@@ -1,0 +1,42 @@
+name = "vlm-nls-search"
+enable_filestore = false
+# GCS-fuse mount at /gcs backs the Lance + model download cache, so the corpus
+# is downloaded once ever and shared across users and instances (not re-paid
+# per cold start). local_cache defaults its root to /gcs/nls_cache.
+enable_gcs_fuse = true
+enable_postgres = true
+enable_mysql = false
+enable_secrets = true
+enable_api_gateway = false
+enable_slack = false
+
+[cloudrun]
+  # int8 PCA corpus (47.8M x 256 = 12.2GB resident) + ~5GB fp32 model + metadata
+  # (chunk_id reconstructed, not stored) + per-query scratch. 8 vCPU caps memory
+  # at 32Gi on Cloud Run; the int8 corpus fits with the gpu_corpus memory cuts.
+  memory = "32Gi"
+  # 8 cores: the ~5GB encoder load (CPU-bound, holds the GIL) is what makes the
+  # single worker laggy during warmup; more cores shorten that window and leave
+  # headroom for request handling. Query matmul (~100ms) also benefits.
+  cpu = "8"
+  # Query latency is ~100ms, but the cold-start model+corpus load is minutes.
+  timeout = "600s"
+  # Keep one instance warm so the resident model and matrix are not reloaded.
+  min_instances = 1
+  max_instances = 2
+  # NOTE: startup CPU boost and CPU-always-allocated (no request-time throttling)
+  # are NOT expressible in this schema, but both are required for responsiveness.
+  # They are set out-of-band on the service and must be re-applied after any
+  # `apps-platform deploy` (which would otherwise reset CPU throttling to on):
+  #   gcloud run services update vlm-nls-search --region us-west1 \
+  #     --project experimental-apps-v2 --cpu-boost --no-cpu-throttling
+  # Our normal deploy path (gcloud run services update --image ...) already sets
+  # these, so they only need re-applying if someone deploys via apps-platform.
+
+[metadata]
+  owner = "sibo.geng@applied.co"
+  # Platform-level maintainers: granted deploy/manage (develop) access to the
+  # app, in addition to the owner. Distinct from NLS_OWNER_EMAIL, which only
+  # gates the in-app usage-analytics view.
+  maintainers = ["michelle.chen@applied.co"]
+  description = "Natural-language similarity search over VLM (Cosmos-Embed) video embeddings"

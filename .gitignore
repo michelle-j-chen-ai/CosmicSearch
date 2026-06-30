@@ -1,0 +1,22 @@
+# Vendored Applied SDKs are NOT committed to this repo (proprietary; pulled from the
+# authenticated Applied index). They live in the working tree and are uploaded at deploy
+# time (gcloud run deploy --source respects .gcloudignore, not .gitignore), so the app still
+# deploys, but the binaries never land on GitHub.
+#
+# Repopulate locally before deploying:
+#   adp/ :   cp -r <venv>/lib/python*/site-packages/adp ./adp
+#   wheel:   cp <lilypad_py wheel> ./vendor/
+adp/
+vendor/*.whl
+
+# Python caches / artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Local env
+.venv/
+venv/
+.env

@@ -1,0 +1,75 @@
+# Deploy config for the trucking sibling service `vlm-nls-search-trucking`
+# (https://vlm-nls-search-trucking.experimental.apps.applied.dev). It runs the
+# same app image as the prod `vlm-nls-search` (see project.toml) but as a
+# separate Cloud Run service pointed -- via mounted secrets -- at the trucking
+# embedding corpus + v3 encoder. Deploy with:
+#   apps-platform app deploy -c project-trucking.toml
+# Then (re-)mount the secrets as env, which `deploy` does not do automatically:
+#   gcloud run services update vlm-nls-search-trucking --region=us-west1 \
+#     --project=experimental-apps-v2 --update-secrets <KEY=secret:latest,...>
+#
+# Data Explorer (segment-set search) for THIS service must point at the trucking
+# cluster, which is the FRONTIER Dora (grpc.frontier.prod.applied.dev -- note the
+# .prod.applied.dev domain, NOT .oci.applied.dev like neuron) -- where
+# the trucking tag-based segment sets are synced by
+# onroad/tools/offboard/frontier/workflows/frontier_dora_segment_set_sync_workflow.py.
+# Three env vars are required (the neuron service's defaults would hit the WRONG
+# cluster). The hostname is a non-sensitive app secret:
+#   vlm-nls-search-trucking-ursa-sdk-grpc-hostname = grpc.frontier.prod.applied.dev
+# Machine auth must be FRONTIER-scoped credentials (the neuron machine client is
+# not valid for frontier Dora). Mount them and the hostname with:
+#   gcloud run services update vlm-nls-search-trucking --region=us-west1 \
+#     --project=experimental-apps-v2 --update-secrets \
+#     URSA_SDK_GRPC_HOSTNAME=vlm-nls-search-trucking-ursa-sdk-grpc-hostname:latest,\
+#     MACHINE_CLIENT_ID=<frontier-machine-client-id-secret>:latest,\
+#     MACHINE_CLIENT_SECRET=<frontier-machine-client-secret-secret>:latest
+# The existing frontier creds trucking-ops-dashboard-adp-machine-auth-client-id/
+# -secret can be reused, but the trucking SA
+# (vlm-nls-search-trucking-sa@experimental-apps-v2.iam.gserviceaccount.com) must
+# first be granted roles/secretmanager.secretAccessor on them, e.g.:
+#   gcloud secrets add-iam-policy-binding trucking-ops-dashboard-adp-machine-auth-client-id \
+#     --member=serviceAccount:vlm-nls-search-trucking-sa@experimental-apps-v2.iam.gserviceaccount.com \
+#     --role=roles/secretmanager.secretAccessor --project=experimental-apps-v2
+#   (repeat for ...-client-secret). Alternatively copy the two values into this
+#   app's own namespace (apps-platform app secret set MACHINE_CLIENT_ID <val>
+#   --service vlm-nls-search-trucking) so its SA can read them directly.
+name = "vlm-nls-search-trucking"
+enable_filestore = false
+# GCS-fuse mount backs the Lance + model download cache (NLS_CACHE_ROOT), so the
+# corpus is downloaded once and shared across instances, not re-paid per cold start.
+enable_gcs_fuse = true
+# Cloud SQL (exp-db) is attached by the platform; the app itself stores usage
+# analytics on the GCS-fuse mount, but postgres is kept enabled to match the
+# live service's injected DB_* env and cloudsql-instances binding.
+enable_postgres = true
+enable_mysql = false
+enable_secrets = true
+enable_api_gateway = false
+enable_slack = false
+
+[cloudrun]
+  # ~5.3GB model (fp32) + the siglip embedding matrix (2,260,540 x 768 fp32 ~= 7GB) +
+  # per-row metadata lists + the gcs-fuse page cache for the 6.5GB embeddings.npy.
+  # 16Gi was OOM-killed (SIGKILL on load) by the 2.26M corpus; 32Gi gives headroom.
+  # Cloud Run requires >= 8 vCPU for 32GiB of memory.
+  memory = "32Gi"
+  cpu = "8"
+  # Query latency is ~100ms, but the cold-start model+corpus load is minutes.
+  timeout = "600s"
+  # Keep TWO instances warm. Cloud Run periodically recycles min-instances for
+  # infra maintenance (~daily, reason MANUAL_OR_CUSTOMER_MIN_INSTANCE) and there is
+  # no knob to disable it; with a single min-instance that recycle forces the full
+  # ~15min model+corpus reload and 503s in the meantime. Two instances let the
+  # rolling (one-at-a-time) recycle stay invisible: the other instance keeps serving
+  # with the model resident while the replacement warms in the background.
+  min_instances = 2
+  # >= min+1 so a rolling replacement has a slot without evicting a warm instance.
+  max_instances = 3
+
+[metadata]
+  owner = "sibo.geng@applied.co"
+  # Platform-level maintainers: granted deploy/manage (develop) access to the
+  # app, in addition to the owner. Distinct from NLS_OWNER_EMAIL, which only
+  # gates the in-app usage-analytics view.
+  maintainers = ["michelle.chen@applied.co"]
+  description = "Natural-language similarity search over VLM (Cosmos-Embed) video embeddings -- trucking corpus"

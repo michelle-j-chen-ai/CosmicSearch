@@ -1,0 +1,1009 @@
+"""Brute-force natural-language video retrieval over Cosmos-Embed embeddings.
+
+The search core is intentionally self-contained (no dependency on the
+`finetuning` package, which pulls in repo-internal modules that cannot ship in
+a slim container). The encode + rank logic mirrors
+`text_query_search._encode_texts` and `_rank_top_k`, but loads the model on CPU
+and keeps the corpus matrix resident in memory.
+
+At 1M x 768 the corpus is ~1.5GB in fp16 and a single query is a matrix-vector
+product (~50-200ms on CPU, memory-bandwidth bound). An ANN index only becomes
+worthwhile past ~10M rows; see README "Scaling" for the migration path.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import os
+import shutil
+import tempfile
+import time
+from pathlib import Path
+
+import local_cache
+import oci_s3
+import torch
+from transformers import AutoModel, AutoProcessor
+
+import numpy as np
+from config import (
+    BASE_MODEL_REVISION,
+    BASE_MODEL_URI,
+    OUTPUT_TABLE_NAME,
+)
+
+# Interval projection + arrow extraction live in a dependency-light shared module
+# so the offline Spark scan workflow produces byte-for-byte the same intervals.
+# Re-exported here so existing `search_engine.<name>` references keep working.
+from interval_core import (  # noqa: F401  (re-exported for back-compat)
+    _DEFAULT_STRIDE_S,
+    _DEFAULT_WINDOW_S,
+    _VECTOR_COLUMNS,
+    ScoredInterval,
+    _chunk_ends_from_arrow,
+    _chunk_starts_from_arrow,
+    _drive_cells,
+    _interval_threshold,
+    _merge_drive,
+    _vector_column_name,
+    _vectors_from_arrow,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_model_source(model_artifact_uri: str) -> tuple[str, str | None]:
+    """Return (local-or-hub source, revision) for transformers.from_pretrained.
+
+    - Empty artifact URI -> pinned base HF model.
+    - s3:// artifact URI -> download the merged snapshot to the disk cache.
+    - Anything else      -> treat as a local path / hub id as-is.
+    """
+    if not model_artifact_uri:
+        return BASE_MODEL_URI, BASE_MODEL_REVISION
+    if model_artifact_uri.startswith(("s3://", "s3a://")):
+        local = local_cache.ensure_model_local(model_artifact_uri, oci_s3.s3_client())
+        return str(local), None
+    return model_artifact_uri, None
+
+
+@dataclasses.dataclass(frozen=True)
+class RankedHit:
+    # 1-based position in the (optionally date-filtered) descending-score order.
+    # Carried on the hit so a windowed page that starts past the top still shows
+    # the true global rank, not its offset within the page.
+    rank: int
+    # Row index into the corpus matrix, so a reviewed hit can be mapped back to
+    # its embedding vector for relevance-feedback refinement (see centroid_query).
+    index: int
+    chunk_id: str
+    run_uuid: str
+    chunk_start_unix: int
+    source_media_uri: str
+    # Original 30s source segment_id (empty if the corpus metadata lacks it).
+    segment_id: str
+    score: float
+    # Chunk END time (epoch seconds); None for corpora that carry only a start.
+    chunk_end_unix: int | None = None
+
+
+@dataclasses.dataclass
+class Corpus:
+    # (n, dim) row-L2-normalized embedding matrix, fp16 or fp32.
+    matrix: np.ndarray
+    chunk_id: list[str]
+    run_uuid: list[str]
+    chunk_start_unix: list[int]
+    source_media_uri: list[str]
+    # Original 30s source segment_ids (empty strings if the metadata lacks them).
+    segment_id: list[str]
+    # DORA global internal segment counter per row, for roaring-bitmap segment-set
+    # filtering. None when the corpus metadata lacks the column (older corpora);
+    # the segment filter then falls back to the external_id path.
+    dx_internal_id: list[int] | None = None
+    # Chunk END time (epoch seconds) per row; None for corpora that carry only a
+    # start (e.g. the older npy metadata). Date filtering uses the start; the end
+    # is carried for display + export.
+    chunk_end_unix: list[int] | None = None
+    # Vehicle id per row (e.g. truck-808 / a car vehicle_name), for the vehicle
+    # filter. None when the corpus metadata lacks a vehicle column.
+    vehicle: list[str] | None = None
+
+    @property
+    def num_rows(self) -> int:
+        return self.matrix.shape[0]
+
+    @property
+    def dim(self) -> int:
+        return self.matrix.shape[1] if self.matrix.ndim == 2 else 0
+
+    def chunk_start_array(self) -> np.ndarray:
+        """chunk_start_unix as a cached int64 array, for vectorized date masking.
+
+        Built once and memoized on the instance (the corpus is cached for the
+        process lifetime, so the conversion is paid a single time per corpus).
+        """
+        arr = self.__dict__.get("_chunk_start_arr")
+        if arr is None:
+            arr = np.asarray(self.chunk_start_unix, dtype=np.int64)
+            self.__dict__["_chunk_start_arr"] = arr
+        return arr
+
+    def segment_id_array(self) -> np.ndarray:
+        """segment_id as a cached string array, for vectorized segment-set masking.
+
+        Memoized on the instance like ``chunk_start_array``. Rows whose metadata
+        lacked a segment_id hold "" (see the loaders), so callers can detect a
+        corpus with no usable segment_id via ``.any()`` on a non-empty mask.
+        """
+        arr = self.__dict__.get("_segment_id_arr")
+        if arr is None:
+            arr = np.asarray(self.segment_id, dtype=object)
+            self.__dict__["_segment_id_arr"] = arr
+        return arr
+
+    def vehicle_array(self) -> np.ndarray | None:
+        """vehicle as a cached string array for vectorized vehicle masking, or
+        None when the corpus has no vehicle column. Memoized like the others."""
+        if self.vehicle is None:
+            return None
+        arr = self.__dict__.get("_vehicle_arr")
+        if arr is None:
+            arr = np.asarray(self.vehicle, dtype=object)
+            self.__dict__["_vehicle_arr"] = arr
+        return arr
+
+    def has_vehicle(self) -> bool:
+        return self.vehicle is not None
+
+    def has_internal_ids(self) -> bool:
+        """True when the corpus carries DORA internal segment counters, enabling
+        the roaring-bitmap segment-set filter (one ``include_bitmap`` call vs.
+        paginating the set's external_ids)."""
+        return self.dx_internal_id is not None
+
+    def dx_internal_id_array(self) -> np.ndarray:
+        """dx_internal_id as a cached int64 array, for roaring-bitmap masking.
+
+        Memoized like ``segment_id_array``. Only valid when ``has_internal_ids``;
+        rows whose metadata lacked an id hold -1 (never a real DORA counter).
+        """
+        arr = self.__dict__.get("_dx_internal_id_arr")
+        if arr is None:
+            src = self.dx_internal_id or []
+            arr = np.fromiter(
+                (-1 if v is None else int(v) for v in src),
+                dtype=np.int64,
+                count=len(src),
+            )
+            self.__dict__["_dx_internal_id_arr"] = arr
+        return arr
+
+    def time_span(self) -> tuple[int, int]:
+        """(min, max) chunk_start_unix over the corpus; (0, 0) if empty."""
+        starts = self.chunk_start_array()
+        if starts.size == 0:
+            return (0, 0)
+        return (int(starts.min()), int(starts.max()))
+
+
+def load_model(model_artifact_uri: str, device: str) -> tuple[object, object]:
+    """Load the Cosmos-Embed processor + model onto the configured device.
+
+    A fine-tuned snapshot is given as an s3:// merged-model URI and is
+    downloaded to the disk cache on first load; an empty URI loads the pinned
+    base model from the HF hub.
+    """
+    source, revision = _resolve_model_source(model_artifact_uri)
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    LOGGER.info("loading model %s (device=%s, dtype=%s)", source, device, dtype)
+    t0 = time.time()
+    processor = AutoProcessor.from_pretrained(
+        source, revision=revision, trust_remote_code=True
+    )
+    model = AutoModel.from_pretrained(
+        source, revision=revision, trust_remote_code=True, torch_dtype=dtype
+    ).to(device)
+    model.eval()
+    LOGGER.info("model loaded in %.1fs", time.time() - t0)
+    return processor, model
+
+
+def encode_query(
+    text: str, processor: object, model: object, device: str
+) -> np.ndarray:
+    """Encode one query string into the joint video/text space (L2-normalized).
+
+    Mirrors text_query_search._encode_texts but device-agnostic: fp32 on CPU,
+    bf16 on GPU.
+    """
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    inputs = processor(text=[text])
+    moved: dict[str, torch.Tensor] = {}
+    for key, value in inputs.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        moved[key] = (
+            value.to(device, dtype=dtype)
+            if value.is_floating_point()
+            else value.to(device)
+        )
+    with torch.inference_mode():
+        output = model.get_text_embeddings(**moved)
+    vector = torch.nn.functional.normalize(output.text_proj.float(), dim=-1)
+    return vector.detach().cpu().numpy().astype("float32")[0]
+
+
+def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
+    """Download the corpus to the disk cache (once) and load it into a resident
+    matrix.
+
+    Dispatches on the on-disk format that local_cache materialized: the fast
+    `embeddings.npy` (+ metadata.parquet) is loaded by a single contiguous read
+    (_load_corpus_npy); otherwise the Lance `rank=NNNNN/` shards are read and
+    converted (_load_corpus_lance). The download is cached and lock-guarded, so
+    repeat users of the same URI never re-pay the transfer.
+    """
+    local_dir = local_cache.ensure_corpus_local(embeddings_uri, oci_s3.s3_client())
+    import gpu_corpus
+
+    if gpu_corpus.is_gpu_artifact(local_dir):
+        # int8 PCA corpus (very large sets) -> compressed backend that owns its
+        # own scoring/sort (gpu_score / gpu_argsort), dispatched below.
+        return gpu_corpus.load_gpu_corpus(local_dir, os.environ.get("NLS_DEVICE", "cpu"))
+    if (local_dir / local_cache.NPY_MATRIX_FILE).exists():
+        return _load_corpus_npy(local_dir, matrix_dtype)
+    if embeddings_uri.rstrip("/").endswith(".lance"):
+        return _load_corpus_lance_dataset(local_dir, matrix_dtype)
+    return _load_corpus_lance(local_dir, embeddings_uri, matrix_dtype)
+
+
+def _internal_ids_from_arrow(arrow_table: object) -> list[int] | None:
+    """The dx_internal_id column as a list, or None when the corpus lacks it."""
+    if "dx_internal_id" not in arrow_table.column_names:
+        return None
+    return arrow_table.column("dx_internal_id").to_pylist()
+
+
+# Candidate vehicle-id column names in the corpus metadata (build-time join from
+# the Ursa runs table, or parsed from segment_id). First present wins.
+_VEHICLE_COLUMNS = ("vehicle", "vehicle_name", "vehicle_id")
+
+
+def _vehicle_from_arrow(arrow_table: object) -> list[str] | None:
+    """The vehicle-id column as a list of strings, or None when absent."""
+    names = arrow_table.column_names
+    col = next((c for c in _VEHICLE_COLUMNS if c in names), None)
+    if col is None:
+        return None
+    LOGGER.info("vehicle column: %s", col)
+    return [("" if v is None else str(v)) for v in arrow_table.column(col).to_pylist()]
+
+
+def _corpus_from_arrow(arrow_table: object, matrix_dtype: str) -> Corpus:
+    """Build a Corpus from a single Arrow table with the standard columns."""
+    n = arrow_table.num_rows
+    seg = (
+        arrow_table.column("segment_id").to_pylist()
+        if "segment_id" in arrow_table.column_names
+        else [""] * n
+    )
+    vec_col = _vector_column_name(arrow_table)
+    return Corpus(
+        matrix=_vectors_from_arrow(arrow_table, vec_col).astype(
+            matrix_dtype, copy=False
+        ),
+        chunk_id=arrow_table.column("chunk_id").to_pylist(),
+        run_uuid=arrow_table.column("run_uuid").to_pylist(),
+        chunk_start_unix=_chunk_starts_from_arrow(arrow_table),
+        source_media_uri=arrow_table.column("source_media_uri").to_pylist(),
+        segment_id=seg,
+        dx_internal_id=_internal_ids_from_arrow(arrow_table),
+        chunk_end_unix=_chunk_ends_from_arrow(arrow_table),
+        vehicle=_vehicle_from_arrow(arrow_table),
+    )
+
+
+def _load_corpus_lance_dataset(local_dir: Path, matrix_dtype: str) -> Corpus:
+    """Load a single direct Lance dataset (e.g. a `.../chunks.lance` URI)."""
+    import lance
+
+    t0 = time.time()
+    ds = lance.dataset(str(local_dir))
+    corpus = _corpus_from_arrow(ds.to_table(), matrix_dtype)
+    LOGGER.info(
+        "corpus ready (lance dataset): %d rows x %d dim (%s) in %.1fs",
+        corpus.matrix.shape[0],
+        corpus.dim,
+        corpus.matrix.dtype,
+        time.time() - t0,
+    )
+    return corpus
+
+
+def _fast_local_copy(path: Path) -> Path | None:
+    """Stage a (gcs-fuse-backed) file to local instance storage via one sequential
+    streaming copy, returning the local Path -- or None if staging failed.
+
+    np.load / parquet reads against the gcs-fuse mount issue their reads in a
+    pattern FUSE serves pathologically slowly (observed ~2.6 MB/s -> 40+ min for the
+    6.5GB corpus matrix on a cold instance). A single large-buffer sequential copy
+    streams the bytes far faster; we then load from the local copy. On any OS error
+    (e.g. no local space) we return None and the caller reads the original path.
+    """
+    try:
+        staged = Path(tempfile.gettempdir()) / f"nls_{os.getpid()}_{path.name}"
+        t = time.time()
+        with open(path, "rb") as src, open(staged, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=64 * 1024 * 1024)
+        LOGGER.info(
+            "staged %s locally (%.0f MB) in %.1fs",
+            path.name,
+            staged.stat().st_size / 1e6,
+            time.time() - t,
+        )
+        return staged
+    except OSError as exc:
+        LOGGER.warning(
+            "local staging of %s failed (%s); reading directly", path.name, exc
+        )
+        return None
+
+
+def _load_corpus_npy(local_dir: Path, matrix_dtype: str) -> Corpus:
+    """Load the fast corpus format: a contiguous embeddings.npy + metadata.parquet.
+
+    The matrix is one contiguous read (no Lance/Arrow conversion, no per-row
+    fragment fetch). Both files are staged to local storage first (see
+    _fast_local_copy) because reading them directly off the shared gcs-fuse mount is
+    pathologically slow on a cold instance.
+    """
+    import pyarrow.parquet as pq
+
+    t0 = time.time()
+    mpath = local_dir / local_cache.NPY_MATRIX_FILE
+    staged = _fast_local_copy(mpath)
+    try:
+        matrix = np.load(staged or mpath)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+    if str(matrix.dtype) != matrix_dtype:
+        matrix = matrix.astype(matrix_dtype)
+    ppath = local_dir / local_cache.NPY_METADATA_FILE
+    pstaged = _fast_local_copy(ppath)
+    try:
+        meta = pq.read_table(pstaged or ppath)
+    finally:
+        if pstaged is not None:
+            pstaged.unlink(missing_ok=True)
+    n = matrix.shape[0]
+    segment_id = (
+        meta.column("segment_id").to_pylist()
+        if "segment_id" in meta.column_names
+        else [""] * n
+    )
+    corpus = Corpus(
+        matrix=matrix,
+        chunk_id=meta.column("chunk_id").to_pylist(),
+        run_uuid=meta.column("run_uuid").to_pylist(),
+        chunk_start_unix=_chunk_starts_from_arrow(meta),
+        source_media_uri=meta.column("source_media_uri").to_pylist(),
+        segment_id=segment_id,
+        dx_internal_id=_internal_ids_from_arrow(meta),
+        chunk_end_unix=_chunk_ends_from_arrow(meta),
+        vehicle=_vehicle_from_arrow(meta),
+    )
+    LOGGER.info(
+        "corpus ready (npy): %d rows x %d dim (%s) in %.1fs",
+        matrix.shape[0],
+        matrix.shape[1],
+        matrix.dtype,
+        time.time() - t0,
+    )
+    return corpus
+
+
+def _load_corpus_lance(
+    local_dir: Path, embeddings_uri: str, matrix_dtype: str
+) -> Corpus:
+    """Read the rank=NNNNN/ Lance shards into one resident matrix."""
+    import lancedb
+
+    rank_dirs = sorted(
+        d for d in local_dir.iterdir() if d.is_dir() and d.name.startswith("rank=")
+    )
+    if not rank_dirs:
+        raise FileNotFoundError(f"no rank=NNNNN/ dirs in cached download {local_dir}")
+    LOGGER.info("loading %d cached rank shards from %s", len(rank_dirs), local_dir)
+
+    matrices: list[np.ndarray] = []
+    chunk_id: list[str] = []
+    run_uuid: list[str] = []
+    chunk_start_unix: list[int] = []
+    source_media_uri: list[str] = []
+    segment_id: list[str] = []
+    internal_ids: list[int] = []
+    has_internal = True  # cleared if any shard lacks the dx_internal_id column
+    for rank_dir in rank_dirs:
+        db = lancedb.connect(str(rank_dir))
+        table = db.open_table(OUTPUT_TABLE_NAME)
+        arrow_table = table.to_arrow()
+        if arrow_table.num_rows == 0:
+            continue
+        matrices.append(_vectors_from_arrow(arrow_table).astype(matrix_dtype))
+        chunk_id.extend(arrow_table.column("chunk_id").to_pylist())
+        run_uuid.extend(arrow_table.column("run_uuid").to_pylist())
+        chunk_start_unix.extend(
+            int(v) for v in arrow_table.column("chunk_start_unix").to_pylist()
+        )
+        source_media_uri.extend(arrow_table.column("source_media_uri").to_pylist())
+        if "segment_id" in arrow_table.column_names:
+            segment_id.extend(arrow_table.column("segment_id").to_pylist())
+        else:
+            segment_id.extend([""] * arrow_table.num_rows)
+        if has_internal and "dx_internal_id" in arrow_table.column_names:
+            internal_ids.extend(arrow_table.column("dx_internal_id").to_pylist())
+        else:
+            has_internal = False
+        LOGGER.info("  %s: %d rows", rank_dir.name, arrow_table.num_rows)
+
+    if not matrices:
+        raise ValueError(f"all shards under {embeddings_uri} were empty")
+    matrix = np.concatenate(matrices, axis=0)
+    LOGGER.info(
+        "corpus ready: %d rows x %d dim (%s)",
+        matrix.shape[0],
+        matrix.shape[1],
+        matrix.dtype,
+    )
+    return Corpus(
+        matrix=matrix,
+        chunk_id=chunk_id,
+        run_uuid=run_uuid,
+        chunk_start_unix=chunk_start_unix,
+        source_media_uri=source_media_uri,
+        segment_id=segment_id,
+        dx_internal_id=internal_ids if has_internal else None,
+    )
+
+
+def _hit(corpus: Corpus, scores: np.ndarray, index: int, rank: int) -> RankedHit:
+    return RankedHit(
+        rank=rank,
+        index=int(index),
+        chunk_id=corpus.chunk_id[index],
+        run_uuid=corpus.run_uuid[index],
+        chunk_start_unix=corpus.chunk_start_unix[index],
+        source_media_uri=corpus.source_media_uri[index],
+        segment_id=corpus.segment_id[index],
+        score=float(scores[index]),
+        chunk_end_unix=(
+            corpus.chunk_end_unix[index] if corpus.chunk_end_unix is not None else None
+        ),
+    )
+
+
+def rank_top_k(query_vector: np.ndarray, corpus: Corpus, top_k: int) -> list[RankedHit]:
+    """Score the corpus by cosine similarity and return the top-k hits."""
+    if corpus.num_rows == 0:
+        return []
+    if hasattr(corpus, "gpu_score"):
+        scores = corpus.gpu_score(query_vector)
+        order = corpus.gpu_argsort(scores, None)
+        top = order[: min(top_k, scores.shape[0])]
+        return [_hit(corpus, scores, int(i), r) for r, i in enumerate(top, start=1)]
+    # Match query dtype to the matrix so an fp32 corpus hits the BLAS gemv
+    # path (~58ms at 1M x 768). scores stay fp32-safe via float() below.
+    scores = corpus.matrix @ query_vector.astype(corpus.matrix.dtype)
+    k = min(top_k, scores.shape[0])
+    top = np.argpartition(-scores, k - 1)[:k]
+    top = top[np.argsort(-scores[top])]
+    return [_hit(corpus, scores, int(i), rank) for rank, i in enumerate(top, start=1)]
+
+
+def score_corpus(query_vector: np.ndarray, corpus: Corpus) -> np.ndarray:
+    """Cosine similarity of the query against every corpus row (1-D, fp-matrix dtype)."""
+    if hasattr(corpus, "gpu_score"):
+        # int8 PCA backend: project + dequant-fold + blocked int8 matmul.
+        return corpus.gpu_score(query_vector)
+    return corpus.matrix @ query_vector.astype(corpus.matrix.dtype)
+
+
+def segment_mask(
+    corpus: Corpus, allowed_segment_ids: frozenset[str] | set[str]
+) -> np.ndarray:
+    """Boolean mask over corpus rows: True where the row's segment_id is allowed.
+
+    Uses O(1) set membership over the corpus's ~10^5 rows, so the cost scales
+    with the corpus, NOT the segment set (which can be millions of ids) -- and
+    there is no per-call sort of the id set. The result is immutable for a given
+    (corpus, set), so callers cache it and reuse it across searches/pages.
+    """
+    seg = corpus.segment_id_array()
+    return np.fromiter(
+        (sid in allowed_segment_ids for sid in seg), dtype=bool, count=len(seg)
+    )
+
+
+def vehicle_mask(
+    corpus: Corpus, allowed_vehicles: frozenset[str] | set[str]
+) -> np.ndarray | None:
+    """Boolean mask over corpus rows: True where the row's vehicle is allowed.
+
+    O(corpus) set membership over the vehicle column, mirroring ``segment_mask``.
+    Returns None when the corpus has no vehicle column (filter inert) so callers
+    can skip it without special-casing. Matching is exact on the vehicle id.
+    """
+    veh = corpus.vehicle_array()
+    if veh is None:
+        return None
+    return np.fromiter(
+        (v in allowed_vehicles for v in veh), dtype=bool, count=len(veh)
+    )
+
+
+def run_mask(
+    corpus: Corpus, allowed_runs: frozenset[str] | set[str]
+) -> np.ndarray:
+    """Boolean mask over corpus rows: True where the row's run_uuid (drive id) is
+    allowed. run_uuid is always present, so (unlike ``vehicle_mask``) this never
+    returns None. Exact match on the full run_uuid; O(corpus) set membership."""
+    runs = corpus.run_uuid
+    return np.fromiter(
+        (r in allowed_runs for r in runs), dtype=bool, count=len(runs)
+    )
+
+
+def segment_mask_from_bitmap(corpus: Corpus, set_bitmap) -> np.ndarray:
+    """Boolean mask over corpus rows via DORA's roaring bitmap of the segment set.
+
+    ``set_bitmap`` is a ``pyroaring.BitMap`` of the set's global internal segment
+    counters (one ``DescribeDataSet(include_bitmap=True)`` call -- no pagination).
+    Membership is O(1) per row, so cost scales with the corpus, not the set.
+    Requires ``corpus.has_internal_ids()``.
+    """
+    ids = corpus.dx_internal_id_array()
+    return np.fromiter((int(i) in set_bitmap for i in ids), dtype=bool, count=len(ids))
+
+
+# Columns a downsample dataset may key on, in priority order, mapped to the
+# corpus column they cross-reference against. ``scenario_id`` is an alias for
+# ``segment_id`` (same id space, different producer). ``run_uuid`` is a curated
+# run list (every corpus also carries run_uuid). We use the FIRST column the
+# dataset has and intersect it against the corpus's mapped column.
+_FILTER_KEY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("dx_internal_id", "dx_internal_id"),
+    ("segment_id", "segment_id"),
+    ("scenario_id", "segment_id"),
+    ("run_uuid", "run_uuid"),
+)
+
+
+def read_filter_ids(local_dir: Path, is_lance: bool) -> tuple[str, frozenset[str]]:
+    """``(corpus_key, ids)`` for a downsample dataset (lance dir or parquet files).
+
+    Backs the "downsample by a Lance/parquet dataset" filter: the user points at
+    an arbitrary dataset whose ``segment_id`` / ``scenario_id`` (segment id space)
+    or ``run_uuid`` column defines what to keep; we intersect it against the
+    corpus's mapped column, reusing the ``value_mask`` membership primitive.
+    Returns the CORPUS key (``segment_id`` or ``run_uuid``) so callers mask the
+    right column. Raises ``ValueError`` if the dataset has no usable key column.
+    """
+    if is_lance:
+        import lance
+
+        names = lance.dataset(str(local_dir)).schema.names
+    else:
+        import pyarrow.dataset as pads
+
+        files = [str(p) for p in sorted(local_dir.rglob("*.parquet"))]
+        if not files:
+            raise ValueError("no .parquet files in downsample dataset")
+        names = pads.dataset(files, format="parquet").schema.names
+
+    match = next((p for p in _FILTER_KEY_COLUMNS if p[0] in names), None)
+    if match is None:
+        wanted = " / ".join(c for c, _ in _FILTER_KEY_COLUMNS)
+        raise ValueError(
+            f"downsample dataset has no {wanted} column to cross-reference "
+            f"(has {sorted(names)})"
+        )
+    dataset_col, corpus_key = match
+    if is_lance:
+        import lance
+
+        col = (
+            lance.dataset(str(local_dir))
+            .to_table(columns=[dataset_col])
+            .column(dataset_col)
+            .to_pylist()
+        )
+    else:
+        import pyarrow.dataset as pads
+
+        files = [str(p) for p in sorted(local_dir.rglob("*.parquet"))]
+        col = (
+            pads.dataset(files, format="parquet")
+            .to_table(columns=[dataset_col])
+            .column(dataset_col)
+            .to_pylist()
+        )
+    if corpus_key == "dx_internal_id":
+        # int roaring-bitmap key -- keep as ints, not strings.
+        return corpus_key, frozenset(int(s) for s in col if s is not None)
+    return corpus_key, frozenset(str(s) for s in col if s is not None and s != "")
+
+
+def value_mask(values: list[str], allowed: frozenset[str] | set[str]) -> np.ndarray:
+    """Boolean mask over ``values`` (a corpus column) -- True where allowed.
+
+    Generalizes ``segment_mask`` to any string column (e.g. ``run_uuid``), so the
+    downsample-dataset filter can cross-reference whichever key the dataset has.
+    """
+    return np.fromiter((v in allowed for v in values), dtype=bool, count=len(values))
+
+
+def ranked_order(
+    scores: np.ndarray,
+    corpus: Corpus,
+    start_unix: int | None = None,
+    end_unix: int | None = None,
+    allowed_segment_ids: frozenset[str] | set[str] | None = None,
+    allowed_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Corpus row indices sorted by descending score, optionally filtered.
+
+    Rows are kept only if ``start_unix <= chunk_start_unix < end_unix`` (either
+    bound may be ``None`` to leave that side open) AND, when
+    ``allowed_segment_ids`` is given, the row's ``segment_id`` is in that set
+    (the Data Explorer segment-set downsample). A full argsort over ~10^5 rows
+    is a few ms, so this runs fresh on every rerun rather than being cached.
+    """
+    n = scores.shape[0]
+    has_seg = allowed_mask is not None or allowed_segment_ids is not None
+    if start_unix is None and end_unix is None and not has_seg:
+        idx = np.arange(n)
+    else:
+        mask = np.ones(n, dtype=bool)
+        if start_unix is not None or end_unix is not None:
+            starts = corpus.chunk_start_array()
+            if start_unix is not None:
+                mask &= starts >= start_unix
+            if end_unix is not None:
+                mask &= starts < end_unix
+        if allowed_mask is not None:
+            mask &= allowed_mask
+        elif allowed_segment_ids is not None:
+            mask &= segment_mask(corpus, allowed_segment_ids)
+        idx = np.nonzero(mask)[0]
+    # int8 backend: sort on its own device/kernel (the CPU path caps the
+    # unfiltered case for speed). None lets it reuse the resident score tensor.
+    if hasattr(corpus, "gpu_argsort"):
+        filtered = start_unix is not None or end_unix is not None or has_seg
+        return corpus.gpu_argsort(scores, idx if filtered else None)
+    # Stable sort so equal scores keep corpus order (deterministic paging).
+    return idx[np.argsort(-scores[idx], kind="stable")]
+
+
+def filter_funnel(
+    corpus: Corpus,
+    start_unix: int | None = None,
+    end_unix: int | None = None,
+    allowed_segment_ids: frozenset[str] | set[str] | None = None,
+    allowed_mask: np.ndarray | None = None,
+) -> dict:
+    """How many corpus clips survive each filter independently + combined.
+
+    Returns counts so the UI can show the funnel from the full corpus down to the
+    matched set (e.g. 100k corpus -> 70k in date range -> 9.5k in segment set ->
+    16 in both). The query is a ranker, not a filter, so it does not appear here.
+    """
+    n = corpus.num_rows
+    date_mask = None
+    if start_unix is not None or end_unix is not None:
+        starts = corpus.chunk_start_array()
+        date_mask = np.ones(n, dtype=bool)
+        if start_unix is not None:
+            date_mask &= starts >= start_unix
+        if end_unix is not None:
+            date_mask &= starts < end_unix
+    seg_mask = None
+    if allowed_mask is not None:
+        seg_mask = allowed_mask
+    elif allowed_segment_ids is not None:
+        seg_mask = segment_mask(corpus, allowed_segment_ids)
+
+    combined = np.ones(n, dtype=bool)
+    if date_mask is not None:
+        combined &= date_mask
+    if seg_mask is not None:
+        combined &= seg_mask
+    return {
+        "corpus_total": int(n),
+        "in_date_range": int(date_mask.sum()) if date_mask is not None else int(n),
+        "in_segment_set": int(seg_mask.sum()) if seg_mask is not None else None,
+        "matched": int(combined.sum()),
+        "date_filtered": date_mask is not None,
+        "segment_filtered": seg_mask is not None,
+    }
+
+
+def start_index_for_score(
+    scores: np.ndarray, order: np.ndarray, score_threshold: float
+) -> int:
+    """First position in `order` whose score is <= score_threshold.
+
+    `order` is already sorted by descending score, so this is a binary search:
+    everything before the returned offset scores strictly higher than the
+    threshold. Returns len(order) if every score exceeds the threshold.
+    """
+    if order.size == 0:
+        return 0
+    sorted_desc = scores[order]
+    # -sorted_desc is ascending; first element >= -threshold is the first hit
+    # whose own score is <= threshold.
+    return int(np.searchsorted(-sorted_desc, -float(score_threshold), side="left"))
+
+
+def hits_from_order(
+    corpus: Corpus, scores: np.ndarray, order: np.ndarray, start: int, count: int
+) -> list[RankedHit]:
+    """Materialize a window of `count` hits from `order` beginning at `start`.
+
+    `start` is a 0-based offset into the ranking; each hit's `rank` is its
+    1-based global position (start + 1, start + 2, ...).
+    """
+    window = order[start : start + count]
+    return [
+        _hit(corpus, scores, int(i), start + 1 + offset)
+        for offset, i in enumerate(window)
+    ]
+
+
+def _build_drives(scores, corpus, allowed_mask):
+    """Group the allowed rows by drive and build each drive's 4s-cell signal.
+
+    Returns a list of ``(run_uuid, cell_score, cell_center, cell_peak_row)``,
+    one per drive (the shared front half of interval projection)."""
+    n = corpus.num_rows
+    if n == 0:
+        return []
+    idx = np.nonzero(allowed_mask)[0] if allowed_mask is not None else np.arange(n)
+    if idx.size == 0:
+        return []
+    starts_all = corpus.chunk_start_array()
+    if corpus.chunk_end_unix is not None:
+        ends_all = np.asarray(corpus.chunk_end_unix, dtype=np.int64)
+    else:
+        ends_all = starts_all + _DEFAULT_WINDOW_S
+    runs = np.asarray([corpus.run_uuid[i] for i in idx], dtype=object)
+    g = np.lexsort((starts_all[idx], runs))  # sort by (run, start)
+    idx_s = idx[g]
+    runs_s = runs[g]
+    boundaries = np.nonzero(runs_s[1:] != runs_s[:-1])[0] + 1
+    out = []
+    for grp in np.split(np.arange(idx_s.size), boundaries):
+        rows = idx_s[grp]
+        cs, cc, cpr, _d = _drive_cells(
+            starts_all[rows], ends_all[rows], scores[rows].astype(np.float64), rows
+        )
+        out.append((corpus.run_uuid[int(rows[0])], cs, cc, cpr))
+    return out
+
+
+def project_intervals(
+    scores: np.ndarray,
+    corpus: Corpus,
+    allowed_mask: np.ndarray | None,
+    *,
+    mode: str = "k",
+    k: int = 100,
+    score_cutoff: float | None = None,
+) -> tuple[list[ScoredInterval], float]:
+    """Merge the per-clip scores into variable-length intervals per drive.
+
+    ``allowed_mask`` is the final boolean keep-mask over corpus rows (date +
+    segment-set + lance + vehicle), or None for the whole corpus. ``mode`` is
+    ``"k"`` (threshold = the k-th largest grid-cell score, so ~k cells survive)
+    or ``"score"`` (threshold = ``score_cutoff``). Returns
+    ``(intervals_sorted_by_peak_desc, threshold_used)``.
+
+    The grid cell math is in ``_drive_cells``; here we threshold, walk each
+    drive's cells, and linearly interpolate the two boundary crossings.
+    """
+    per_drive = _build_drives(scores, corpus, allowed_mask)
+    if not per_drive:
+        return [], 0.0
+    tau = _interval_threshold(per_drive, mode, k, score_cutoff)
+    if tau is None:
+        return [], 0.0
+    intervals: list[ScoredInterval] = []
+    for run_uuid, cs, cc, cpr in per_drive:
+        intervals.extend(_merge_drive(run_uuid, cs, cc, cpr, tau))
+    intervals.sort(key=lambda iv: iv.peak_score, reverse=True)
+    return intervals, tau
+
+
+def interval_threshold(
+    scores: np.ndarray,
+    corpus: Corpus,
+    allowed_mask: np.ndarray | None,
+    *,
+    mode: str = "k",
+    k: int = 100,
+    score_cutoff: float | None = None,
+) -> float | None:
+    """The cell-score threshold tau that ``project_intervals`` would use for
+    these scores + filters, WITHOUT building the intervals (used by the
+    similarity-distribution endpoint). ``"score"`` mode returns ``score_cutoff``;
+    ``"k"`` mode returns
+    the k-th largest 4s-cell score pooled across drives (None if no finite cells).
+    """
+    per_drive = _build_drives(scores, corpus, allowed_mask)
+    if not per_drive:
+        return None
+    return _interval_threshold(per_drive, mode, k, score_cutoff)
+
+
+def _unit(vector: np.ndarray) -> np.ndarray:
+    """L2-normalize to a unit fp32 vector; raise if it has zero norm."""
+    norm = np.linalg.norm(vector)
+    if norm == 0.0:
+        raise ValueError("vector has zero norm; cannot normalize")
+    return (vector / norm).astype("float32")
+
+
+def refine_query(
+    corpus: Corpus,
+    positive_indices: list[int],
+    negative_indices: list[int] | None = None,
+    text_vector: np.ndarray | None = None,
+    negative_weight: float = 0.5,
+    text_weight: float = 0.0,
+) -> np.ndarray:
+    """Build a refined query direction from reviewed examples (relevance feedback).
+
+    This is a *prototype* (Rocchio) objective, deliberately not a max-margin
+    classifier. Retrieval wants a vector close to the confirmed positives and
+    away from the negatives -- not the boundary that best separates them. With
+    only a handful of marks in a ~768-d space a discriminative separator is
+    badly underdetermined: it latches onto whichever spurious plane happens to
+    split the current marks and gets *worse* as you iterate. The prototype
+    direction instead stays anchored to the positive centroid (a low-variance
+    estimate), so it degrades gracefully and converges toward the true cluster.
+
+    Maximizing ``alignment(w, positives) - negative_weight * alignment(w,
+    negatives)`` over unit ``w`` has the closed form::
+
+        w = unit( mean(positives) - negative_weight * mean(negatives) )
+
+    ``negative_weight`` (gamma) scales how hard to reject the negatives; 0
+    ignores them (pure positive centroid). ``text_weight > 0`` then blends the
+    original text query back in (Rocchio's query term) as an extra anchor:
+    ``unit(w + text_weight * unit(text_vector))``. The result is L2-normalized,
+    so it drops straight into `rank_top_k` like any query vector.
+    """
+    if not positive_indices:
+        raise ValueError("refine_query needs at least one positive example")
+    direction = corpus.matrix[positive_indices].astype("float32").mean(axis=0)
+    if negative_indices:
+        neg_mean = corpus.matrix[negative_indices].astype("float32").mean(axis=0)
+        direction = direction - float(negative_weight) * neg_mean
+
+    direction = _unit(direction)
+    if text_vector is not None and text_weight > 0.0:
+        direction = _unit(direction + float(text_weight) * _unit(text_vector))
+    return direction
+
+
+# Multi-cluster-positive thresholds (tunable; defaults are conservative so we
+# only split genuinely diverse 👍 sets — over-clustering a coherent set is the
+# documented failure mode). All are cosine similarities of unit vectors.
+_POS_TIGHT_SIM = 0.5    # if MEAN pairwise cos among 👍 >= this -> one coherent prototype
+_POS_LINK_SIM = 0.5     # greedy grouping: join a cluster if cos to its running mean >= this
+_POS_MAX_CLUSTERS = 3   # more clusters than this -> treat as noise, fall back to one prototype
+
+
+def _positive_clusters(vecs: np.ndarray) -> list[list[int]]:
+    """Group unit positive vectors into 1..``_POS_MAX_CLUSTERS`` clusters.
+
+    Returns a list of member-index lists (indices into ``vecs``). Falls back to a
+    SINGLE cluster (all members) when the positives are cohesive (high mean
+    pairwise similarity) or when greedy grouping fragments into too many pieces --
+    so multi-prototype only engages for genuinely multi-modal 👍 sets. Diversity
+    gate first (mean pairwise cosine), then a single-pass greedy single-link
+    grouping on cosine. Mean-pairwise tolerates one outlier mark, unlike the
+    min-to-centroid which a balanced bimodal set also passes.
+    """
+    m = vecs.shape[0]
+    if m <= 2:
+        return [list(range(m))]  # too few marks to cluster reliably
+    sims = vecs @ vecs.T
+    mean_pair = float((sims.sum() - m) / (m * (m - 1)))  # exclude the unit diagonal
+    if mean_pair >= _POS_TIGHT_SIM:
+        return [list(range(m))]  # cohesive -> one prototype (== single-centroid behavior)
+    members: list[list[int]] = []
+    means: list[np.ndarray] = []
+    for i in range(m):
+        v = vecs[i]
+        best, best_sim = -1, _POS_LINK_SIM
+        for ci, mean in enumerate(means):
+            s = float(v @ mean)
+            if s >= best_sim:
+                best, best_sim = ci, s
+        if best < 0:
+            members.append([i])
+            means.append(v.copy())
+        else:
+            members[best].append(i)
+            acc = vecs[members[best]].mean(axis=0)
+            nn = float(np.linalg.norm(acc))
+            means[best] = acc / nn if nn else acc
+    if len(members) <= 1 or len(members) > _POS_MAX_CLUSTERS:
+        return [list(range(m))]  # not actually multi-modal / too fragmented
+    return members
+
+
+def refine_scores(
+    corpus: Corpus,
+    positive_indices: list[int],
+    negative_indices: list[int] | None = None,
+    text_vector: np.ndarray | None = None,
+    negative_weight: float = 0.5,
+    text_weight: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Relevance-feedback scores with MULTI-CLUSTER positives and a PER-NEGATIVE
+    penalty::
+
+        score(x) = max_c cos(x, w_c)  -  negative_weight * max_j cos(x, neg_j)
+
+    Positives are grouped into 1..3 cluster prototypes ``w_c`` (each a centroid +
+    the optional text-query anchor). A coherent 👍 set yields ONE prototype (the
+    classic single-centroid behavior); a diverse set yields several, and each row
+    is scored by its NEAREST positive cluster (the ``max_c``) -- so two distinct
+    👍 themes both rank high instead of averaging into a meaningless midpoint.
+    The negative term demotes any row close to ANY specific rejected example.
+
+    Returns ``(scores, w_pos)``: ``w_pos`` is the overall positive centroid (all
+    👍 averaged + anchor) -- the single vector persisted for export / the offline
+    scan. Neither the multi-cluster max nor the negative penalty is expressible as
+    one vector, so export/scan use this representative centroid.
+    """
+    if not positive_indices:
+        raise ValueError("refine_scores needs at least one positive example")
+
+    def _prototype(local_idxs: list[int]) -> np.ndarray:
+        # Reuse refine_query for the unit(mean(..)) + text-anchor logic exactly.
+        global_idxs = [positive_indices[i] for i in local_idxs]
+        return refine_query(
+            corpus, global_idxs, negative_indices=None,
+            text_vector=text_vector, negative_weight=0.0, text_weight=text_weight,
+        )
+
+    pos = corpus.matrix[positive_indices].astype("float32")  # unit rows
+    clusters = _positive_clusters(pos)
+    protos = [_prototype(c) for c in clusters]
+    # Rank by the NEAREST positive cluster prototype.
+    scores = np.maximum.reduce([score_corpus(w, corpus) for w in protos])
+    # Representative single vector to persist (export / offline scan).
+    w_pos = protos[0] if len(clusters) == 1 else _prototype(list(range(pos.shape[0])))
+
+    if negative_indices and negative_weight > 0.0:
+        # max over negatives: one score_corpus pass per 👎 (reuses the app's exact
+        # dtype handling), then element-wise max -> closeness to the nearest 👎.
+        penalty = np.maximum.reduce(
+            [score_corpus(corpus.matrix[j], corpus) for j in negative_indices]
+        )
+        scores = scores - float(negative_weight) * penalty.astype(scores.dtype)
+    return scores, w_pos
+
+
+def centroid_query(corpus: Corpus, indices: list[int]) -> np.ndarray:
+    """Nearest-centroid relevance feedback over the given positive rows.
+
+    Thin wrapper over `refine_query` (positives only) for the simple case and
+    existing callers.
+    """
+    return refine_query(corpus, positive_indices=indices)

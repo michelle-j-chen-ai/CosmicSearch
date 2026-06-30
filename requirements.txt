@@ -1,0 +1,53 @@
+# torch + torchvision are installed separately in the Dockerfile from the CPU
+# wheel index (download.pytorch.org/whl/cpu) to avoid pulling CUDA wheels.
+streamlit>=1.30.0
+transformers==4.51.3
+einops
+numpy
+lancedb==0.30.2
+pylance==4.0.0
+pyarrow
+# Roaring-bitmap decode for the fast segment-set downsample: a DORA dataset's
+# membership comes back as one serialized roaring bitmap (DescribeDataSet
+# include_bitmap), intersected against the corpus's dx_internal_id column.
+pyroaring>=1.0.0
+boto3>=1.36.0
+botocore>=1.36.0
+# FastAPI frontend (web_server.py + web/) served by uvicorn.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+# Apps Platform Postgres (exp-db) export log. Cloud Run uses the Cloud SQL
+# connector + pg8000 with IAM auth; SQLAlchemy wraps the engine.
+SQLAlchemy>=2.0.0
+cloud-sql-python-connector[pg8000]>=1.9.0
+pg8000>=1.30.0
+# Runtime deps for the VENDORED DORA proto stubs (adp/, COPYed in the
+# Dockerfile). The stubs need only grpc + protobuf + the google.api annotations;
+# the heavy data-explorer-py extras (requests/retrying/trino/matplotlib/simian)
+# are NOT needed because dora_client avoids importing adp.public.strada.dora.
+grpcio>=1.50.0
+protobuf>=4.21,<8
+googleapis-common-protos>=1.66.0
+# Submit/poll the offline NLS scans as Lilypad workloads (nls_launcher.py). The lilypad_py
+# wheel is on the AUTHENTICATED Applied (ursa) index (not public PyPI) and its declared
+# deps include ray/wandb/oci (heavy, unused by the submit path) -- so it is VENDORED
+# (vendor/lilypad_py-*.whl) and installed --no-deps in the Dockerfile. Here we add only the
+# light import-closure the submit path needs that isn't already pinned above (boto3/grpcio/
+# protobuf/pydantic are shared). Pin 2.26.0 in vendor/: the cluster speaks 2.26.0 (2.27.0
+# returns UNIMPLEMENTED for the launch RPCs).
+omegaconf>=2.3
+msgspec>=0.18
+aistore>=1.13
+psutil>=5.9
+click>=8.0
+rich>=13.0
+tenacity>=8.0
+tabulate>=0.9
+cryptography>=41.0
+pyOpenSSL>=23.0
+circuitbreaker>=2.0
+# CPU fast path for the int8 PCA corpus backend (gpu_corpus.py, NLS_DEVICE=cpu):
+# a numba-fused int8 dot kernel reads the 12.2GB int8 corpus once per query
+# (~0.25s) instead of a ~11s int8->fp32 cast + BLAS. Imported lazily.
+numba>=0.59

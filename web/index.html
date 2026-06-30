@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VLM Video Search</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="grain"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span id="platform-tag" class="platform-tag" title="Active platform"></span>
+      <nav class="maintabs">
+        <a href="/" class="tab active">Natural-Language Video Search</a>
+        <a href="/curate" class="tab">Search history &amp; export</a>
+      </nav>
+    </div>
+    <div class="topright">
+      <label class="pagesize" title="Results shown per page">per page
+        <select id="page-size">
+          <option>12</option><option selected>24</option><option>48</option><option>96</option>
+        </select>
+      </label>
+      <div class="corpus-stack">
+        <div id="corpus-pill" class="corpus-pill" title="Active corpus">loading corpus…</div>
+        <!-- Corpus + model switchers — tiny lines tucked under the active pill. -->
+        <div class="corpus-bar">
+          <span class="corpus-k">corpus</span>
+          <input id="embeddings-uri" type="text" class="plain"
+                 placeholder="s3://…/chunks.lance  or  s3://…/embeddings/<session>/" />
+          <button id="load-corpus" type="button" class="ghost">Load</button>
+          <span id="corpus-note" class="note"></span>
+        </div>
+        <div class="corpus-bar">
+          <span class="corpus-k">model</span>
+          <input id="model-uri" type="text" class="plain"
+                 placeholder="s3://…/models/<ckpt>/   (empty = base Cosmos-Embed1)" />
+          <button id="load-model" type="button" class="ghost">Load</button>
+          <span id="model-note" class="note"></span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- SAVE-VECTOR FLYOUT — collapsed strip on the RIGHT edge (paired with Filters);
+         hover (or focus) slides it out. Persists the current (refined) search vector under
+         a tag so it can be reused on the Export page. Downloading CSVs + offline scans live on
+         the "Export" tab (pick saved searches from history, download CSV from the resident
+         corpus, or launch the per-segment Lilypad scan over the full corpus). -->
+    <aside id="save-panel" class="export-panel" aria-label="Save vector">
+      <div class="flyout-tab"><span>Save vector</span></div>
+      <div class="export-body">
+        <label>Save search vector</label>
+        <div class="export-field">
+          <p class="note">Store the current (refined) query vector under a tag — it then appears in
+            your history on the <strong>Export</strong> tab, where you can download a CSV from the
+            loaded corpus or launch a per-segment scan over the full corpus.</p>
+          <input id="save-vec-tag" type="text" placeholder="tag name (e.g. left_turn)" />
+          <button id="save-vec-btn" type="button" class="primary">Save vector</button>
+          <div id="save-vec-note" class="note"></div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- FILTERS FLYOUT — collapsed strip on the RIGHT edge; hover (or focus)
+         slides the vertical filter panel out. Mirrors the export tab. -->
+    <aside id="filter-panel" class="filter-panel" aria-label="Filters">
+      <div class="flyout-tab"><span>Filters</span></div>
+      <div class="filter-body">
+        <div class="control">
+          <label>Date range (UTC)</label>
+          <div class="date-stack">
+            <input id="from-date" type="date" />
+            <span class="dash">→</span>
+            <input id="to-date" type="date" />
+          </div>
+        </div>
+
+        <div class="control">
+          <label>Data Explorer segment set <span class="muted">(superset)</span></label>
+          <div id="segset-combo" class="combo">
+            <input id="segset-filter" type="text" autocomplete="off" role="combobox"
+                   aria-expanded="false" aria-autocomplete="list"
+                   placeholder="type a keyword to search sets… (none by default)" />
+            <button id="segset-clear" type="button" class="combo-clear hidden" title="Clear segment set" aria-label="Clear segment set">×</button>
+            <div id="segset-menu" class="combo-menu hidden" role="listbox"></div>
+          </div>
+          <div id="segset-note" class="note"></div>
+        </div>
+
+        <div class="control">
+          <label>Lance dataset downsample <span class="muted">(segment cross-ref)</span></label>
+          <div id="lance-combo" class="combo">
+            <input id="lance-filter" type="text" autocomplete="off"
+                   placeholder="s3://…/seg_map.parquet  or  s3://…/dataset.lance  — Enter to apply" />
+            <button id="lance-clear" type="button" class="combo-clear hidden" title="Clear dataset" aria-label="Clear dataset">×</button>
+          </div>
+          <div id="lance-note" class="note">keeps only chunks whose segment_id is in this dataset</div>
+        </div>
+
+        <div class="control">
+          <label>Vehicle id <span class="muted">(comma/space-separated)</span></label>
+          <div id="vehicle-combo" class="combo">
+            <input id="vehicle-filter" type="text" autocomplete="off"
+                   placeholder="e.g. truck-808, truck-810  — Enter to apply" />
+            <button id="vehicle-clear" type="button" class="combo-clear hidden" title="Clear vehicle" aria-label="Clear vehicle">×</button>
+          </div>
+          <div id="vehicle-note" class="note">keeps only chunks from these vehicles (corpus must carry a vehicle column)</div>
+        </div>
+
+        <div class="control">
+          <label>Drive id <span class="muted">(run_uuid, comma/space-separated)</span></label>
+          <div id="drive-combo" class="combo">
+            <input id="drive-filter" type="text" autocomplete="off"
+                   placeholder="e.g. 019eb27f-…, 019e69c5-…  — Enter to apply" />
+            <button id="drive-clear" type="button" class="combo-clear hidden" title="Clear drive id" aria-label="Clear drive id">×</button>
+          </div>
+          <div id="drive-note" class="note">keeps only chunks from these drives (run_uuids)</div>
+        </div>
+      </div>
+    </aside>
+
+    <div id="search-view">
+    <!-- SEARCH -->
+    <section class="search-block">
+      <form id="search-form" class="search-bar" autocomplete="off">
+        <span class="search-icon">⌕</span>
+        <input id="query" type="text" placeholder="Describe a moment — e.g. ego makes an unprotected left turn across oncoming traffic" />
+        <button id="search-btn" type="submit">Search</button>
+      </form>
+      <div id="examples" class="examples"></div>
+    </section>
+
+    <!-- ACTIVE FILTERS + STATUS -->
+    <div id="filterbar" class="filterbar hidden"></div>
+
+    <!-- REFINE (relevance feedback) -->
+    <div id="refinebar" class="refinebar hidden">
+      <button id="refine-btn" class="primary" disabled>Refine (mark 👍 first)</button>
+      <button id="clear-marks" class="ghost">Clear marks</button>
+      <!-- On click: show the whole-corpus similarity histogram and jump to it;
+           drag/click the chart to set the threshold. Not shown until clicked. -->
+      <button id="dist-btn" type="button" class="ghost"
+              title="Show the similarity-score distribution for this search and jump to it">Similarity distribution</button>
+      <span id="mark-count" class="note"></span>
+      <span class="refine-knobs">
+        <label title="How hard to push away from 👎">avoid-👎
+          <input id="neg-weight" type="range" min="0" max="2" step="0.1" value="0.5" />
+        </label>
+        <!-- Classic Rocchio query term (alpha*q0): anchoring refine to the
+             original query reduces drift, so it's on by default. -->
+        <label><input id="blend-text" type="checkbox" checked /> blend text query</label>
+        <input id="text-weight" type="range" min="0" max="1" step="0.05" value="0.3" />
+      </span>
+    </div>
+
+    <!-- SIMILARITY DISTRIBUTION — whole-corpus score histogram, shown at the TOP
+         (above results) so it's visible without scrolling. Populated by the
+         "Similarity distribution" button or the interval preview. -->
+    <section id="score-dist-view" class="score-dist-view hidden"></section>
+
+    <!-- PAGER + JUMP (top) -->
+    <nav id="pager" class="pager hidden">
+      <button id="prev" class="ghost">← Prev</button>
+      <span id="page-label" class="page-label"></span>
+      <button id="next" class="ghost">Next →</button>
+      <span class="jump">
+        <input id="jump-rank" type="number" min="1" placeholder="rank #" />
+        <button id="jump-rank-btn" class="ghost">Jump</button>
+        <input id="jump-score" type="number" step="0.01" placeholder="sim ≤" />
+        <button id="jump-score-btn" class="ghost">Go</button>
+      </span>
+      <!-- Direct top-k CSV export of the current search — shown where there is no offline
+           workflow (e.g. trucking), restoring the original search-page Download CSV. -->
+      <span class="search-export requires-no-offline-scan">
+        <label class="dedup-toggle" title="Keep only the best (highest-scoring) clip per segment_id, so the CSV holds k distinct segments rather than k clips">
+          <input id="search-export-dedup" type="checkbox" /> dedup by segment
+        </label>
+        <input id="search-export-k" type="number" min="1" value="100" title="how many top results to export to CSV" />
+        <button id="search-export-btn" type="button" class="ghost" title="Download a CSV of the current search's top-k from the loaded corpus (honors active filters)">Download CSV</button>
+      </span>
+    </nav>
+
+    <!-- RESULTS -->
+    <section id="status" class="status">Type a query above to begin.</section>
+    <section id="grid" class="grid"></section>
+    </div><!-- /search-view -->
+
+    <!-- EXPORT — pick saved searches from history (per-row k), then preview / download
+         CSV from the loaded corpus, or launch the full-corpus per-segment scan. -->
+    <section id="curate-view" class="hidden">
+      <div class="curate-head">
+        <h2>Search history &amp; export</h2>
+        <p class="curate-sub">Your saved searches (one row per <strong>tag</strong>, with its saved
+          vector, <code>k</code>, and filters) are listed below — tick the ones you want, set
+          <code>k</code> per row, then <strong>Download CSV</strong> of each tag's top-k from the
+          loaded corpus. Download honors all active <strong>Filters</strong> below
+          (date / segment set / lance / vehicle / drive).<span class="requires-offline-scan"> Or
+          set a per-row <code>threshold</code> and <strong>Launch offline segment scan</strong> to run
+          every pick over the FULL corpus (Lilypad → a per-segment Lance, one interval column per
+          tag); the scan currently enforces the <em>date range</em> (the other filters are recorded
+          with it).</span></p>
+
+        <!-- Search history = the selectable picker (one row per tag): tick + edit k/threshold. -->
+        <div class="export-history-bar">
+          <input id="export-hist-filter" type="text" class="plain" placeholder="filter history by query or tag…" />
+          <label class="curate-k-label" title="k applied to a row when first ticked, and to ad-hoc lines">
+            default k <input id="curate-k" type="number" min="1" value="50" />
+          </label>
+          <label class="curate-k-label requires-offline-scan" title="per-tag cosine threshold applied to a row when first ticked, and to ad-hoc lines">
+            default threshold <input id="curate-threshold" type="number" step="0.01" min="0" max="1" value="0.3" />
+          </label>
+          <span class="curate-toolbar-spacer"></span>
+          <button id="export-hist-all" type="button" class="ghost">Select all</button>
+          <button id="export-hist-none" type="button" class="ghost">Select none</button>
+          <button id="export-hist-reload" type="button" class="ghost">Reload</button>
+        </div>
+        <div id="export-history" class="export-history"></div>
+
+        <!-- Optional ad-hoc queries not present in history. -->
+        <details class="export-adhoc">
+          <summary>add ad-hoc queries (not in history) — <code>query, k, threshold</code> per line</summary>
+          <textarea id="curate-queries" rows="3" spellcheck="false"
+            placeholder="one query, k, threshold per line (k/threshold optional)&#10;straight highway, 50, 0.30&#10;highway entrances or exits, 50, 0.28"></textarea>
+        </details>
+
+        <!-- Scan filters: the SAME filter controls used for search, docked inline here so the
+             scope the offline scan runs with is visible and editable in place (no hover flyout).
+             Pre-loaded with the active filters by default; edit/clear any before launching. The
+             filter-body node is moved in/out of here on view switches (one source of truth). -->
+        <div class="curate-filter-dock">
+          <div class="curate-filter-dock-head">
+            <span>Filters</span>
+            <span class="note">applied to Download CSV (and the offline scan, where available), and saved with each launched vector — edit or clear any below</span>
+          </div>
+          <div id="curate-filter-host"></div>
+        </div>
+
+        <!-- Actions over the assembled set (ticked history rows + ad-hoc lines). Each
+             tag carries its OWN k + threshold (set per row above) — no global cutoff.
+             Two actions: Download CSV (resident corpus) and Launch offline segment scan. -->
+        <div class="curate-launch">
+          <button id="curate-csv-btn" type="button" class="primary"
+                  title="Download a CSV of each tag's top-k from the loaded corpus">Download CSV</button>
+          <label class="export-toggle" title="Keep only the best (highest-scoring) clip per segment_id, so the CSV holds distinct segments rather than clips that may repeat a segment">
+            <input id="curate-csv-dedup" type="checkbox" /> dedup by segment
+          </label>
+          <span class="curate-toolbar-spacer"></span>
+          <label class="export-toggle requires-offline-scan" title="When the scan completes, register its qualifying segments as a DORA segment set so the results are browsable in Data Explorer">
+            <input id="curate-scan-segset" type="checkbox" /> register DX segment set
+          </label>
+          <button id="curate-scan-btn" type="button" class="primary requires-offline-scan"
+                  title="Run the assembled tags over the FULL corpus offline (Lilypad); each tag uses its own threshold. Writes a per-segment Lance (segment_id + one interval column per tag)">Launch offline segment scan</button>
+        </div>
+        <div id="curate-note" class="note"></div>
+        <div id="curate-scan-note" class="note"></div>
+
+        <!-- Recent launched scans: durable across reloads (backed by scan_jobs). -->
+        <div class="scan-jobs-head requires-offline-scan">
+          <span>Recent scans</span>
+          <button id="scan-jobs-reload" type="button" class="ghost">Reload</button>
+        </div>
+        <div id="scan-jobs" class="scan-jobs requires-offline-scan"></div>
+      </div>
+    </section>
+
+    <!-- SEARCH HISTORY (loaded client-side, no full reload) -->
+    <section id="history-view" class="hidden"></section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

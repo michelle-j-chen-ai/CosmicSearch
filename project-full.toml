@@ -1,0 +1,29 @@
+# Deploy config for the -full sibling service `vlm-nls-search-full`
+# (https://vlm-nls-search-full.experimental.apps.applied.dev). Runs the same
+# app image as the base service but as a separate Cloud Run service backed by
+# the white-dwarf-int8 corpus (47.8M rows, int8 PCA-256, 12.2GB).
+# Deploy with:
+#   apps-platform app deploy -c project-full.toml
+name = "vlm-nls-search-full"
+enable_filestore = false
+enable_gcs_fuse = true
+enable_postgres = true
+enable_mysql = false
+enable_secrets = true
+enable_api_gateway = false
+enable_slack = false
+
+[cloudrun]
+  # ~5.3GB model (fp32) + 12.2GB int8 corpus resident on cpu + metadata + overhead.
+  # Cloud Run requires >= 8 vCPU for 32GiB of memory.
+  memory = "32Gi"
+  cpu = "8"
+  timeout = "600s"
+  # Keep TWO instances warm so a rolling recycle stays invisible.
+  min_instances = 2
+  max_instances = 3
+
+[metadata]
+  owner = "sibo.geng@applied.co"
+  maintainers = ["michelle.chen@applied.co"]
+  description = "Natural-language similarity search over VLM (Cosmos-Embed) video embeddings -- full int8 corpus"

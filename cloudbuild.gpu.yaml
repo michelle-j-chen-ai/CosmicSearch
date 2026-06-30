@@ -1,0 +1,15 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - Dockerfile.gpu
+      - -t
+      - us-west1-docker.pkg.dev/experimental-apps-v2/apps-platform-repository/vlm-nls-search-full-gpu:latest
+      - .
+images:
+  - us-west1-docker.pkg.dev/experimental-apps-v2/apps-platform-repository/vlm-nls-search-full-gpu:latest
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s

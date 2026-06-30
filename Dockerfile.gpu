@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# GPU (NVIDIA L4) variant of the nls_search_app image. Identical to Dockerfile
+# except it installs CUDA torch wheels so gpu_corpus's `cuda` path can hold the
+# int8 corpus in L4 VRAM (24GB) and score on-GPU -- sidestepping the 32GiB CPU
+# RAM ceiling that OOM-kills the CPU build on the 47.8M-row corpus.
+# Deploy target: Cloud Run GPU in a GPU region (us-central1) with NLS_DEVICE=cuda.
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# CUDA torch stack (cu126 wheels bundle the CUDA runtime; the Cloud Run GPU host
+# provides the driver). torchvision is required by the Cosmos-Embed remote code.
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cu126 \
+      torch==2.8.0 torchvision==0.23.0
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Vendored DORA SDK proto stubs (see Dockerfile for why adp/ is local).
+COPY adp/ ./adp/
+
+COPY config.py oci_s3.py local_cache.py search_engine.py analytics.py app.py ./
+COPY gpu_corpus.py ./
+COPY web_server.py dora_client.py db.py machine_auth.py ./
+COPY web ./web
+
+ENV HF_HOME=/tmp/hf_cache
+ENV PORT=8080
+EXPOSE 8080
+
+COPY entrypoint.sh ./
+RUN chmod +x entrypoint.sh
+CMD ["./entrypoint.sh"]
