@@ -255,6 +255,13 @@ function renderExamples() {
 
 function wireEvents() {
   $("search-form").addEventListener("submit", (e) => { e.preventDefault(); runSearch({ page: 0 }); });
+  $("video-search-toggle").addEventListener("click", () => {
+    const panel = $("video-search-panel");
+    const open = panel.classList.toggle("hidden") === false;
+    $("video-search-toggle").setAttribute("aria-expanded", String(open));
+    $("video-search-toggle").textContent = (open ? "▼" : "▶") + " Search by video clip";
+  });
+  $("vs-search-btn").addEventListener("click", () => runWindowSearch({ page: 0 }));
   $("page-size").addEventListener("change", () => {
     state.pageSize = parseInt($("page-size").value, 10);
     if (state.query) reload({ page: 0 });
@@ -637,7 +644,46 @@ async function runRefine(startOpts) {
 function reload(startOpts) {
   if (state.mode === "refine") return runRefine(startOpts);
   if (state.mode === "resume") return runVectorSearch(startOpts);
+  if (state.mode === "window") return runWindowSearch(startOpts);
   return runSearch(startOpts);
+}
+
+// ---------- search by video clip (query-by-example over the corpus) ----------
+// Accept a unix timestamp typed as seconds or nanoseconds; normalize to ns
+// (the API divides back to seconds). Blank -> 0 (that side of the window open).
+function _toNs(raw) {
+  const v = (raw || "").trim().replace(/[_,\s]/g, "");
+  if (!v) return 0;
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return 0;
+  // < 1e12 is implausible as ns (would be < year 2001), so treat it as seconds.
+  return n < 1e12 ? Math.round(n * 1e9) : Math.round(n);
+}
+
+async function runWindowSearch(startOpts) {
+  // Paging/filter reloads reuse the window captured on the first run.
+  if (startOpts && startOpts.page === 0 || !state.windowReq) {
+    const run_uuid = $("vs-run-uuid").value.trim();
+    const segment_id = $("vs-segment-id").value.trim();
+    if (!run_uuid && !segment_id) {
+      setStatus("Enter a drive (run_uuid) or a segment id to search by clip.", true);
+      return;
+    }
+    const key = run_uuid || segment_id;
+    state.windowReq = {
+      run_uuid, segment_id,
+      start_ns: _toNs($("vs-start").value),
+      end_ns: _toNs($("vs-end").value),
+      query: "video clip: " + key,
+    };
+  }
+  state.mode = "window";
+  state.query = state.windowReq.query;
+  await _issue("/api/search_by_window", {
+    ...state.windowReq,
+    ...(startOpts || {}),
+    ..._filterBody(),
+  }, "search");
 }
 
 // ---------- resume a saved search (from Search history) ----------
@@ -781,8 +827,37 @@ async function _issue(endpoint, body, mode) {
       `similarity ${data.score_lo}–${data.score_hi}`
     );
   }
+  renderQueryStrip(data);
   renderGrid(data.hits);
   renderPager(data);
+}
+
+// The matched example chunks for a "search by video clip" query (a filmstrip
+// above the results). Hidden for ordinary text/resume searches.
+function renderQueryStrip(data) {
+  const strip = $("query-strip");
+  const clips = data.query_clips;
+  if (!clips || !clips.length) {
+    strip.classList.add("hidden");
+    strip.innerHTML = "";
+    return;
+  }
+  const span = data.query_span_seconds
+    ? ` · ${fmtInt(data.query_span_seconds)}s` : "";
+  const head = document.createElement("div");
+  head.className = "query-strip-head";
+  head.textContent =
+    `Query clip — averaged ${fmtInt(data.query_chunk_count)} chunk(s)${span}` +
+    (clips.length < data.query_chunk_count ? ` (showing ${clips.length})` : "");
+  const row = document.createElement("div");
+  row.className = "query-strip-row";
+  clips.forEach((h) => row.appendChild(buildHitCard(h, {
+    cardClass: "query-card", badge: "query",
+  })));
+  strip.innerHTML = "";
+  strip.appendChild(head);
+  strip.appendChild(row);
+  strip.classList.remove("hidden");
 }
 
 let _segPoll = null;
@@ -1054,6 +1129,9 @@ async function saveVector() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         tag, query: state.query,
+        // Remember the chosen export defaults (k + cosine threshold; blank threshold = top-k).
+        k: parseInt($("save-vec-k").value, 10) || 0,
+        threshold: parseFloat($("save-vec-threshold").value) || 0,
         // Persist the active filter set with the vector so Resume restores it exactly.
         ..._activeFilters(),
       }),
@@ -1076,9 +1154,11 @@ async function launchCurateScan() {
   const set = collectExportQueries();
   const tags = [...new Set(set.map((x) => x.query))].filter(Boolean);
   if (!tags.length) { scanNote(noteId, "Tick at least one saved search (or add an ad-hoc line).", true); return; }
-  // Per-tag cosine threshold (no single global cutoff).
+  // Per-tag cosine threshold (no single global cutoff). A blank/0 row falls back to the
+  // default-threshold input (a scan always needs a positive cutoff, unlike top-k CSV export).
+  const defThr = parseFloat($("curate-threshold").value) || 0.3;
   const thresholds = {};
-  set.forEach((x) => { thresholds[x.query] = x.threshold; });
+  set.forEach((x) => { thresholds[x.query] = x.threshold > 0 ? x.threshold : defThr; });
   const btn = $("curate-scan-btn");
   btn.disabled = true;
   scanNote(noteId, `Launching per-segment scan over ${tags.length} tag(s)…`);
@@ -1088,6 +1168,7 @@ async function launchCurateScan() {
       body: JSON.stringify({
         tags, thresholds, default_threshold: parseFloat($("curate-threshold").value) || 0.3,
         create_segment_set: $("curate-scan-segset").checked,
+        merge_intervals: $("curate-scan-merge").checked,
         // Full active filter set (forwarded into the workflow + persisted with the scan;
         // date applied by the worker today). Same set shown in the Scan filters summary.
         ..._activeFilters(),
@@ -1323,7 +1404,9 @@ const CURATE_CAP = 60; // cards rendered in the selection grid before "show all"
 // optional; missing values fall back to the default-k / default-threshold inputs.
 function parseConfigQueries(queriesId, defKId, defThreshId) {
   const defK = parseInt($(defKId).value || "50", 10) || 50;
-  const defT = defThreshId ? (parseFloat($(defThreshId).value) || 0.3) : 0.3;
+  // Default threshold 0 = top-k (the historical Download CSV default); a positive
+  // default-threshold input switches unspecified lines to similarity-cutoff mode.
+  const defT = defThreshId ? (parseFloat($(defThreshId).value) || 0) : 0;
   return $(queriesId).value
     .split("\n")
     .map((l) => l.trim())
@@ -1397,7 +1480,6 @@ function renderExportHistory() {
     return;
   }
   const defK = parseInt($("curate-k").value || "50", 10) || 50;
-  const defT = parseFloat($("curate-threshold").value) || 0.3;
   const body = rows
     .map((e, i) => {
       // Global friendly model name (server-provided via _MODEL_LABELS, e.g. white-dwarf).
@@ -1419,13 +1501,13 @@ function renderExportHistory() {
         <td class="exp-meta muted" title="${escapeHtml(e.model_uri || "base model")}">${escapeHtml(model)} · ${dim}</td>
         <td class="exp-filters muted" title="${escapeHtml(filt || "no filters saved")}">${filt ? escapeHtml(filt) : "—"}</td>
         <td class="exp-kc"><input type="number" class="exp-k" min="1" value="${e.k || defK}" /></td>
-        <td class="exp-tc requires-offline-scan"><input type="number" class="exp-t" step="0.01" min="0" max="1" value="${e.threshold > 0 ? e.threshold : defT}" title="per-tag cosine threshold for the scan (saved from the last launch)" /></td>
+        <td class="exp-tc"><input type="number" class="exp-t" step="0.01" min="0" max="1" placeholder="top-k" value="${e.threshold > 0 ? e.threshold : ''}" title="per-tag cosine threshold: Download CSV keeps clips >= this (capped at k); blank = top-k. Also used by the offline scan (which falls back to the default)." /></td>
         <td class="exp-open-c">${openBtn}</td>
       </tr>`;
     })
     .join("");
   wrap.innerHTML = `<table class="exp-hist-table">
-      <thead><tr><th></th><th>tag</th><th>query</th><th>corpus model · vec</th><th>filters</th><th>k</th><th class="requires-offline-scan">thresh</th><th></th></tr></thead>
+      <thead><tr><th></th><th>tag</th><th>query</th><th>corpus model · vec</th><th>filters</th><th>k</th><th>thresh</th><th></th></tr></thead>
       <tbody>${body}</tbody></table>`;
   filterExportHistory();
 }
@@ -1454,17 +1536,19 @@ function exportHistSelectAll(on) {
 function collectExportQueries() {
   const out = [];
   const seen = new Set();
-  const defT = parseFloat($("curate-threshold").value) || 0.3;
   const push = (query, k, threshold) => {
     const qq = (query || "").trim().replace(/,+$/, "");
     if (!qq) return;
     const key = qq.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
+    // Raw per-row threshold: >0 => similarity-cutoff mode; 0/blank => pure top-k. Each
+    // consumer applies its own default (Download CSV keeps 0 = top-k; the scan substitutes
+    // its default_threshold for 0 since a scan always needs a positive cutoff).
     out.push({
       query: qq,
       k: parseInt(k, 10) || 50,
-      threshold: Number(threshold) > 0 ? Number(threshold) : defT,
+      threshold: Number(threshold) > 0 ? Number(threshold) : 0,
     });
   };
   // History rows are keyed by TAG (the DB primary key + the scan's Lance column name).
@@ -1615,8 +1699,8 @@ async function downloadCsv() {
   const set = collectExportQueries();
   if (!set.length) { curateNote("Tick at least one saved search (or add an ad-hoc line).", true); return; }
   if (!state.embeddingsUri) { curateNote("Load a corpus first.", true); return; }
-  const queries = set.map((x) => ({ query: x.query, k: x.k }));
-  curateNote(`Exporting top-k for ${queries.length} tag(s) from the loaded corpus…`);
+  const queries = set.map((x) => ({ query: x.query, k: x.k, threshold: x.threshold || 0 }));
+  curateNote(`Exporting ${queries.length} tag(s) from the loaded corpus…`);
   $("curate-csv-btn").disabled = true;
   try {
     const resp = await fetch("/api/export_config", {
@@ -1624,6 +1708,8 @@ async function downloadCsv() {
       body: JSON.stringify({
         queries, dedupe: true,
         dedupe_segment: $("curate-csv-dedup").checked,
+        // Also register the exported segments as a DORA / Data Explorer segment set.
+        create_segment_set: $("curate-csv-segset").checked,
         from_date: $("from-date").value || null,
         to_date: $("to-date").value || null,
         segment_set_uuid: state.segUuid,
@@ -1644,7 +1730,8 @@ async function downloadCsv() {
     a.href = url; a.download = exportFilename(resp, "config_export.csv");
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
-    curateNote(`Downloaded CSV for ${queries.length} tag(s)` + (parquet ? ` · parquet → ${parquet}` : " · ⚠ parquet not written"), !parquet);
+    curateNote(`Downloaded CSV for ${queries.length} tag(s)` +
+      (parquet ? ` · parquet → ${parquet}` : " · ⚠ parquet not written") + segsetNote(resp), !parquet);
   } catch (e) {
     curateNote("Download failed: " + e.message, true);
   } finally {

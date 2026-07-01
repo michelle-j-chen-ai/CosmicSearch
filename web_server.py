@@ -504,6 +504,41 @@ def _lance_filter_ids(uri: str) -> tuple[str, frozenset[str]]:
     return key, ids
 
 
+# Cap on inline downsample ids passed in the workload config (gRPC ~4MB; a segment_id is
+# ~60 chars). Beyond this the dataset should be narrowed (or moved to an object the worker
+# GETs by exact key -- a future scale-up).
+_SCAN_DOWNSAMPLE_MAX = 50_000
+
+
+def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
+    """``(corpus_key, sorted ids)`` for the OFFLINE-SCAN downsample dataset at ``uri``.
+
+    The Lilypad worker's role has S3 GET/HEAD but NOT LIST, so it can't enumerate a dataset
+    prefix itself. The app (which has list+read -- it already powers the in-app lance filter)
+    resolves the membership here and passes the ids inline in the workload config. Uses the
+    segment_id-first priority (no dx) so the worker can match the segment_id string space."""
+    local_dir = _lance_filter_cache_dir(uri)
+    if not local_dir.exists():
+        tmp = local_dir.with_name(local_dir.name + ".tmp")
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        oci_s3.download_s3_prefix(uri.rstrip("/") + "/", tmp, oci_s3.s3_client(fast_fail=True))
+        local_dir.parent.mkdir(parents=True, exist_ok=True)
+        tmp.replace(local_dir)
+    is_lance = uri.rstrip("/").endswith(".lance")
+    key, ids = search_engine.read_filter_ids(
+        local_dir, is_lance, key_columns=search_engine._SCAN_FILTER_KEY_COLUMNS
+    )
+    if not ids:
+        raise ValueError("downsample dataset has no usable segment ids")
+    if len(ids) > _SCAN_DOWNSAMPLE_MAX:
+        raise ValueError(
+            f"downsample dataset has {len(ids)} ids (> {_SCAN_DOWNSAMPLE_MAX}); narrow it"
+        )
+    LOGGER.info("scan downsample %s -> %d %s ids", uri, len(ids), key)
+    return key, sorted(ids)
+
+
 def _dx_bitmap_from_segment_ids(corpus, seg_ids):
     """Roaring bitmap of the ``dx_internal_id``s of corpus rows whose ``segment_id``
     is in ``seg_ids`` -- i.e. convert a segment-id downsample set to the dx-internal
@@ -789,9 +824,39 @@ class VectorSearchRequest(BaseModel):
     embeddings_uri: str | None = None
 
 
+class WindowSearchRequest(BaseModel):
+    """Search by an example video window already embedded in the corpus.
+
+    The user names a drive (``run_uuid``) or 30s source segment (``segment_id``)
+    and an optional [start_ns, end_ns] window; the matching pre-embedded chunks
+    are mean-pooled into the query vector. Carries the same date / segment-set /
+    vehicle / drive filters as the other search endpoints.
+    """
+
+    run_uuid: str = ""
+    segment_id: str = ""
+    start_ns: int = 0  # window start, unix nanoseconds (0 = open on this side)
+    end_ns: int = 0  # window end, unix nanoseconds (0 = open on this side)
+    query: str = ""  # optional label for search history
+    page: int = 0
+    page_size: int = 24
+    start_rank: int | None = None
+    start_score: float | None = None
+    from_date: str | None = None
+    to_date: str | None = None
+    segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    embeddings_uri: str | None = None
+
+
 class ConfigQuery(BaseModel):
     query: str
     k: int = 100
+    # Per-query cosine cutoff. >0 => keep clips with score >= threshold (capped at k as a
+    # safety max); 0/unset => pure top-k. Lets Download CSV select by similarity OR by rank.
+    threshold: float = 0.0
 
 
 class ConfigExportRequest(BaseModel):
@@ -1203,6 +1268,98 @@ def search_by_vector(req: VectorSearchRequest) -> dict:
     return out
 
 
+@app.post("/api/search_by_window")
+def search_by_window(req: WindowSearchRequest) -> dict:
+    """Search by an example video window (query-by-example over the corpus).
+
+    Resolve the mini-segment chunks already embedded for the given drive/segment
+    and time window, mean-pool their embeddings into a query vector, then rank
+    the corpus exactly like /api/search_by_vector -- same date + segment-set
+    filters, same paging, and the pooled vector is cached so a follow-up export
+    (Download CSV / save vector / register segment set) persists it. Also returns
+    ``query_clips``: a handful of the matched chunks (filmstrip preview).
+    """
+    _require_ready()
+    if not req.run_uuid.strip() and not req.segment_id.strip():
+        raise HTTPException(400, "provide a run_uuid or segment_id for the query window")
+    t0 = time.time()
+    uri = (req.embeddings_uri or _state["active_uri"]).strip()
+    try:
+        corpus = _get_corpus(uri)
+    except _CORPUS_ERRORS as exc:
+        raise HTTPException(400, f"could not load corpus: {exc}")
+    # UI works in unix nanoseconds (like the result timestamps); the corpus
+    # chunk_start/end are unix seconds. 0 leaves that side of the window open.
+    start_s = int(req.start_ns) // 1_000_000_000 if req.start_ns else 0
+    end_s = int(req.end_ns) // 1_000_000_000 if req.end_ns else 0
+    try:
+        wm = search_engine.window_query(
+            corpus,
+            run_uuid=req.run_uuid,
+            segment_id=req.segment_id,
+            start_unix=start_s,
+            end_unix=end_s,
+        )
+    except ValueError as exc:
+        raise HTTPException(404, str(exc))
+    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
+    seg_mask, pending, seg_count, lance_count, lance_key, lance_err, seg_sig = (
+        _combined_mask(
+            uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
+        )
+    )
+    scores = search_engine.score_corpus(wm.vector, corpus)
+    order = search_engine.ranked_order(
+        scores, corpus, start_unix=start_unix, end_unix=end_unix, allowed_mask=seg_mask
+    )
+    # Cache like search_by_vector so paging reuses the ranking and a follow-up
+    # export persists this pooled query vector.
+    _state["last"] = {
+        "sig": (
+            "window",
+            uri,
+            req.run_uuid.strip(),
+            req.segment_id.strip(),
+            start_s,
+            end_s,
+            start_unix,
+            end_unix,
+            seg_sig,
+        ),
+        "scores": scores,
+        "order": order,
+        "vec": wm.vector,
+    }
+    key = req.run_uuid.strip() or req.segment_id.strip()
+    label = req.query.strip() or f"video window: {key}"
+    out = _window(
+        corpus,
+        scores,
+        order,
+        req.page,
+        req.page_size,
+        req.start_rank,
+        req.start_score,
+        t0,
+        label,
+    )
+    # The matched query chunks (score = their cosine to the pooled vector).
+    out["query_clips"] = [
+        _hit_dict(search_engine._hit(corpus, scores, i, 0)) for i in wm.preview
+    ]
+    out["query_chunk_count"] = int(wm.indices.size)
+    out["query_span_seconds"] = int(wm.span_seconds)
+    out["segment_set_pending"] = pending
+    out["segment_set_count"] = seg_count
+    out["filter_lance_count"] = lance_count
+    out["filter_lance_key"] = lance_key
+    out["filter_lance_error"] = lance_err
+    out["funnel"] = search_engine.filter_funnel(
+        corpus, start_unix, end_unix, allowed_mask=seg_mask
+    )
+    return out
+
+
 @app.get("/api/segment_set_prefetch")
 def segment_set_prefetch(uuid: str) -> dict:
     """Start the background id-load for a segment set without running a search.
@@ -1455,6 +1612,10 @@ class SaveVectorRequest(BaseModel):
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
+    # Export defaults remembered with the vector: top-k and the per-tag cosine threshold
+    # (0 = top-k). The Export table pre-fills these for the tag.
+    k: int = 0
+    threshold: float = 0.0
 
 
 class SegmentScanRequest(BaseModel):
@@ -1480,6 +1641,10 @@ class SegmentScanRequest(BaseModel):
     # When true, register the scan's qualifying segments as a DORA segment set once it
     # completes (browsable in Data Explorer). Opt-in, like the export's create_segment_set.
     create_segment_set: bool = False
+    # Output is always keyed by segment_id. merge_intervals=True (default) merges contiguous
+    # above-threshold clips into variable-length spans per segment; False emits one best
+    # (highest-scoring) clip per segment (no interval merge).
+    merge_intervals: bool = True
 
 
 @app.post("/api/save_vector")
@@ -1504,7 +1669,10 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
             "user_email": _current_user(request),
             "query": req.query.strip() or tag,
             "tag": tag,
-            "k": 0,
+            # Remember the chosen export defaults (k + cosine threshold) with the vector; the
+            # conservative upsert keeps a prior threshold when this save sends 0/none.
+            "k": int(req.k) or 0,
+            "threshold": float(req.threshold) if req.threshold else None,
             "num_results": 0,
             "model_uri": cfg.model_artifact_uri,
             "embeddings_uri": uri,
@@ -1525,6 +1693,83 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
         raise HTTPException(502, "could not save vector (exp-db unavailable)")
     LOGGER.info("saved search vector under tag %r (dim %d)", tag, len(vec))
     return {"tag": tag, "dim": len(vec)}
+
+
+def _scan_idem_key(
+    req: "SegmentScanRequest", tags: list[str], model_uri: str, scan_uri: str,
+    client_key: str = "",
+) -> str:
+    """Stable dedup key for a segment-scan launch.
+
+    A client-supplied Idempotency-Key wins (lets a Spark job coalesce its own
+    retries); otherwise hash the canonicalized, output-determining request fields
+    so two identical scans share one workload. Excludes purely cosmetic fields
+    (segment_set_name) that don't change the produced Lance."""
+    if client_key.strip():
+        return hashlib.sha256(("ck:" + client_key.strip()).encode()).hexdigest()
+    canon = json.dumps(
+        {
+            "tags": sorted(tags),
+            "thresholds": {k: float(v) for k, v in sorted((req.thresholds or {}).items())},
+            "default_threshold": float(req.default_threshold),
+            "model_uri": model_uri or "",
+            "scan_embeddings_uri": scan_uri or "",
+            "filter_lance_uri": req.filter_lance_uri or "",
+            "from": req.from_date or "",
+            "to": req.to_date or "",
+            "segment_set_uuid": req.segment_set_uuid or "",
+            "vehicle": req.vehicle or "",
+            "drive_id": req.drive_id or "",
+            "merge_intervals": bool(req.merge_intervals),
+            "register_segset": bool(req.create_segment_set),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canon.encode()).hexdigest()
+
+
+class _SingleFlightCall:
+    __slots__ = ("done", "result", "exc")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result = None
+        self.exc: BaseException | None = None
+
+
+_SF_LOCK = threading.Lock()
+_SF_CALLS: dict[str, _SingleFlightCall] = {}
+
+
+def _scan_single_flight(key: str, fn):
+    """Coalesce concurrent same-key calls on THIS instance to one execution of ``fn``.
+
+    The first caller (leader) runs ``fn``; the rest wait and share its result or
+    exception. This spares the DB a thundering herd of one transaction per executor;
+    cross-instance dedup is still enforced by ``db.launch_or_get``. The key is freed
+    as soon as the leader finishes, so a later (non-concurrent) identical request
+    re-leads and hits the DB dedup (returns the persisted workload id)."""
+    with _SF_LOCK:
+        call = _SF_CALLS.get(key)
+        leader = call is None
+        if leader:
+            call = _SF_CALLS[key] = _SingleFlightCall()
+    if not leader:
+        call.done.wait()
+        if call.exc is not None:
+            raise call.exc
+        return call.result
+    try:
+        call.result = fn()
+        return call.result
+    except BaseException as exc:  # propagate identically to all waiters
+        call.exc = exc
+        raise
+    finally:
+        call.done.set()
+        with _SF_LOCK:
+            _SF_CALLS.pop(key, None)
 
 
 @app.post("/api/launch_segment_scan")
@@ -1556,75 +1801,97 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
     except (ValueError, botocore.exceptions.ClientError) as exc:
         raise HTTPException(400, f"could not load corpus: {exc}")
 
-    stored = db.vectors_for_tags(tags, cfg.model_artifact_uri)
-    search_vectors: dict[str, list[float]] = {}
-    encoded: list[str] = []
-    for tag in tags:
-        vec = stored.get(tag)
-        if vec is not None and len(vec) == corpus.dim:
-            search_vectors[tag] = [float(x) for x in vec]
-            continue
-        if not _state.get("model_ready"):
-            raise HTTPException(503, f"model still loading; cannot encode new tag {tag!r}")
-        v = search_engine.encode_query(
-            tag, _state["processor"], _state["model"], cfg.device
-        ).tolist()
-        search_vectors[tag] = v
-        encoded.append(tag)
-        # Persist the freshly-encoded vector under its tag so the next launch reuses it.
-        # Upserts on the unique tag key (refreshes the tag's one history row).
-        db.insert_export(
-            {
-                "user_email": _current_user(request),
-                "query": tag,
-                "tag": tag,
-                "k": 0,
-                "num_results": 0,
-                "model_uri": cfg.model_artifact_uri,
-                "embeddings_uri": uri,
-                "search_vector": v,
-                "parquet_uri": "",
-            }
-        )
-    # Per-tag cosine cutoff: each tag uses its own threshold (default for any unset).
-    thresholds = {
-        tag: float(req.thresholds.get(tag, req.default_threshold)) for tag in tags
-    }
-    # Remember each tag's threshold so the Export table pre-fills it next time (like k).
-    db.set_tag_thresholds(thresholds)
+    # Server-side launch dedup. Identical concurrent requests -- e.g. a Spark stage
+    # firing the same scan from every executor -- must coalesce to ONE Lilypad
+    # workload. Prefer a client-supplied Idempotency-Key header (so a job's retries
+    # across stages coalesce too), else hash the output-determining request fields.
+    # A deterministic scan_id from the key keeps the output Lance path stable.
+    client_key = request.headers.get("Idempotency-Key", "")
+    idem = _scan_idem_key(req, tags, cfg.model_artifact_uri, cfg.scan_embeddings_uri, client_key)
+    scan_id = idem[:32]
     output_dir = f"s3://{cfg.scan_output_bucket}/{cfg.scan_output_prefix.rstrip('/')}"
-    # Pin a scan_id so we know the exact output Lance path up front (worker writes
-    # output_dir/<scan_id>/segments.lance) and can show it in the Recent scans panel.
-    scan_id = uuid.uuid4().hex
-    try:
-        res = nls_launcher.launch_segment_scan(
-            search_vectors=search_vectors,
-            thresholds=thresholds,
-            embeddings_uri=cfg.scan_embeddings_uri,
-            output_dir=output_dir,
-            scan_id=scan_id,
-            start_date=req.from_date or cfg.scan_default_from_date,
-            end_date=req.to_date or "",
-            segment_set_uuid=req.segment_set_uuid or "",
-            segment_set_name=req.segment_set_name or "",
-            filter_lance_uri=req.filter_lance_uri or "",
-            vehicle=req.vehicle or "",
-            drive_id=req.drive_id or "",
+    user_email = _current_user(request)
+
+    def _launch_and_record() -> tuple[dict, dict]:
+        """The ONE real launch: resolve each tag's vector + the downsample id-set and
+        submit the workload. Runs once per idem_key (in-process single-flight + DB
+        advisory lock); duplicate requests never reach here -- they get the cached id."""
+        stored = db.vectors_for_tags(tags, cfg.model_artifact_uri)
+        search_vectors: dict[str, list[float]] = {}
+        encoded: list[str] = []
+        for tag in tags:
+            vec = stored.get(tag)
+            if vec is not None and len(vec) == corpus.dim:
+                search_vectors[tag] = [float(x) for x in vec]
+                continue
+            if not _state.get("model_ready"):
+                raise HTTPException(503, f"model still loading; cannot encode new tag {tag!r}")
+            v = search_engine.encode_query(
+                tag, _state["processor"], _state["model"], cfg.device
+            ).tolist()
+            search_vectors[tag] = v
+            encoded.append(tag)
+            # Persist the freshly-encoded vector under its tag so the next launch reuses
+            # it. Upserts on the unique tag key (refreshes the tag's one history row).
+            db.insert_export(
+                {
+                    "user_email": user_email,
+                    "query": tag,
+                    "tag": tag,
+                    "k": 0,
+                    "num_results": 0,
+                    "model_uri": cfg.model_artifact_uri,
+                    "embeddings_uri": uri,
+                    "search_vector": v,
+                    "parquet_uri": "",
+                }
+            )
+        # Per-tag cosine cutoff: each tag uses its own threshold (default for any unset).
+        thresholds = {
+            tag: float(req.thresholds.get(tag, req.default_threshold)) for tag in tags
+        }
+        # Remember each tag's threshold so the Export table pre-fills it next time (like k).
+        db.set_tag_thresholds(thresholds)
+        # Resolve the lance downsample HERE (the app has S3 list+read; the worker's role
+        # does not) and pass the segment_id set inline, so the worker never lists S3.
+        filter_key, filter_ids = "", []
+        if req.filter_lance_uri:
+            try:
+                filter_key, filter_ids = _scan_downsample_ids(req.filter_lance_uri.strip())
+            except (ValueError, botocore.exceptions.ClientError) as exc:
+                raise HTTPException(400, f"could not read downsample dataset: {exc}")
+        try:
+            res = nls_launcher.launch_segment_scan(
+                search_vectors=search_vectors,
+                thresholds=thresholds,
+                embeddings_uri=cfg.scan_embeddings_uri,
+                output_dir=output_dir,
+                scan_id=scan_id,
+                start_date=req.from_date or cfg.scan_default_from_date,
+                end_date=req.to_date or "",
+                segment_set_uuid=req.segment_set_uuid or "",
+                segment_set_name=req.segment_set_name or "",
+                filter_lance_uri=req.filter_lance_uri or "",
+                filter_key=filter_key,
+                filter_segment_ids=filter_ids,
+                vehicle=req.vehicle or "",
+                drive_id=req.drive_id or "",
+                merge_intervals=bool(req.merge_intervals),
+            )
+        except nls_launcher.LauncherUnavailable as exc:
+            raise HTTPException(502, f"could not launch segment scan: {exc}")
+        LOGGER.info(
+            "launched per-segment scan %s for %d tags (%d reused, %d encoded)",
+            res.get("execution_id"), len(tags), len(tags) - len(encoded), len(encoded),
         )
-    except nls_launcher.LauncherUnavailable as exc:
-        raise HTTPException(502, f"could not launch segment scan: {exc}")
-    LOGGER.info(
-        "launched per-segment scan %s for %d tags (%d reused, %d encoded)",
-        res.get("execution_id"), len(tags), len(tags) - len(encoded), len(encoded),
-    )
-    # Persist the launch so the Export tab can show it (id / status / when) across
-    # reloads (best-effort: a DB hiccup must not fail the launch).
-    # Segment-set name (used iff create_segment_set): readable, scan-unique.
-    segset_name = f"nls-scan-{tags[0]}-{scan_id[:8]}" if len(tags) == 1 else f"nls-scan-{scan_id[:8]}"
-    db.insert_scan_job(
-        {
+        # Segment-set name (used iff create_segment_set): readable, scan-unique.
+        segset_name = (
+            f"nls-scan-{tags[0]}-{scan_id[:8]}" if len(tags) == 1
+            else f"nls-scan-{scan_id[:8]}"
+        )
+        record = {
             "execution_id": res.get("execution_id"),
-            "user_email": _current_user(request),
+            "user_email": user_email,
             "tags": tags,
             "thresholds": thresholds,
             "output_dir": output_dir,
@@ -1633,8 +1900,8 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
             "status": "LAUNCHED",
             "register_segset": bool(req.create_segment_set),
             "segset_name": segset_name,
-            # Persist the full filter set the scan was launched with (date is applied by
-            # the worker today; the rest are recorded for provenance / future enforcement).
+            # Full filter set the scan was launched with (date is applied by the worker
+            # today; the rest are recorded for provenance / future enforcement).
             "filters": {
                 "from_date": req.from_date or cfg.scan_default_from_date,
                 "to_date": req.to_date or "",
@@ -1643,12 +1910,27 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 "filter_lance_uri": req.filter_lance_uri or "",
                 "vehicle": req.vehicle or "",
                 "drive_id": req.drive_id or "",
+                "merge_intervals": bool(req.merge_intervals),
             },
         }
+        res["tags"] = tags
+        res["encoded"] = encoded
+        res["thresholds"] = thresholds
+        return res, record
+
+    # In-process single-flight collapses the up-to-80 concurrent same-key requests on
+    # THIS instance to one db.launch_or_get; db.launch_or_get is the cross-instance
+    # authority (advisory lock on the key, then insert keyed by idem_key).
+    res, deduplicated = _scan_single_flight(
+        idem, lambda: db.launch_or_get(idem, _launch_and_record)
     )
-    res["tags"] = tags
-    res["encoded"] = encoded
-    res["thresholds"] = thresholds
+    res["deduplicated"] = deduplicated
+    res.setdefault("workload_id", res.get("execution_id"))
+    if deduplicated:
+        LOGGER.info(
+            "deduplicated scan launch (idem=%s) -> existing workload %s",
+            scan_id, res.get("execution_id"),
+        )
     return res
 
 
@@ -2189,12 +2471,19 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
             end_unix=end_unix,
             allowed_mask=seg_mask,
         )
-        hits = search_engine.hits_from_order(corpus, scores, order, 0, int(cq.k))
+        # Select by similarity threshold when given (clips with cosine >= threshold, capped at
+        # k as a safety max), else pure top-k. order is score-descending, so the above-threshold
+        # clips are its prefix -- count them via searchsorted on the negated (ascending) scores.
+        if cq.threshold and cq.threshold > 0:
+            sc_desc = scores[order]
+            n_above = int(np.searchsorted(-sc_desc, -float(cq.threshold), side="right"))
+            count = min(n_above, int(cq.k))
+        else:
+            count = int(cq.k)
+        hits = search_engine.hits_from_order(corpus, scores, order, 0, count)
         LOGGER.info(
-            "config export: %r -> %d hits (vector %s)",
-            q,
-            len(hits),
-            "reused" if reused else "encoded",
+            "config export: %r -> %d hits (k=%d threshold=%s, vector %s)",
+            q, len(hits), int(cq.k), cq.threshold or "-", "reused" if reused else "encoded",
         )
         rows.extend((q, h) for h in hits)
         if not reused:
@@ -2209,6 +2498,7 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
                         "query": q,
                         "tag": q,
                         "k": int(cq.k),
+                        "threshold": float(cq.threshold) if cq.threshold else None,
                         "num_results": len(hits),
                         "model_uri": model_uri,
                         "embeddings_uri": uri,

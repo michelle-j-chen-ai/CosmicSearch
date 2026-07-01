@@ -169,6 +169,58 @@ def test_centroid_query_empty_raises() -> None:
     raise AssertionError("expected ValueError for empty selection")
 
 
+def _window_corpus() -> "search_engine.Corpus":
+    # Drive A: 3 chunks t=[100,108),[108,116),[116,124); drive B: 1 chunk.
+    matrix = np.array(
+        [[1, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype="float32"
+    )
+    return search_engine.Corpus(
+        matrix=matrix,
+        chunk_id=["a0", "a1", "a2", "b0"],
+        run_uuid=["A", "A", "A", "B"],
+        chunk_start_unix=[100, 108, 116, 100],
+        source_media_uri=[f"s3://x/{c}.mp4" for c in ["a0", "a1", "a2", "b0"]],
+        segment_id=["segA", "segA", "segA", "segB"],
+        chunk_end_unix=[108, 116, 124, 108],
+    )
+
+
+def test_window_query_overlap_and_mean() -> None:
+    corpus = _window_corpus()
+    wm = search_engine.window_query(corpus, run_uuid="A", start_unix=104, end_unix=120)
+    assert wm.indices.tolist() == [0, 1, 2], wm.indices
+    # mean([1,0,0],[1,0,0],[0,1,0]) = [2,1,0]/3 -> unit
+    np.testing.assert_allclose(
+        wm.vector, search_engine._unit(np.array([2, 1, 0], dtype="float32")), rtol=1e-5
+    )
+    assert wm.span_seconds == 24, wm.span_seconds
+    assert wm.preview, wm.preview
+
+
+def test_window_query_by_segment_id() -> None:
+    corpus = _window_corpus()
+    wm = search_engine.window_query(corpus, segment_id="segA")
+    assert wm.indices.tolist() == [0, 1, 2], wm.indices
+
+
+def test_window_query_no_match_raises() -> None:
+    corpus = _window_corpus()
+    try:
+        search_engine.window_query(corpus, run_uuid="A", start_unix=500, end_unix=600)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError when no chunk overlaps the window")
+
+
+def test_window_query_needs_a_key() -> None:
+    corpus = _window_corpus()
+    try:
+        search_engine.window_query(corpus)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError when neither run_uuid nor segment_id given")
+
+
 def test_rank_top_k_sets_global_rank() -> None:
     corpus = _toy_corpus()
     query = np.array([1.0, 0.0, 0.0], dtype="float32")

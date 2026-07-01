@@ -63,6 +63,14 @@
             your history on the <strong>Export</strong> tab, where you can download a CSV from the
             loaded corpus or launch a per-segment scan over the full corpus.</p>
           <input id="save-vec-tag" type="text" placeholder="tag name (e.g. left_turn)" />
+          <div class="export-row">
+            <label class="curate-k-label" title="top-k to remember for this tag's Download CSV">
+              k <input id="save-vec-k" type="number" min="1" value="50" />
+            </label>
+            <label class="curate-k-label" title="cosine threshold to remember (blank = top-k); Download CSV keeps clips >= this">
+              threshold <input id="save-vec-threshold" type="number" step="0.01" min="0" max="1" placeholder="top-k" />
+            </label>
+          </div>
           <button id="save-vec-btn" type="button" class="primary">Save vector</button>
           <div id="save-vec-note" class="note"></div>
         </div>
@@ -136,7 +144,43 @@
         <button id="search-btn" type="submit">Search</button>
       </form>
       <div id="examples" class="examples"></div>
+      <!-- SEARCH BY VIDEO CLIP — query-by-example over the pre-embedded corpus.
+           Name a drive (run_uuid) or 30s source segment_id and an optional time
+           window; the matching mini-segment chunks are averaged into the query
+           vector. No model inference: the clip's embeddings are already indexed. -->
+      <div class="video-search">
+        <button id="video-search-toggle" type="button" class="ghost"
+                aria-expanded="false" title="Search by an example video clip instead of text">
+          ▶ Search by video clip</button>
+        <div id="video-search-panel" class="video-search-panel hidden">
+          <div class="vsp-row">
+            <label class="vsp-field">drive (run_uuid)
+              <input id="vs-run-uuid" type="text" autocomplete="off"
+                     placeholder="019eb27f-…  (or use segment id)" />
+            </label>
+            <label class="vsp-field">segment id
+              <input id="vs-segment-id" type="text" autocomplete="off"
+                     placeholder="30s source segment_id (optional)" />
+            </label>
+          </div>
+          <div class="vsp-row">
+            <label class="vsp-field">start
+              <input id="vs-start" type="text" autocomplete="off"
+                     placeholder="unix s or ns — blank = whole drive/segment" />
+            </label>
+            <label class="vsp-field">end
+              <input id="vs-end" type="text" autocomplete="off"
+                     placeholder="unix s or ns — blank = open" />
+            </label>
+            <button id="vs-search-btn" type="button" class="primary">Search by clip</button>
+          </div>
+          <div id="vs-note" class="note">averages the ~8s chunks overlapping the window into the query vector</div>
+        </div>
+      </div>
     </section>
+
+    <!-- QUERY FILMSTRIP — the matched example chunks for a video-clip search. -->
+    <section id="query-strip" class="query-strip hidden"></section>
 
     <!-- ACTIVE FILTERS + STATUS -->
     <div id="filterbar" class="filterbar hidden"></div>
@@ -214,8 +258,8 @@
           <label class="curate-k-label" title="k applied to a row when first ticked, and to ad-hoc lines">
             default k <input id="curate-k" type="number" min="1" value="50" />
           </label>
-          <label class="curate-k-label requires-offline-scan" title="per-tag cosine threshold applied to a row when first ticked, and to ad-hoc lines">
-            default threshold <input id="curate-threshold" type="number" step="0.01" min="0" max="1" value="0.3" />
+          <label class="curate-k-label" title="default per-tag cosine threshold: Download CSV keeps clips >= this (capped at k); blank/0 = top-k">
+            default threshold <input id="curate-threshold" type="number" step="0.01" min="0" max="1" value="0" />
           </label>
           <span class="curate-toolbar-spacer"></span>
           <button id="export-hist-all" type="button" class="ghost">Select all</button>
@@ -252,7 +296,13 @@
           <label class="export-toggle" title="Keep only the best (highest-scoring) clip per segment_id, so the CSV holds distinct segments rather than clips that may repeat a segment">
             <input id="curate-csv-dedup" type="checkbox" /> dedup by segment
           </label>
+          <label class="export-toggle" title="Also register the exported segments as a DORA / Data Explorer segment set (browsable in DX). Uses the same machine-auth as the app.">
+            <input id="curate-csv-segset" type="checkbox" /> save as DX segment set
+          </label>
           <span class="curate-toolbar-spacer"></span>
+          <label class="export-toggle requires-offline-scan" title="Output is always keyed by segment_id. Checked: merge contiguous above-threshold clips into time intervals per segment. Unchecked: emit one best (highest-scoring) clip per segment, no interval merge.">
+            <input id="curate-scan-merge" type="checkbox" checked /> merge into intervals
+          </label>
           <label class="export-toggle requires-offline-scan" title="When the scan completes, register its qualifying segments as a DORA segment set so the results are browsable in Data Explorer">
             <input id="curate-scan-segset" type="checkbox" /> register DX segment set
           </label>

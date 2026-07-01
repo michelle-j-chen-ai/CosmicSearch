@@ -123,6 +123,12 @@ _DDL = [
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS segset_uuid TEXT",
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS segset_label TEXT",
     f"CREATE UNIQUE INDEX IF NOT EXISTS scan_jobs_exec_idx ON {_SCAN_TABLE} (execution_id)",
+    # Idempotency key for server-side launch dedup: identical concurrent requests
+    # (e.g. a Spark stage firing the same scan from every executor) coalesce to one
+    # Lilypad workload. The partial UNIQUE index is the cross-instance authority.
+    f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS idem_key TEXT",
+    f"CREATE UNIQUE INDEX IF NOT EXISTS scan_jobs_idem_idx ON {_SCAN_TABLE} (idem_key) "
+    f"WHERE idem_key IS NOT NULL",
 ]
 
 # Upsert keyed on `tag` (the true key): a row with a non-empty tag conflicts with the
@@ -560,18 +566,19 @@ def vectors_for_tags(tags: list[str], model_uri: str) -> dict[str, list[float]]:
 _INSERT_SCAN = text(
     f"""INSERT INTO {_SCAN_TABLE} (
         execution_id, user_email, tags, thresholds, output_dir, lance_uri, console_url,
-        status, register_segset, segset_name, filters
+        status, register_segset, segset_name, filters, idem_key
     ) VALUES (
         :execution_id, :user_email, CAST(:tags AS JSONB), CAST(:thresholds AS JSONB),
         :output_dir, :lance_uri, :console_url, :status, :register_segset, :segset_name,
-        CAST(:filters AS JSONB)
+        CAST(:filters AS JSONB), :idem_key
     )
     ON CONFLICT (execution_id) DO UPDATE SET
         user_email = EXCLUDED.user_email, tags = EXCLUDED.tags,
         thresholds = EXCLUDED.thresholds, output_dir = EXCLUDED.output_dir,
         lance_uri = EXCLUDED.lance_uri, console_url = EXCLUDED.console_url,
         status = EXCLUDED.status, register_segset = EXCLUDED.register_segset,
-        segset_name = EXCLUDED.segset_name, filters = EXCLUDED.filters, updated_at = now()
+        segset_name = EXCLUDED.segset_name, filters = EXCLUDED.filters,
+        idem_key = COALESCE({_SCAN_TABLE}.idem_key, EXCLUDED.idem_key), updated_at = now()
     RETURNING id"""
 )
 
@@ -600,9 +607,9 @@ _LIST_SCANS = text(
 )
 
 
-def insert_scan_job(record: dict) -> bool:
-    """Record a launched per-segment scan (upsert by workload id). Best-effort."""
-    params = {
+def _scan_params(record: dict) -> dict:
+    """Build the _INSERT_SCAN bind params from a launch record dict."""
+    return {
         "execution_id": record.get("execution_id"),
         "user_email": record.get("user_email"),
         "tags": json.dumps(record.get("tags", [])),
@@ -614,7 +621,13 @@ def insert_scan_job(record: dict) -> bool:
         "register_segset": bool(record.get("register_segset")),
         "segset_name": record.get("segset_name") or "",
         "filters": json.dumps(record.get("filters") or {}),
+        "idem_key": record.get("idem_key") or None,
     }
+
+
+def insert_scan_job(record: dict) -> bool:
+    """Record a launched per-segment scan (upsert by workload id). Best-effort."""
+    params = _scan_params(record)
     if not params["execution_id"]:
         return False
     try:
@@ -627,6 +640,46 @@ def insert_scan_job(record: dict) -> bool:
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: insert_scan_job failed (%s): %s", type(exc).__name__, exc)
         return False
+
+
+# Cross-instance single-flight for scan launches. A transaction-scoped advisory
+# lock on the idempotency key serializes ONLY same-key callers and auto-releases
+# on commit / rollback / crash / disconnect (no stale-lease cleanup needed); the
+# launch + its record commit atomically in that same transaction.
+_SCAN_ADVISORY_LOCK = text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))")
+_SELECT_SCAN_BY_IDEM = text(
+    f"SELECT execution_id FROM {_SCAN_TABLE} WHERE idem_key = :idem"
+)
+
+
+def launch_or_get(idem_key: str, launch_and_record) -> tuple[dict, bool]:
+    """Single-flight a scan launch across all instances on ``idem_key``.
+
+    Holds an advisory lock on the key, then: if a row already carries this key,
+    return its existing workload id (dedup hit); otherwise call
+    ``launch_and_record() -> (result, record)`` -- the ONE real launch -- and
+    persist the record (with ``idem_key``) in the SAME transaction. Returns
+    ``(result, deduplicated)``. On a dedup hit ``result`` is
+    ``{"execution_id": <existing>}``.
+
+    Raises if the DB is unreachable (so the caller fails loudly rather than
+    double-launching) or if ``launch_and_record`` raises (the transaction rolls
+    back, the lock releases, and the next caller retries cleanly -- nothing is
+    recorded).
+    """
+    if not _schema_ready:
+        init_schema()
+    with _get_engine().begin() as conn:
+        conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+        conn.execute(_SCAN_ADVISORY_LOCK, {"k": idem_key})
+        row = conn.execute(_SELECT_SCAN_BY_IDEM, {"idem": idem_key}).first()
+        if row and row.execution_id:
+            return {"execution_id": row.execution_id}, True
+        result, record = launch_and_record()
+        params = _scan_params({**record, "idem_key": idem_key})
+        if params["execution_id"]:
+            conn.execute(_INSERT_SCAN, params)
+        return result, False
 
 
 def get_scan_job(execution_id: str) -> dict | None:

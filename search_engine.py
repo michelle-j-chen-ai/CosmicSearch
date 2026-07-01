@@ -143,6 +143,28 @@ class Corpus:
             self.__dict__["_segment_id_arr"] = arr
         return arr
 
+    def chunk_end_array(self) -> np.ndarray:
+        """chunk_end_unix as a cached int64 array, for vectorized time-window
+        overlap. Falls back to chunk_start (a zero-length span) when the corpus
+        metadata carries no end, so callers can always treat it as [start, end]."""
+        arr = self.__dict__.get("_chunk_end_arr")
+        if arr is None:
+            if self.chunk_end_unix is None:
+                arr = self.chunk_start_array()
+            else:
+                arr = np.asarray(self.chunk_end_unix, dtype=np.int64)
+            self.__dict__["_chunk_end_arr"] = arr
+        return arr
+
+    def run_uuid_array(self) -> np.ndarray:
+        """run_uuid as a cached string array, for vectorized drive masking.
+        Memoized like ``segment_id_array``."""
+        arr = self.__dict__.get("_run_uuid_arr")
+        if arr is None:
+            arr = np.asarray(self.run_uuid, dtype=object)
+            self.__dict__["_run_uuid_arr"] = arr
+        return arr
+
     def vehicle_array(self) -> np.ndarray | None:
         """vehicle as a cached string array for vectorized vehicle masking, or
         None when the corpus has no vehicle column. Memoized like the others."""
@@ -580,8 +602,19 @@ _FILTER_KEY_COLUMNS: tuple[tuple[str, str], ...] = (
     ("run_uuid", "run_uuid"),
 )
 
+# Offline-scan downsample priority: segment_id-first, NO dx_internal_id. The Lilypad scan
+# worker matches on the segment_id string space (from chunks_metadata / the npy corpus), not
+# the corpus dx-internal-id bitmap, so resolve a string key the worker can use.
+_SCAN_FILTER_KEY_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("segment_id", "segment_id"),
+    ("scenario_id", "segment_id"),
+    ("run_uuid", "run_uuid"),
+)
 
-def read_filter_ids(local_dir: Path, is_lance: bool) -> tuple[str, frozenset[str]]:
+
+def read_filter_ids(
+    local_dir: Path, is_lance: bool, key_columns: tuple[tuple[str, str], ...] | None = None
+) -> tuple[str, frozenset[str]]:
     """``(corpus_key, ids)`` for a downsample dataset (lance dir or parquet files).
 
     Backs the "downsample by a Lance/parquet dataset" filter: the user points at
@@ -590,7 +623,10 @@ def read_filter_ids(local_dir: Path, is_lance: bool) -> tuple[str, frozenset[str
     corpus's mapped column, reusing the ``value_mask`` membership primitive.
     Returns the CORPUS key (``segment_id`` or ``run_uuid``) so callers mask the
     right column. Raises ``ValueError`` if the dataset has no usable key column.
+    ``key_columns`` overrides the dataset-column -> corpus-key priority (default
+    ``_FILTER_KEY_COLUMNS``; the offline scan passes ``_SCAN_FILTER_KEY_COLUMNS``).
     """
+    cols = key_columns or _FILTER_KEY_COLUMNS
     if is_lance:
         import lance
 
@@ -603,9 +639,9 @@ def read_filter_ids(local_dir: Path, is_lance: bool) -> tuple[str, frozenset[str
             raise ValueError("no .parquet files in downsample dataset")
         names = pads.dataset(files, format="parquet").schema.names
 
-    match = next((p for p in _FILTER_KEY_COLUMNS if p[0] in names), None)
+    match = next((p for p in cols if p[0] in names), None)
     if match is None:
-        wanted = " / ".join(c for c, _ in _FILTER_KEY_COLUMNS)
+        wanted = " / ".join(c for c, _ in cols)
         raise ValueError(
             f"downsample dataset has no {wanted} column to cross-reference "
             f"(has {sorted(names)})"
@@ -896,6 +932,89 @@ def refine_query(
     if text_vector is not None and text_weight > 0.0:
         direction = _unit(direction + float(text_weight) * _unit(text_vector))
     return direction
+
+
+@dataclasses.dataclass(frozen=True)
+class WindowMatch:
+    """The in-corpus chunks that make up a video-window query.
+
+    ``indices`` are corpus row indices of every mini-segment overlapping the
+    requested [start, end] window of the requested drive/segment; ``vector`` is
+    their L2-normalized mean (the query-by-example direction, drop-in for
+    ``rank_top_k`` / ``score_corpus``). ``preview`` is an evenly-sampled handful
+    of those indices for the UI filmstrip (count scales with the window length).
+    """
+
+    vector: np.ndarray
+    indices: np.ndarray
+    preview: list[int]
+    span_seconds: int
+
+
+def window_query(
+    corpus: Corpus,
+    *,
+    run_uuid: str = "",
+    segment_id: str = "",
+    start_unix: int = 0,
+    end_unix: int = 0,
+    max_preview: int = 12,
+) -> WindowMatch:
+    """Resolve a video-window query against the *pre-embedded* corpus.
+
+    Given a drive (``run_uuid``) or 30s source segment (``segment_id``) and an
+    optional [start_unix, end_unix] time window (unix seconds), select the
+    mini-segment chunks already embedded in the corpus that overlap it, and mean-
+    pool their embeddings into one query vector (same prototype direction as
+    ``refine_query``). No model inference or MP4 decode -- the query clip's
+    embeddings are read straight out of the corpus.
+
+    Raises ``ValueError`` if neither key is given or no chunk matches (e.g. the
+    drive was never embedded, or the window falls outside its coverage).
+    """
+    run_uuid = (run_uuid or "").strip()
+    segment_id = (segment_id or "").strip()
+    if not run_uuid and not segment_id:
+        raise ValueError("window_query needs a run_uuid or a segment_id")
+
+    mask = np.ones(corpus.num_rows, dtype=bool)
+    if run_uuid:
+        mask &= corpus.run_uuid_array() == run_uuid
+    if segment_id:
+        mask &= corpus.segment_id_array() == segment_id
+    # Half-open overlap test: a chunk [cs, ce) overlaps [start, end) iff
+    # cs < end and ce > start. Either bound 0/unset opens that side.
+    if start_unix:
+        mask &= corpus.chunk_end_array() > int(start_unix)
+    if end_unix:
+        mask &= corpus.chunk_start_array() < int(end_unix)
+
+    idx = np.nonzero(mask)[0]
+    if idx.size == 0:
+        key = run_uuid or segment_id
+        raise ValueError(
+            f"no embedded chunks match {key!r} in the requested window -- the "
+            "drive/segment may not be in this corpus, or the window is outside "
+            "its coverage"
+        )
+
+    # Order the matched chunks chronologically so the preview filmstrip reads in
+    # time order and the mean is over the window as the user sees it.
+    starts = corpus.chunk_start_array()[idx]
+    idx = idx[np.argsort(starts, kind="stable")]
+    # Same prototype direction as relevance feedback: mean of the matched rows,
+    # L2-normalized (centroid_query -> refine_query, positives only).
+    vector = centroid_query(corpus, idx.tolist())
+
+    # Show a handful, count scaling with the window length (~one per 8s chunk),
+    # evenly sampled across the matched chunks and capped at ``max_preview``.
+    span = int(corpus.chunk_end_array()[idx][-1] - corpus.chunk_start_array()[idx][0])
+    n_preview = int(min(max_preview, max(1, idx.size)))
+    sample = np.linspace(0, idx.size - 1, num=n_preview).round().astype(int)
+    preview = [int(idx[s]) for s in np.unique(sample)]
+    return WindowMatch(
+        vector=vector, indices=idx, preview=preview, span_seconds=max(span, 0)
+    )
 
 
 # Multi-cluster-positive thresholds (tunable; defaults are conservative so we

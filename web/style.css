@@ -115,6 +115,40 @@ main { padding: 26px 34px 80px; max-width: 1480px; margin: 0 auto; }
 #search-btn:active { transform: translateY(0); }
 
 .examples { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-left: 4px; }
+
+/* Search by video clip (query-by-example) */
+.video-search { margin-top: 10px; padding-left: 4px; }
+#video-search-toggle { font-size: 13px; }
+.video-search-panel {
+  margin-top: 10px; padding: 14px; border: 1px solid var(--line);
+  border-radius: var(--radius); background: var(--panel);
+}
+.video-search-panel.hidden { display: none; }
+.vsp-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 10px; }
+.vsp-row:last-of-type { margin-bottom: 0; }
+.vsp-field {
+  display: flex; flex-direction: column; gap: 5px; flex: 1 1 220px;
+  font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-faint);
+}
+.vsp-field input {
+  background: var(--bg); border: 1px solid var(--line-strong); color: var(--ink);
+  border-radius: 9px; padding: 9px 11px; font-size: 13px; font-family: 'IBM Plex Mono', monospace;
+}
+.vsp-field input:focus { outline: none; border-color: var(--accent-line); }
+#vs-search-btn { flex: 0 0 auto; }
+
+/* Query filmstrip — the matched example chunks above the results */
+.query-strip {
+  margin: 16px 0 4px; padding: 14px; border: 1px solid var(--accent-line);
+  border-radius: var(--radius); background: var(--accent-dim);
+}
+.query-strip.hidden { display: none; }
+.query-strip-head {
+  font-size: 12px; color: var(--ink-dim); margin-bottom: 10px;
+  letter-spacing: .03em;
+}
+.query-strip-row { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 4px; }
+.query-strip-row .card.query-card { flex: 0 0 200px; }
 .example {
   background: transparent; border: 1px solid var(--line-strong); color: var(--ink-dim);
   border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer;

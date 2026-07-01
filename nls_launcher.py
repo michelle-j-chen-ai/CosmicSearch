@@ -38,7 +38,7 @@ LOGGER = logging.getLogger("nls_search_app.nls_launcher")
 # with nls_scan/purpose/prod.yaml; overridable per-deploy via NLS_SCAN_IMAGE.
 _DEFAULT_IMAGE = (
     "us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds"
-    "@sha256:9878e40151cbcee3937b9579b4bfed8b2851a5d8095a6fc65807a48c88f64c8c"
+    "@sha256:81d506fc46ff8179cae0b80d69b177b766d835cac327cd0e8cb6d435d72cbbd9"
 )
 _OCI_ENDPOINT = "https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com"
 _CUSTOMER_RESOURCE = "autolabeling"
@@ -170,8 +170,11 @@ def launch_segment_scan(
     segment_set_uuid: str = "",
     segment_set_name: str = "",
     filter_lance_uri: str = "",
+    filter_key: str = "",
+    filter_segment_ids: list[str] | None = None,
     vehicle: str = "",
     drive_id: str = "",
+    merge_intervals: bool = True,
     name: str = "nls-segment-scan",
 ) -> dict:
     """Per-segment multi-tag scan: {tag: [768 floats]} -> per-segment Lance table.
@@ -194,6 +197,9 @@ def launch_segment_scan(
         "start_date": start_date or "",
         "end_date": end_date or "",
         "num_blocks": 64,
+        # Output mode (always segment-keyed): True merges contiguous clips into intervals per
+        # segment; False emits one best clip per segment. Worker defaults True if omitted.
+        "merge_intervals": bool(merge_intervals),
         "search_vectors": {t: [float(x) for x in v] for t, v in search_vectors.items()},
     }
     # Carry the full active filter set into the workflow inputs so the launched scan
@@ -208,6 +214,10 @@ def launch_segment_scan(
         "filter_lance_uri": filter_lance_uri or "",
         "vehicle": vehicle or "",
         "drive_id": drive_id or "",
+        # Pre-resolved downsample membership (the app has S3 list+read; the worker doesn't),
+        # passed inline so the worker filters output to these segments WITHOUT listing S3.
+        "filter_key": filter_key or "",
+        "filter_segment_ids": list(filter_segment_ids or []),
     }
     ec["filters"] = filters
     if sid:
