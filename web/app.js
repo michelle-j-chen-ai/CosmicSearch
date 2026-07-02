@@ -810,6 +810,8 @@ async function _issue(endpoint, body, mode) {
   renderFilterBar(data);
   renderLanceNote(data);
   $("refinebar").classList.remove("hidden");
+  // Any fresh search/refine returns to the results view (leaves threshold mode).
+  exitThresholdView();
   if (data.total === 0) {
     setStatus("No clips match the current query + filters. Try widening the date range or segment set.");
     $("pager").classList.add("hidden");
@@ -1447,9 +1449,22 @@ async function loadThresholdSearch() {
 function showThreshold(data) {
   const t = $("threshold-view");
   t.innerHTML = "";
-  if (!data) { t.classList.add("hidden"); return; }
+  if (!data) { exitThresholdView(); return; }
   t.appendChild(buildThreshold(data));
   t.classList.remove("hidden");
+  // Dedicated view: hide the video results grid (+ pager/chips/dist) so the
+  // threshold workspace is separate from the search ordering. CSS on the parent
+  // does the hiding; Back / any new search removes the class.
+  $("search-view").classList.add("threshold-active");
+  t.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// Leave the dedicated threshold view and restore the results grid. Idempotent.
+function exitThresholdView() {
+  const sv = $("search-view");
+  if (sv) sv.classList.remove("threshold-active");
+  const t = $("threshold-view");
+  if (t) { t.classList.add("hidden"); t.innerHTML = ""; }
 }
 
 // A small precision-recall curve SVG for the labeled set.
@@ -1510,6 +1525,10 @@ function buildThreshold(data) {
     : `<span class="sub">not enough labels yet</span>`;
   const note = data.note ? `<div class="sub sd-hint">${escapeHtml(data.note)}</div>` : "";
   wrap.innerHTML = `
+    <div class="thr-topbar">
+      <button id="thr-back" type="button" class="ghost">← Back to results</button>
+      <span class="thr-context">${escapeHtml(state.query || "")}</span>
+    </div>
     <div class="interval-head">
       <h3>Threshold search</h3>
       ${metrics}
@@ -1554,6 +1573,7 @@ function buildThreshold(data) {
   syncMinp();
   objSel.addEventListener("change", syncMinp);
 
+  wrap.querySelector("#thr-back").onclick = () => exitThresholdView();
   wrap.querySelector("#thr-refit").onclick = () => loadThresholdSearch();
   wrap.querySelector("#thr-apply").onclick = () => {
     if (data.threshold == null) return;

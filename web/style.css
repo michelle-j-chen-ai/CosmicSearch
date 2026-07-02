@@ -360,6 +360,20 @@ select:disabled { opacity: 0.5; cursor: not-allowed; }
 .sd-axlbl { fill: var(--ink-dim); font-size: 10px; text-anchor: middle; }
 .sd-taulbl { fill: var(--accent, #d98b5f); font-size: 10px; }
 /* ---------- threshold search ---------- */
+/* Dedicated view: when active, hide the video results + their chrome so the
+   threshold workspace stands alone (not stacked in the search ordering). The
+   search bar + refinebar stay visible so you can re-search / see the mark count. */
+#search-view.threshold-active #grid,
+#search-view.threshold-active #pager,
+#search-view.threshold-active #query-strip,
+#search-view.threshold-active #filterbar,
+#search-view.threshold-active #score-dist-view { display: none !important; }
+#threshold-view { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+.thr-topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.thr-topbar .thr-context {
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--ink-dim);
+}
+.thr-topbar .thr-context::before { content: "query: "; color: var(--ink-faint); }
 .thr-up { stroke: #6ee7a0; stroke-width: 2; opacity: 0.9; }
 .thr-down { stroke: #f2795f; stroke-width: 2; opacity: 0.9; }
 .sd-prline { stroke: var(--accent, #c8ff4d); stroke-width: 1.6; }
