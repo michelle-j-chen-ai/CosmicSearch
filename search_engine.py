@@ -1126,3 +1126,253 @@ def centroid_query(corpus: Corpus, indices: list[int]) -> np.ndarray:
     existing callers.
     """
     return refine_query(corpus, positive_indices=indices)
+
+
+# ---------------------------------------------------------------------------
+# Threshold search: choose a per-tag score cutoff from labeled 👍/👎 examples.
+#
+# Picking a cosine cutoff from labeled positives/negatives is binary-classifier
+# operating-point selection on a 1-D score. We sweep EVERY candidate threshold
+# (each observed score) -- exact and O(n log n), no random subsampling -- and
+# pick the one that optimizes an explicit objective. The companion sampler feeds
+# an active-labeling loop so the cutoff can be found from a handful of clicks
+# instead of assuming a large pre-existing label set.
+# ---------------------------------------------------------------------------
+
+
+def _pr_sweep(
+    pos_scores: np.ndarray, neg_scores: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Precision/recall/TPR/FPR at every distinct candidate threshold.
+
+    A hit is ``score >= tau``. Sorting the pooled labeled scores descending and
+    walking the prefix gives, at each cut, ``TP = #pos >= tau`` and
+    ``FP = #neg >= tau``. We only evaluate at the LAST index of each equal-score
+    run so a threshold never splits identical scores. Returns arrays aligned by
+    candidate (``tau`` descending: high-precision/low-recall first).
+    """
+    n_pos = int(pos_scores.size)
+    n_neg = int(neg_scores.size)
+    scores = np.concatenate([pos_scores, neg_scores]).astype(np.float64)
+    labels = np.concatenate(
+        [np.ones(n_pos, dtype=np.int64), np.zeros(n_neg, dtype=np.int64)]
+    )
+    order = np.argsort(-scores, kind="mergesort")  # stable, score-descending
+    s = scores[order]
+    y = labels[order]
+    tp = np.cumsum(y)
+    fp = np.cumsum(1 - y)
+    # Keep only the last position of each run of equal scores: a valid tau sits
+    # between distinct values, so identical scores must fall on the same side.
+    keep = np.ones(s.size, dtype=bool)
+    keep[:-1] = s[1:] != s[:-1]
+    tau = s[keep]
+    tp = tp[keep].astype(np.float64)
+    fp = fp[keep].astype(np.float64)
+    precision = np.divide(tp, tp + fp, out=np.ones_like(tp), where=(tp + fp) > 0)
+    recall = tp / n_pos if n_pos else np.zeros_like(tp)  # == TPR
+    fpr = fp / n_neg if n_neg else np.zeros_like(fp)
+    return {
+        "tau": tau,
+        "precision": precision,
+        "recall": recall,
+        "fpr": fpr,
+        "n_pos": np.int64(n_pos),
+        "n_neg": np.int64(n_neg),
+    }
+
+
+def _metrics_at(
+    pos_scores: np.ndarray, neg_scores: np.ndarray, tau: float, beta: float
+) -> dict[str, float]:
+    """Precision/recall/F-beta of the cut ``score >= tau`` on a labeled set."""
+    tp = float(np.count_nonzero(pos_scores >= tau))
+    fn = float(pos_scores.size) - tp
+    fp = float(np.count_nonzero(neg_scores >= tau))
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    b2 = beta * beta
+    denom = b2 * precision + recall
+    fbeta = (1 + b2) * precision * recall / denom if denom else 0.0
+    return {"precision": precision, "recall": recall, "f1": fbeta}
+
+
+def _pick_tau(sweep: dict[str, np.ndarray], objective: str, beta: float,
+              min_precision: float) -> tuple[float, bool]:
+    """Index the sweep for the best tau under ``objective``.
+
+    Returns ``(tau, ok)`` where ``ok`` is False only for the precision-floor
+    objective when no threshold reaches ``min_precision`` (caller can surface a
+    warning); in that case we fall back to the highest-precision threshold.
+    """
+    p, r, tau = sweep["precision"], sweep["recall"], sweep["tau"]
+    if objective == "youden":
+        return float(tau[int(np.argmax(r - sweep["fpr"]))]), True
+    if objective == "precision":
+        ok_mask = p >= min_precision
+        if ok_mask.any():
+            # Highest recall among thresholds that clear the precision floor;
+            # ties -> the higher tau (fewer, cleaner hits).
+            cand = np.nonzero(ok_mask)[0]
+            best = cand[int(np.argmax(r[cand]))]
+            return float(tau[best]), True
+        return float(tau[int(np.argmax(p))]), False  # nothing clears the floor
+    # default: maximize F-beta
+    b2 = beta * beta
+    denom = b2 * p + r
+    fbeta = np.divide((1 + b2) * p * r, denom, out=np.zeros_like(p), where=denom > 0)
+    return float(tau[int(np.argmax(fbeta))]), True
+
+
+def fit_threshold(
+    pos_scores: np.ndarray,
+    neg_scores: np.ndarray,
+    *,
+    objective: str = "f1",
+    beta: float = 1.0,
+    min_precision: float = 0.9,
+    val_fraction: float = 0.0,
+    max_curve_points: int = 200,
+    seed: int = 0,
+) -> dict:
+    """Choose a score cutoff separating labeled positives from negatives.
+
+    ``objective`` selects what "best" means:
+      - ``"f1"``:        maximize F-beta (default beta=1; the usual retrieval default).
+      - ``"youden"``:    maximize TPR - FPR (Youden's J, the ROC-classic pick).
+      - ``"precision"``: max recall subject to precision >= ``min_precision``
+                         (operational: "don't waste reviewer time").
+
+    When ``val_fraction`` > 0 the threshold is chosen on a train split and the
+    reported precision/recall/f1 are measured on a held-out split, so the numbers
+    are not optimistically biased by fitting-and-scoring the same labels. The full
+    PR curve (subsampled to ``max_curve_points``) is returned for plotting.
+
+    Raises ``ValueError`` if either class is empty (no threshold is meaningful).
+    """
+    pos = np.asarray(pos_scores, dtype=np.float64).ravel()
+    neg = np.asarray(neg_scores, dtype=np.float64).ravel()
+    if pos.size == 0 or neg.size == 0:
+        raise ValueError("fit_threshold needs at least one positive and one negative")
+
+    fit_pos, fit_neg, eval_pos, eval_neg = pos, neg, pos, neg
+    held_out = False
+    if val_fraction and 0.0 < val_fraction < 1.0:
+        rng = np.random.default_rng(seed)
+
+        def _split(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            idx = rng.permutation(a.size)
+            cut = max(1, int(round(a.size * (1.0 - val_fraction))))
+            return a[idx[:cut]], a[idx[cut:]]
+
+        tp_, vp_ = _split(pos)
+        tn_, vn_ = _split(neg)
+        # Only honor the split if BOTH val classes are non-empty; else fit==eval.
+        if vp_.size and vn_.size:
+            fit_pos, fit_neg, eval_pos, eval_neg = tp_, tn_, vp_, vn_
+            held_out = True
+
+    sweep = _pr_sweep(fit_pos, fit_neg)
+    tau, ok = _pick_tau(sweep, objective, beta, min_precision)
+    metrics = _metrics_at(eval_pos, eval_neg, tau, beta)
+
+    # Subsample the PR curve for transport (keep endpoints).
+    tau_c, p_c, r_c = sweep["tau"], sweep["precision"], sweep["recall"]
+    if tau_c.size > max_curve_points:
+        sel = np.linspace(0, tau_c.size - 1, max_curve_points).round().astype(int)
+        sel = np.unique(sel)
+        tau_c, p_c, r_c = tau_c[sel], p_c[sel], r_c[sel]
+    # Average precision (area under PR, recall-weighted) as a single quality number.
+    ap = float(np.sum(np.diff(np.concatenate([[0.0], sweep["recall"]])) * sweep["precision"]))
+
+    return {
+        "threshold": tau,
+        "objective": objective,
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "f1": metrics["f1"],
+        "average_precision": ap,
+        "n_pos": int(pos.size),
+        "n_neg": int(neg.size),
+        "held_out": held_out,
+        "precision_floor_met": bool(ok),
+        "curve": {
+            "tau": tau_c.tolist(),
+            "precision": p_c.tolist(),
+            "recall": r_c.tolist(),
+        },
+    }
+
+
+def stratified_boundary_sample(
+    scores: np.ndarray,
+    candidate_mask: np.ndarray | None,
+    labeled: "set[int] | np.ndarray | None",
+    n: int,
+    *,
+    tau: float | None = None,
+    band: float = 0.08,
+    seed: int = 0,
+) -> list[int]:
+    """Pick up to ``n`` UNLABELED rows to hand the user for active labeling.
+
+    Uniform-random sampling wastes the budget on the rare-positive corpus's flood
+    of obvious negatives, none of which sit near the cutoff. Instead we bias toward
+    the decision boundary (uncertainty sampling): about half the budget is drawn
+    from the uncertain band ``[tau-band, tau+band]`` and the rest is spread across
+    score quantiles -- so the high tail (positives, for recall) and low tail (clear
+    negatives) still appear. Already-``labeled`` rows are excluded. With ``tau``
+    None this degrades to pure quantile stratification.
+
+    Returns global row indices (Python ints), highest-score first for a tidy UI.
+    """
+    if n <= 0:
+        return []
+    total = int(np.asarray(scores).shape[0])
+    eligible = (
+        np.asarray(candidate_mask, dtype=bool)
+        if candidate_mask is not None
+        else np.ones(total, dtype=bool)
+    )
+    if labeled is not None:
+        lab = np.fromiter((int(i) for i in labeled), dtype=np.int64)
+        lab = lab[(lab >= 0) & (lab < total)]
+        eligible = eligible.copy()
+        eligible[lab] = False
+    idx = np.nonzero(eligible)[0]
+    if idx.size == 0:
+        return []
+    sc = np.asarray(scores, dtype=np.float64)[idx]
+    rng = np.random.default_rng(seed)
+    picks: list[int] = []
+
+    def _take(pool: np.ndarray, count: int) -> None:
+        pool = np.setdiff1d(pool, np.asarray(picks, dtype=np.int64), assume_unique=False)
+        if pool.size == 0 or count <= 0:
+            return
+        chosen = rng.choice(pool, size=min(count, pool.size), replace=False)
+        picks.extend(int(i) for i in chosen)
+
+    if tau is not None:
+        near = idx[np.abs(sc - float(tau)) <= band]
+        _take(near, n // 2)
+
+    # Quantile stratification over the remaining budget: one row per score bin.
+    remaining = n - len(picks)
+    if remaining > 0:
+        nbins = min(remaining, max(1, idx.size))
+        # Rank eligible rows by score, split into ~nbins contiguous groups, take one.
+        order = idx[np.argsort(-sc, kind="mergesort")]
+        groups = np.array_split(order, nbins)
+        for g in groups:
+            if len(picks) >= n:
+                break
+            _take(g, 1)
+
+    # Top-up from anywhere eligible if bins were exhausted (small corpora).
+    if len(picks) < n:
+        _take(idx, n - len(picks))
+
+    picks = list(dict.fromkeys(picks))[:n]  # dedupe, cap
+    picks.sort(key=lambda i: -float(np.asarray(scores)[i]))  # high score first
+    return picks

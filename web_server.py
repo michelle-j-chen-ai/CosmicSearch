@@ -803,6 +803,33 @@ class ExportRequest(BaseModel):
     interval_score: float | None = None
 
 
+class ThresholdSearchRequest(BaseModel):
+    """Fit a per-tag score cutoff from labeled 👍/👎 marks, and return a batch of
+    UNLABELED boundary clips to keep labeling (active learning). Carries the same
+    query + filters as the other search endpoints so the scores it tunes against
+    are exactly the ones the app will select with."""
+
+    query: str
+    from_date: str | None = None
+    to_date: str | None = None
+    segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    embeddings_uri: str | None = None
+    marks: list[Mark] = []
+    # "f1" (max F-beta) | "youden" (max TPR-FPR) | "precision" (max recall s.t.
+    # precision >= min_precision). See search_engine.fit_threshold.
+    objective: str = "f1"
+    beta: float = 1.0
+    min_precision: float = 0.9
+    # >0 holds out a fraction of labels so the reported metrics aren't optimistic.
+    val_fraction: float = 0.0
+    # How many boundary clips to hand back for the next labeling round.
+    sample_size: int = 12
+    band: float = 0.08
+
+
 class VectorSearchRequest(BaseModel):
     """Rank by a pre-computed query vector -- used to RESUME a saved search."""
 
@@ -2104,6 +2131,101 @@ def score_distribution(req: ExportRequest, request: Request) -> dict:
         raise HTTPException(400, "no finite scores to summarize")
     dist["mode"] = mode
     return dist
+
+
+@app.post("/api/threshold_search")
+def threshold_search(req: ThresholdSearchRequest) -> dict:
+    """Choose a similarity cutoff for the current query from labeled 👍/👎 marks,
+    and return the next batch of boundary clips to label.
+
+    Picking a cosine threshold from labels is binary-classifier operating-point
+    selection: we score the labeled clips with the SAME query+filters the app
+    ranks with, sweep every candidate cutoff, and pick the one optimizing the
+    chosen objective (search_engine.fit_threshold -- no random subsampling). To
+    bootstrap when labels are scarce we also return a score-stratified, boundary-
+    biased batch of UNLABELED clips (search_engine.stratified_boundary_sample);
+    labeling those and re-posting tightens the threshold each round. Overlaid
+    labeled 👍/👎 score arrays + the corpus histogram + the PR curve back the UI.
+    """
+    _require_ready()
+    uri = (req.embeddings_uri or _state["active_uri"]).strip()
+    try:
+        corpus = _get_corpus(uri)
+    except _CORPUS_ERRORS as exc:
+        raise HTTPException(400, f"could not load corpus: {exc}")
+    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
+    seg_mask, _p, _sc, _lc, _lk, _le, seg_sig = _combined_mask(
+        uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
+    )
+    scores, order = _scored_order(
+        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
+    )
+    allowed = np.zeros(corpus.num_rows, dtype=bool)
+    allowed[order] = True
+
+    def _valid(idxs: list[int]) -> list[int]:
+        seen: dict[int, None] = {}
+        for i in idxs:
+            if i is not None and 0 <= int(i) < corpus.num_rows:
+                seen[int(i)] = None
+        return list(seen)
+
+    pos_idx = _valid([m.index for m in req.marks if m.mark == "up"])
+    neg_idx = _valid([m.index for m in req.marks if m.mark == "down"])
+    labeled = set(pos_idx) | set(neg_idx)
+    pos_scores = scores[np.asarray(pos_idx, dtype=np.int64)] if pos_idx else np.array([])
+    neg_scores = scores[np.asarray(neg_idx, dtype=np.int64)] if neg_idx else np.array([])
+
+    fit: dict | None = None
+    note = ""
+    if pos_idx and neg_idx:
+        fit = search_engine.fit_threshold(
+            pos_scores,
+            neg_scores,
+            objective=req.objective,
+            beta=req.beta,
+            min_precision=req.min_precision,
+            val_fraction=req.val_fraction,
+        )
+        if fit["objective"] == "precision" and not fit["precision_floor_met"]:
+            note = (
+                f"No cutoff reaches precision >= {req.min_precision:.2f} on the "
+                "current labels; showing the highest-precision cutoff. Label more "
+                "boundary clips to separate the classes."
+            )
+    else:
+        missing = "positive (👍)" if not pos_idx else "negative (👎)"
+        note = (
+            f"Need at least one {missing} label to fit a threshold. Label the "
+            "boundary clips below, then run again."
+        )
+
+    tau = float(fit["threshold"]) if fit else None
+    # Next active-labeling batch: boundary-biased, excludes already-labeled rows,
+    # restricted to the same filtered candidate set the search is ranking.
+    sample_idx = search_engine.stratified_boundary_sample(
+        scores, allowed, labeled, req.sample_size, tau=tau, band=req.band
+    )
+    rank_of = np.empty(corpus.num_rows, dtype=np.int64)
+    rank_of[order] = np.arange(1, order.size + 1)
+    sample_hits = [
+        _hit_dict(search_engine._hit(corpus, scores, i, int(rank_of[i])))
+        for i in sample_idx
+    ]
+
+    hist = _score_histogram(scores, tau)
+    return {
+        "threshold": tau,
+        "fit": fit,
+        "note": note,
+        "num_up": len(pos_idx),
+        "num_down": len(neg_idx),
+        # Small labeled arrays for the overlaid 👍/👎 histograms in the UI.
+        "up_scores": [round(float(s), 4) for s in pos_scores.tolist()],
+        "down_scores": [round(float(s), 4) for s in neg_scores.tolist()],
+        "histogram": hist,
+        "sample": sample_hits,
+    }
 
 
 def _export_intervals(

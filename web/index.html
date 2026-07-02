@@ -193,6 +193,10 @@
            drag/click the chart to set the threshold. Not shown until clicked. -->
       <button id="dist-btn" type="button" class="ghost"
               title="Show the similarity-score distribution for this search and jump to it">Similarity distribution</button>
+      <!-- Fit a cosine cutoff from the 👍/👎 marks and get more boundary clips to
+           label (active learning). See /api/threshold_search. -->
+      <button id="threshold-btn" type="button" class="ghost"
+              title="Fit a similarity threshold from your 👍/👎 marks and get more boundary clips to label">Threshold search</button>
       <span id="mark-count" class="note"></span>
       <span class="refine-knobs">
         <label title="How hard to push away from 👎">avoid-👎
@@ -209,6 +213,11 @@
          (above results) so it's visible without scrolling. Populated by the
          "Similarity distribution" button or the interval preview. -->
     <section id="score-dist-view" class="score-dist-view hidden"></section>
+
+    <!-- THRESHOLD SEARCH — fit a cosine cutoff from labeled 👍/👎 marks and show
+         the next batch of boundary clips to label. Populated by the "Threshold
+         search" button; the labeling grid reuses the standard mark buttons. -->
+    <section id="threshold-view" class="score-dist-view hidden"></section>
 
     <!-- PAGER + JUMP (top) -->
     <nav id="pager" class="pager hidden">

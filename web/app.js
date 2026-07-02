@@ -284,6 +284,7 @@ function wireEvents() {
     $("text-weight").disabled = !e.target.checked;
   });
   $("dist-btn").addEventListener("click", loadScoreDistribution);
+  $("threshold-btn").addEventListener("click", () => loadThresholdSearch());
   $("save-vec-btn").addEventListener("click", saveVector);
   $("search-export-btn").addEventListener("click", exportSearchCsv);
   // Export view: history picker + Download CSV (resident corpus) + launch offline scan.
@@ -1393,6 +1394,196 @@ function buildDistribution(dist) {
   svg.addEventListener("pointerup", onUp);
   svg.addEventListener("pointercancel", onUp);
   setTau(curTau);  // initial readout
+  return wrap;
+}
+
+// ---------- threshold search (fit a cutoff from 👍/👎 + active labeling) ----
+// state.marks -> the endpoint's Mark shape. Only the corpus row index + up/down
+// verdict matter for fitting; chunk_id is carried for completeness.
+function _marksArray() {
+  return Object.entries(state.marks).map(([chunk_id, m]) => ({
+    chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "",
+  }));
+}
+
+// Fit a threshold from the current 👍/👎 marks and fetch the next batch of
+// boundary clips to label. Re-runnable: each round folds in the newest marks.
+async function loadThresholdSearch() {
+  if (!state.query) {
+    previewNote("Run a search first, then mark a few 👍/👎 to fit a threshold.", true);
+    setStatus("Run a search first to fit a threshold.", true);
+    return;
+  }
+  const objSel = $("thr-objective");
+  const objective = objSel ? objSel.value : "f1";
+  const minP = $("thr-minp");
+  const body = Object.assign(_filterBody(), {
+    query: state.query,
+    marks: _marksArray(),
+    objective,
+    min_precision: minP ? (parseFloat(minP.value) || 0.9) : 0.9,
+    val_fraction: 0.0,
+    sample_size: 12,
+  });
+  previewNote("Fitting threshold from your labels…");
+  setStatus("Fitting threshold…");
+  try {
+    const data = await fetch("/api/threshold_search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+    showThreshold(data);
+    $("threshold-view").scrollIntoView({ behavior: "smooth", block: "start" });
+    const tn = data.threshold != null ? ` · τ ${data.threshold.toFixed(3)}` : "";
+    previewNote(`threshold search — ${data.num_up} 👍 / ${data.num_down} 👎${tn} — scrolled below ↓`);
+    setStatus(`Threshold search · ${data.num_up} 👍 / ${data.num_down} 👎${tn}`);
+  } catch (e) {
+    previewNote("Threshold search failed: " + escapeHtml(e.message), true);
+    setStatus("Threshold search failed: " + e.message, true);
+  }
+}
+
+function showThreshold(data) {
+  const t = $("threshold-view");
+  t.innerHTML = "";
+  if (!data) { t.classList.add("hidden"); return; }
+  t.appendChild(buildThreshold(data));
+  t.classList.remove("hidden");
+}
+
+// A small precision-recall curve SVG for the labeled set.
+function _prCurveSvg(curve) {
+  if (!curve || !curve.recall || curve.recall.length < 2) return "";
+  const W = 240, H = 200, m = 30;
+  const pw = W - m - 8, ph = H - m - 20;
+  const X = (r) => m + r * pw;              // recall 0..1
+  const Y = (p) => 8 + (1 - p) * ph;        // precision 0..1
+  const pts = curve.recall.map((r, i) => `${X(r).toFixed(1)},${Y(curve.precision[i]).toFixed(1)}`).join(" ");
+  const grid = [0, 0.5, 1].map((v) =>
+    `<line x1="${m}" y1="${Y(v).toFixed(1)}" x2="${W - 8}" y2="${Y(v).toFixed(1)}" class="sd-grid" />`
+    + `<text x="${m - 4}" y="${(Y(v) + 3).toFixed(1)}" class="sd-ytick">${v}</text>`).join("");
+  return `<svg class="sd-spark" viewBox="0 0 ${W} ${H}" role="img" aria-label="precision-recall curve">
+      ${grid}
+      <line x1="${m}" y1="${8 + ph}" x2="${W - 8}" y2="${8 + ph}" class="sd-axis" />
+      <line x1="${m}" y1="8" x2="${m}" y2="${8 + ph}" class="sd-axis" />
+      <polyline points="${pts}" fill="none" class="sd-prline" />
+      <text x="${(m + pw / 2).toFixed(1)}" y="${H - 2}" class="sd-axlbl">recall → (y: precision)</text>
+    </svg>`;
+}
+
+// Overlaid 👍 (green) / 👎 (red) labeled-score strip above the corpus histogram,
+// with the fitted τ marked. The threshold is where the two clouds separate.
+function _labeledStripSvg(data) {
+  const hist = data.histogram;
+  if (!hist) return "";
+  const W = 720, H = 70, mL = 46, mR = 12;
+  const pw = W - mL - mR;
+  const lo = hist.edges[0], hi = hist.edges[hist.edges.length - 1];
+  const span = (hi - lo) || 1;
+  const X = (s) => mL + ((s - lo) / span) * pw;
+  const tick = (s, cls) => `<line x1="${X(s).toFixed(1)}" y1="14" x2="${X(s).toFixed(1)}" y2="46" class="${cls}" />`;
+  const ups = (data.up_scores || []).map((s) => tick(s, "thr-up")).join("");
+  const downs = (data.down_scores || []).map((s) => tick(s, "thr-down")).join("");
+  const tau = data.threshold;
+  const tauLine = tau != null
+    ? `<line x1="${X(tau).toFixed(1)}" y1="6" x2="${X(tau).toFixed(1)}" y2="54" class="sd-thresh" />`
+    + `<text x="${(X(tau) + 5).toFixed(1)}" y="14" class="sd-taulbl">τ ${tau.toFixed(3)}</text>`
+    : "";
+  return `<svg class="sd-spark" viewBox="0 0 ${W} ${H}" role="img" aria-label="labeled positive/negative scores">
+      <text x="${mL - 40}" y="26" class="sd-ytick">👍</text>
+      <text x="${mL - 40}" y="44" class="sd-ytick">👎</text>
+      ${ups}${downs}${tauLine}
+    </svg>`;
+}
+
+function buildThreshold(data) {
+  const wrap = document.createElement("div");
+  wrap.className = "score-dist thr-panel";
+  const fit = data.fit;
+  const pct = (x) => (x == null ? "—" : (100 * x).toFixed(1) + "%");
+  const metrics = fit
+    ? `<span class="sub">τ <b>${data.threshold.toFixed(3)}</b>
+         · precision ${pct(fit.precision)} · recall ${pct(fit.recall)}
+         · F1 ${pct(fit.f1)} · AP ${pct(fit.average_precision)}
+         · ${fit.n_pos} 👍 / ${fit.n_neg} 👎${fit.held_out ? " · held-out" : ""}</span>`
+    : `<span class="sub">not enough labels yet</span>`;
+  const note = data.note ? `<div class="sub sd-hint">${escapeHtml(data.note)}</div>` : "";
+  wrap.innerHTML = `
+    <div class="interval-head">
+      <h3>Threshold search</h3>
+      ${metrics}
+    </div>
+    <div class="thr-controls">
+      <label>objective
+        <select id="thr-objective">
+          <option value="f1">max F1</option>
+          <option value="youden">Youden's J</option>
+          <option value="precision">precision floor</option>
+        </select>
+      </label>
+      <label class="thr-minp-wrap">min precision
+        <input id="thr-minp" type="number" step="0.05" min="0" max="1" value="0.90" />
+      </label>
+      <button id="thr-refit" type="button" class="ghost">Re-fit with current marks</button>
+      <button id="thr-apply" type="button" class="primary" ${data.threshold == null ? "disabled" : ""}>Apply τ to this tag</button>
+      <span id="thr-apply-note" class="note"></span>
+    </div>
+    ${note}
+    <div class="thr-charts">
+      <div class="thr-strip">
+        ${_labeledStripSvg(data)}
+        <div id="thr-hist"></div>
+      </div>
+      ${fit ? `<div class="thr-pr">${_prCurveSvg(fit.curve)}</div>` : ""}
+    </div>
+    <div class="sub">Label these boundary clips, then <b>Re-fit</b> — each round sharpens τ:</div>
+    <div id="thr-grid" class="grid thr-grid"></div>`;
+
+  // Corpus histogram (reuse the distribution chart, marking the fitted τ).
+  if (data.histogram) {
+    const h = Object.assign({}, data.histogram, { mode: "score" });
+    wrap.querySelector("#thr-hist").appendChild(buildDistribution(h));
+  }
+
+  // Set the objective selector back to what produced this result.
+  const objSel = wrap.querySelector("#thr-objective");
+  if (fit && objSel) objSel.value = fit.objective;
+  const minpWrap = wrap.querySelector(".thr-minp-wrap");
+  const syncMinp = () => { minpWrap.style.display = objSel.value === "precision" ? "" : "none"; };
+  syncMinp();
+  objSel.addEventListener("change", syncMinp);
+
+  wrap.querySelector("#thr-refit").onclick = () => loadThresholdSearch();
+  wrap.querySelector("#thr-apply").onclick = () => {
+    if (data.threshold == null) return;
+    const el = $("save-vec-threshold");
+    if (el) el.value = data.threshold.toFixed(3);
+    const cur = $("curate-threshold");
+    if (cur) cur.value = data.threshold.toFixed(3);
+    const n = wrap.querySelector("#thr-apply-note");
+    if (n) n.textContent = `τ ${data.threshold.toFixed(3)} applied to this tag's threshold`;
+  };
+
+  // Active-labeling grid: standard cards + mark buttons; marking then Re-fit folds
+  // the new labels into the next fit (marks live in the shared state.marks).
+  const grid = wrap.querySelector("#thr-grid");
+  (data.sample || []).forEach((h, i) => {
+    const m = state.marks[h.chunk_id];
+    const card = buildHitCard(h, {
+      cardClass: "thr-card",
+      controls: `
+        <div class="marks">
+          <button class="mark up ${m && m.mark === "up" ? "on" : ""}" title="Relevant">👍</button>
+          <button class="mark down ${m && m.mark === "down" ? "on" : ""}" title="Not relevant">👎</button>
+        </div>`,
+    });
+    card.style.animationDelay = (i * 18) + "ms";
+    const [upBtn, downBtn] = card.querySelectorAll(".mark");
+    upBtn.onclick = () => toggleMark(h, "up", card);
+    downBtn.onclick = () => toggleMark(h, "down", card);
+    grid.appendChild(card);
+  });
   return wrap;
 }
 

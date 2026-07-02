@@ -351,6 +351,70 @@ def test_positive_clusters_tolerates_outlier_and_fragmentation() -> None:
     assert search_engine._positive_clusters(_unit_rows(np.eye(4))) == [[0, 1, 2, 3]]
 
 
+def test_fit_threshold_separable_maxf1() -> None:
+    # Cleanly separable: positives ~0.8, negatives ~0.2. The F1-optimal cut sits
+    # between the clusters and recovers precision=recall=1.
+    pos = np.array([0.75, 0.80, 0.85, 0.90])
+    neg = np.array([0.10, 0.15, 0.20, 0.25])
+    out = search_engine.fit_threshold(pos, neg, objective="f1")
+    assert 0.25 < out["threshold"] <= 0.75, out["threshold"]
+    assert out["precision"] == 1.0 and out["recall"] == 1.0, out
+    assert out["n_pos"] == 4 and out["n_neg"] == 4
+    assert len(out["curve"]["tau"]) == len(out["curve"]["precision"]) > 0
+
+
+def test_fit_threshold_precision_floor() -> None:
+    # Overlapping: one negative (0.72) sits above a positive (0.70). A precision
+    # floor of 1.0 must exclude that negative -> threshold above 0.72.
+    pos = np.array([0.70, 0.78, 0.86, 0.94])
+    neg = np.array([0.30, 0.50, 0.72])
+    out = search_engine.fit_threshold(pos, neg, objective="precision", min_precision=1.0)
+    assert out["threshold"] > 0.72, out["threshold"]
+    assert out["precision"] == 1.0, out
+    assert out["precision_floor_met"] is True
+
+
+def test_fit_threshold_precision_floor_unreachable_flags() -> None:
+    # A positive (0.40) buried below a negative (0.60): precision 1.0 is impossible
+    # at any useful recall -> flag it rather than silently lying.
+    pos = np.array([0.40, 0.55])
+    neg = np.array([0.60, 0.62])
+    out = search_engine.fit_threshold(pos, neg, objective="precision", min_precision=1.0)
+    assert out["precision_floor_met"] is False, out
+
+
+def test_fit_threshold_requires_both_classes() -> None:
+    try:
+        search_engine.fit_threshold(np.array([0.5]), np.array([]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError with an empty negative set")
+
+
+def test_stratified_boundary_sample_excludes_labeled_and_targets_band() -> None:
+    scores = np.linspace(0.0, 1.0, 100)
+    labeled = {10, 20, 30}
+    picks = search_engine.stratified_boundary_sample(
+        scores, None, labeled, n=10, tau=0.5, band=0.05, seed=1
+    )
+    assert len(picks) == 10 and len(set(picks)) == 10, picks
+    assert not (set(picks) & labeled), "labeled rows must be excluded"
+    # Half the budget targets the [0.45, 0.55] band (rows ~45..55).
+    near = [i for i in picks if abs(scores[i] - 0.5) <= 0.05]
+    assert len(near) >= 4, (near, picks)
+    # Sorted high-score first for the UI.
+    assert picks == sorted(picks, key=lambda i: -scores[i])
+
+
+def test_stratified_boundary_sample_respects_candidate_mask() -> None:
+    scores = np.linspace(0.0, 1.0, 50)
+    mask = np.zeros(50, dtype=bool)
+    mask[:20] = True  # only the low-score half is eligible
+    picks = search_engine.stratified_boundary_sample(scores, mask, None, n=8, seed=2)
+    assert picks and all(i < 20 for i in picks), picks
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

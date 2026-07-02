@@ -359,6 +359,21 @@ select:disabled { opacity: 0.5; cursor: not-allowed; }
 .sd-xtick { fill: var(--ink-dim); font-size: 10px; text-anchor: middle; }
 .sd-axlbl { fill: var(--ink-dim); font-size: 10px; text-anchor: middle; }
 .sd-taulbl { fill: var(--accent, #d98b5f); font-size: 10px; }
+/* ---------- threshold search ---------- */
+.thr-up { stroke: #6ee7a0; stroke-width: 2; opacity: 0.9; }
+.thr-down { stroke: #f2795f; stroke-width: 2; opacity: 0.9; }
+.sd-prline { stroke: var(--accent, #c8ff4d); stroke-width: 1.6; }
+.thr-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 6px 0 4px; }
+.thr-controls label { font-size: 12px; color: var(--ink-dim); display: inline-flex; align-items: center; gap: 6px; }
+.thr-controls select, .thr-controls input[type="number"] {
+  background: rgba(232,234,240,0.04); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 8px; padding: 3px 6px; font-size: 12px;
+}
+.thr-charts { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+.thr-charts .thr-strip { flex: 1 1 420px; min-width: 320px; }
+.thr-charts .thr-pr { flex: 0 0 240px; }
+.thr-grid { margin-top: 8px; }
+.thr-grid .thr-card video { max-height: 150px; }
 #config-queries {
   width: 100%; box-sizing: border-box; min-height: 84px;
   font-family: 'IBM Plex Mono', monospace; font-size: 12px; line-height: 1.5;
