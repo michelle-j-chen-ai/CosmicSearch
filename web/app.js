@@ -1465,6 +1465,7 @@ function exitThresholdView() {
   if (sv) sv.classList.remove("threshold-active");
   const t = $("threshold-view");
   if (t) { t.classList.add("hidden"); t.innerHTML = ""; }
+  state.thrLastTau = null;  // reset τ-stability tracking for the next concept
 }
 
 // A small precision-recall curve SVG for the labeled set.
@@ -1512,81 +1513,173 @@ function _labeledStripSvg(data) {
     </svg>`;
 }
 
+// Slug a query into a default tag name (lowercase, underscore-joined, capped).
+function _querySlug(q) {
+  return (q || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40);
+}
+
+// Persist the fitted τ to a tag via the same /api/save_vector path the sidebar
+// "Save vector" uses — writing export_log.threshold, which Export CSV and the
+// offline scan read. The server saves the cached query vector (the one τ was fit
+// against), so vector + τ stay consistent.
+async function saveThresholdToTag(tau) {
+  const noteEl = $("thr-save-note");
+  const tag = ($("thr-tag").value || "").trim();
+  if (!tag) { noteEl.classList.add("warn"); noteEl.textContent = "Enter a tag name."; return; }
+  if (!state.query) { noteEl.classList.add("warn"); noteEl.textContent = "Run a search first."; return; }
+  const btn = $("thr-save");
+  btn.disabled = true;
+  noteEl.classList.remove("warn");
+  noteEl.textContent = "Saving…";
+  try {
+    const r = await fetch("/api/save_vector", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tag, query: state.query,
+        k: parseInt(($("save-vec-k") || {}).value, 10) || 50,
+        threshold: tau,
+        ..._activeFilters(),
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
+    await r.json();
+    noteEl.innerHTML = `Saved <b>${escapeHtml(tag)}</b> · τ=${tau.toFixed(3)} — now used by `
+      + `Download CSV + the offline scan. Find it on the <b>Export</b> tab.`;
+    // Mirror into the sidebar inputs so the two stay consistent.
+    if ($("save-vec-tag")) $("save-vec-tag").value = tag;
+    if ($("save-vec-threshold")) $("save-vec-threshold").value = tau.toFixed(3);
+  } catch (e) {
+    noteEl.classList.add("warn");
+    noteEl.textContent = "Save failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Objective codes -> plain-language labels for the picker.
+const THR_OBJECTIVES = [
+  ["f1", "Balanced (F1)"],
+  ["precision", "High precision (few false hits)"],
+  ["youden", "Best separation"],
+];
+
+// The Tune-threshold panel: a guided 3-step flow — Teach (label) -> See (fit) ->
+// Save (persist to tag). The active step is emphasized by state; steps 2/3 stay
+// disabled until there's a fit.
 function buildThreshold(data) {
   const wrap = document.createElement("div");
   wrap.className = "score-dist thr-panel";
   const fit = data.fit;
+  const hasFit = !!fit;
+  const tau = data.threshold;
+  const up = data.num_up || 0, down = data.num_down || 0;
+  const enough = up >= 3 && down >= 3;
   const pct = (x) => (x == null ? "—" : (100 * x).toFixed(1) + "%");
-  const metrics = fit
-    ? `<span class="sub">τ <b>${data.threshold.toFixed(3)}</b>
-         · precision ${pct(fit.precision)} · recall ${pct(fit.recall)}
-         · F1 ${pct(fit.f1)} · AP ${pct(fit.average_precision)}
-         · ${fit.n_pos} 👍 / ${fit.n_neg} 👎${fit.held_out ? " · held-out" : ""}</span>`
-    : `<span class="sub">not enough labels yet</span>`;
+
+  // Progress hint: tell the user the single next thing to do.
+  let hint;
+  if (!hasFit) {
+    hint = up === 0 && down === 0
+      ? "Mark a few clips below 👍 (a match) / 👎 (not a match) to compute a cutoff."
+      : `Need at least one 👍 and one 👎 — you have ${up} 👍 / ${down} 👎.`;
+  } else if (!enough) {
+    hint = `Cutoff from few labels (${up} 👍 / ${down} 👎). Label more + Sharpen for a reliable τ.`;
+  } else {
+    hint = "Looking solid. Sharpen a round or two if τ still moves, then save it to a tag.";
+  }
+
+  // τ-stability across re-fits.
+  let stab = "";
+  if (hasFit && state.thrLastTau != null) {
+    const d = Math.abs(tau - state.thrLastTau);
+    stab = d < 0.005 ? "τ stable ✓" : `τ moved ${d.toFixed(3)} since last round`;
+  }
+  if (hasFit) state.thrLastTau = tau;
+
+  const objOptions = THR_OBJECTIVES
+    .map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+  const metrics = hasFit
+    ? `<span class="sub">τ <b>${tau.toFixed(3)}</b> · precision ${pct(fit.precision)}
+         · recall ${pct(fit.recall)} · F1 ${pct(fit.f1)} · AP ${pct(fit.average_precision)}
+         · ${fit.n_pos} 👍 / ${fit.n_neg} 👎${fit.held_out ? " · held-out" : ""}
+         ${stab ? ` · <b>${stab}</b>` : ""}</span>`
+    : "";
   const note = data.note ? `<div class="sub sd-hint">${escapeHtml(data.note)}</div>` : "";
+
   wrap.innerHTML = `
     <div class="thr-topbar">
       <button id="thr-back" type="button" class="ghost">← Back to results</button>
       <span class="thr-context">${escapeHtml(state.query || "")}</span>
     </div>
-    <div class="interval-head">
-      <h3>Threshold search</h3>
-      ${metrics}
-    </div>
-    <div class="thr-controls">
-      <label>objective
-        <select id="thr-objective">
-          <option value="f1">max F1</option>
-          <option value="youden">Youden's J</option>
-          <option value="precision">precision floor</option>
-        </select>
-      </label>
-      <label class="thr-minp-wrap">min precision
-        <input id="thr-minp" type="number" step="0.05" min="0" max="1" value="0.90" />
-      </label>
-      <button id="thr-refit" type="button" class="ghost">Re-fit with current marks</button>
-      <button id="thr-apply" type="button" class="primary" ${data.threshold == null ? "disabled" : ""}>Apply τ to this tag</button>
-      <span id="thr-apply-note" class="note"></span>
-    </div>
+    <div class="interval-head"><h3>Tune threshold</h3></div>
+    <div class="thr-progress">${escapeHtml(hint)}</div>
     ${note}
-    <div class="thr-charts">
-      <div class="thr-strip">
-        ${_labeledStripSvg(data)}
-        <div id="thr-hist"></div>
-      </div>
-      ${fit ? `<div class="thr-pr">${_prCurveSvg(fit.curve)}</div>` : ""}
-    </div>
-    <div class="sub">Label these boundary clips, then <b>Re-fit</b> — each round sharpens τ:</div>
-    <div id="thr-grid" class="grid thr-grid"></div>`;
+
+    <div class="thr-steps">
+      <section class="thr-step ${hasFit ? "done" : "active"}">
+        <div class="thr-step-head"><span class="thr-step-num">1</span> Teach it
+          <span class="thr-counts">${up} 👍 / ${down} 👎</span></div>
+        <div class="sub">Mark clips 👍 (a match) / 👎 (not) — aim for at least 3 of each.
+          These are picked near the current cutoff, where your labels matter most.</div>
+        <div id="thr-grid" class="grid thr-grid"></div>
+        <button id="thr-more" type="button" class="ghost">More clips to label</button>
+      </section>
+
+      <section class="thr-step ${hasFit ? "active" : "disabled"}">
+        <div class="thr-step-head"><span class="thr-step-num">2</span> See the cutoff</div>
+        ${hasFit ? `
+          ${metrics}
+          <div class="thr-controls">
+            <label>optimize for
+              <select id="thr-objective">${objOptions}</select>
+            </label>
+            <label class="thr-minp-wrap">min precision
+              <input id="thr-minp" type="number" step="0.05" min="0" max="1" value="${fit.objective === "precision" ? "0.90" : "0.90"}" />
+            </label>
+            <button id="thr-sharpen" type="button" class="ghost">Sharpen (more labels + re-fit)</button>
+          </div>
+          <div class="thr-charts">
+            <div class="thr-strip">${_labeledStripSvg(data)}<div id="thr-hist"></div></div>
+            <div class="thr-pr">${_prCurveSvg(fit.curve)}</div>
+          </div>`
+          : `<div class="sub muted">Label at least one 👍 and one 👎 above and the cutoff appears here.</div>`}
+      </section>
+
+      <section class="thr-step ${hasFit ? "active" : "disabled"}">
+        <div class="thr-step-head"><span class="thr-step-num">3</span> Save it</div>
+        <div class="thr-save-row">
+          <label>tag <input id="thr-tag" type="text" placeholder="tag name" value="${escapeHtml(_querySlug(state.query))}" /></label>
+          <button id="thr-save" type="button" class="primary" ${hasFit ? "" : "disabled"}>Save threshold to tag</button>
+        </div>
+        <div id="thr-save-note" class="note"></div>
+        <div class="sub sd-hint">Saves τ + this query to the tag — the value Download CSV and the offline scan use.</div>
+      </section>
+    </div>`;
 
   // Corpus histogram (reuse the distribution chart, marking the fitted τ).
-  if (data.histogram) {
+  if (hasFit && data.histogram) {
     const h = Object.assign({}, data.histogram, { mode: "score" });
     wrap.querySelector("#thr-hist").appendChild(buildDistribution(h));
   }
 
-  // Set the objective selector back to what produced this result.
-  const objSel = wrap.querySelector("#thr-objective");
-  if (fit && objSel) objSel.value = fit.objective;
-  const minpWrap = wrap.querySelector(".thr-minp-wrap");
-  const syncMinp = () => { minpWrap.style.display = objSel.value === "precision" ? "" : "none"; };
-  syncMinp();
-  objSel.addEventListener("change", syncMinp);
-
   wrap.querySelector("#thr-back").onclick = () => exitThresholdView();
-  wrap.querySelector("#thr-refit").onclick = () => loadThresholdSearch();
-  wrap.querySelector("#thr-apply").onclick = () => {
-    if (data.threshold == null) return;
-    const el = $("save-vec-threshold");
-    if (el) el.value = data.threshold.toFixed(3);
-    const cur = $("curate-threshold");
-    if (cur) cur.value = data.threshold.toFixed(3);
-    const n = wrap.querySelector("#thr-apply-note");
-    if (n) n.textContent = `τ ${data.threshold.toFixed(3)} applied to this tag's threshold`;
-  };
+  wrap.querySelector("#thr-more").onclick = () => loadThresholdSearch();
 
-  // Active-labeling grid: standard cards + mark buttons; marking then Re-fit folds
-  // the new labels into the next fit (marks live in the shared state.marks).
+  if (hasFit) {
+    const objSel = wrap.querySelector("#thr-objective");
+    objSel.value = fit.objective;
+    const minpWrap = wrap.querySelector(".thr-minp-wrap");
+    const syncMinp = () => { minpWrap.style.display = objSel.value === "precision" ? "" : "none"; };
+    syncMinp();
+    // Changing the objective (or the precision floor) re-fits immediately.
+    objSel.addEventListener("change", () => { syncMinp(); loadThresholdSearch(); });
+    wrap.querySelector("#thr-minp").addEventListener("change", () => loadThresholdSearch());
+    wrap.querySelector("#thr-sharpen").onclick = () => loadThresholdSearch();
+    wrap.querySelector("#thr-save").onclick = () => saveThresholdToTag(tau);
+  }
+
+  // Active-labeling grid: standard cards + mark buttons; marking then Sharpen/More
+  // folds the new labels into the next fit (marks live in the shared state.marks).
   const grid = wrap.querySelector("#thr-grid");
   (data.sample || []).forEach((h, i) => {
     const m = state.marks[h.chunk_id];
