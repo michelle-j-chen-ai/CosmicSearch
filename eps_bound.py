@@ -18,9 +18,13 @@ the nearest representable point on a `scale_d / 127`-wide grid, so the
 per-dim dequantization error is bounded by half that step:
 `|e_d| <= scale_d / (2 * 127) = scale_d / 254`. For a unit-norm query `q`,
 Cauchy-Schwarz gives `|q . e| <= ||q||_2 * ||e||_2 <= ||scale||_2 / 254` --
-a bound that does not depend on q's direction, only its norm. A looser,
+a bound that does not depend on q's direction, only its norm. A
 per-dimension (Hoelder-style) bound that does not require q to be unit-norm
-is also provided: `|q . e| <= sum_d |q_d| * scale_d / 254`.
+is also provided: `|q . e| <= sum_d |q_d| * scale_d / 254`. For a unit-norm
+query, applying Cauchy-Schwarz to `(|q_d|)` and `(scale_d)` shows this
+Hoelder bound is never looser than the one above -- `sum_d |q_d| * scale_d
+<= ||q||_2 * ||scale||_2 == ||scale||_2` -- so it is at least as tight,
+just query-dependent rather than reusable across queries.
 
 This module is pure numpy: no Lance/dataset dependency, so it is testable in
 isolation from the corpus storage layer.
