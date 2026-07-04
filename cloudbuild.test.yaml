@@ -1,0 +1,15 @@
+steps:
+  - name: python:3.10-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.8.0
+        pip install --no-cache-dir -r requirements.txt
+        python -m pytest tests/ -v
+        python smoke_test.py
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1800s

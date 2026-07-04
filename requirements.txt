@@ -56,3 +56,5 @@ circuitbreaker==2.1.3
 # a numba-fused int8 dot kernel reads the 12.2GB int8 corpus once per query
 # (~0.25s) instead of a ~11s int8->fp32 cast + BLAS. Imported lazily.
 numba==0.66.0
+# Test suite (tests/), run via `python -m pytest tests/`.
+pytest==8.4.2

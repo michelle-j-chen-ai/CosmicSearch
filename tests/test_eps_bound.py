@@ -1,7 +1,7 @@
 """Offline checks for eps_bound: pure numpy, no Lance/dataset, no network.
 
-Run from this directory:
-    python eps_bound_test.py
+Run from the repo root:
+    python -m pytest tests/test_eps_bound.py
 """
 
 from __future__ import annotations
@@ -200,16 +200,3 @@ def test_classify_boundaries_are_exact() -> None:
     np.testing.assert_array_equal(above, [False, False, False, False, True, True])
     # Partition: every row is classified exactly once.
     assert np.all(above.astype(int) + band.astype(int) + below.astype(int) == 1)
-
-
-if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    raise SystemExit(1 if failures else 0)

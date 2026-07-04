@@ -1,13 +1,12 @@
 """Offline checks for threshold_search: synthetic artifacts, no network, no model.
 
-Run from this directory:
-    python threshold_search_test.py
+Run from the repo root:
+    python -m pytest tests/test_threshold_search.py
 """
 
 from __future__ import annotations
 
 import tempfile
-import time
 from pathlib import Path
 
 import eps_bound
@@ -26,7 +25,7 @@ _MODEL_DIM = 768
 def _write_synthetic_artifacts(tmp_dir: Path, n: int, seed: int = 0) -> Path:
     """Write a gpu_corpus-style int8 PCA artifact under `tmp_dir` and return it.
 
-    Same generator shape as lance_writer_test.py's, so threshold_search is
+    Same generator shape as test_lance_writer.py's, so threshold_search is
     exercised against the same builder fixture lance_writer's own tests use.
     """
     rng = np.random.default_rng(seed)
@@ -287,18 +286,3 @@ def test_mutation_eps_zero_causes_false_negative() -> None:
             "mutation check failed to reproduce a false negative -- the oracle "
             "comparison would not actually catch a broken eps bound"
         )
-
-
-if __name__ == "__main__":
-    t0 = time.time()
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    print(f"({time.time() - t0:.1f}s)")
-    raise SystemExit(1 if failures else 0)

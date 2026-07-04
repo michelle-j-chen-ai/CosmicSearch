@@ -1,7 +1,7 @@
 """End-to-end check for search_engine.load_corpus's Lance 2.1 dispatch.
 
 Builds a real Lance 2.1 exact-threshold dataset (via lance_writer.build_dataset,
-same synthetic-artifact fixture as threshold_search_test.py), points
+same synthetic-artifact fixture as test_threshold_search.py), points
 search_engine.load_corpus at it by monkeypatching local_cache.ensure_corpus_local
 (no network / no S3 / no model download), and checks:
 
@@ -13,14 +13,13 @@ search_engine.load_corpus at it by monkeypatching local_cache.ensure_corpus_loca
   3. The npy path (_load_corpus_npy -> rank_top_k) is unaffected by this
      change -- no behavior regression on the existing top-k path.
 
-Run from this directory:
-    python load_corpus_threshold_test.py
+Run from the repo root:
+    python -m pytest tests/test_load_corpus_threshold.py
 """
 
 from __future__ import annotations
 
 import tempfile
-import time
 from pathlib import Path
 
 import lance
@@ -37,7 +36,7 @@ _MODEL_DIM = 768
 
 
 def _write_synthetic_artifacts(tmp_dir: Path, n: int, seed: int = 0) -> Path:
-    """Same fixture shape as threshold_search_test.py / lance_writer_test.py."""
+    """Same fixture shape as test_threshold_search.py / test_lance_writer.py."""
     rng = np.random.default_rng(seed)
     artifact_dir = tmp_dir / "artifact"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -218,18 +217,3 @@ def test_rank_top_k_unaffected_on_npy_path() -> None:
         assert all(
             hits[i].score >= hits[i + 1].score for i in range(len(hits) - 1)
         )
-
-
-if __name__ == "__main__":
-    t0 = time.time()
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    print(f"({time.time() - t0:.1f}s)")
-    raise SystemExit(1 if failures else 0)

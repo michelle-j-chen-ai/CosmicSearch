@@ -1,7 +1,7 @@
 """Offline checks for lance_writer: synthetic artifacts, no network, no model.
 
-Run from this directory:
-    python lance_writer_test.py
+Run from the repo root:
+    python -m pytest tests/test_lance_writer.py
 """
 
 from __future__ import annotations
@@ -192,16 +192,3 @@ def test_pca_metadata_roundtrips_through_schema() -> None:
         pca_out, scale_out = lance_writer.read_pca_metadata(ds)
         np.testing.assert_array_equal(pca_out, pca_in)
         np.testing.assert_array_equal(scale_out, scale_in)
-
-
-if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"PASS {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"FAIL {name}: {exc}")
-    raise SystemExit(1 if failures else 0)
