@@ -1,6 +1,10 @@
 # Design: exact threshold retrieval over 100M-1B embeddings in <10s (Lance, distributed on k8s)
 
-Status: proposed design, research-verified 2026-07-03. Not yet implemented.
+Status: proposed design, research-verified 2026-07-03. The single-node
+screen/eps/re-rank core (`eps_bound.py`, `lance_writer.py`,
+`threshold_search.py`) is implemented and tested; the distributed fleet
+(aggregator, fragment striping, coverage protocol, k8s manifests) described
+below is not.
 Companion doc: [nls_1b_exact_search_findings.md](nls_1b_exact_search_findings.md)
 (repo analysis, verified hardware numbers, prior-art survey backing every
 claim here).
@@ -13,6 +17,13 @@ zero false negatives — over a corpus growing from 100M to 1B+ embeddings,
 scan from ONE Lance dataset. Deployment constraint: horizontally scalable on
 Kubernetes using mainstream cloud machine types with good IO — no bare
 metal, no storage-optimized monsters, no GPUs. Scale = add workers.
+
+This zero-false-negative guarantee is against the true pre-quantization
+cosine only when the writer's artifact supplies an independent fp32-256
+projection; today's production artifact pipeline does not, so the shipped
+`vector_fp` is a deterministic function of the int8 corpus (see the Lance
+dataset spec's `vector_fp` entry and `eps_bound.py`'s module docstring for
+the precise, narrower guarantee that configuration delivers).
 
 ## Design in one paragraph
 
@@ -98,8 +109,9 @@ as 2024-25 exact-search SoTA (SOFA, Panorama).
 - **Refresh loop**: workers poll for new committed dataset versions,
   hydrate only NEW fragment ids they own (append-only until compaction),
   atomic-swap the resident shard; readiness gate = "resident shard matches
-  version V". Post-compaction fragment ids change: re-stripe and rehydrate
-  (256GB/N per worker; ~1 min at 5GB/s NIC).
+  version V". Post-compaction fragment ids change: re-stripe and rehydrate a
+  full per-worker shard (256GB/N = 32GB @N=8; ~7s at 5GB/s NIC, matching the
+  Node sizing section's cold-hydration figure below).
 - **Scaling**: corpus growth => raise N (shards shrink); QPS growth => add
   a replica set. Aggregator is stateless (HPA). Fragments are the unit,
   object store is the truth — scale is linear with no redesign point.
@@ -169,12 +181,24 @@ small, replaceable, elastic — no single machine above ~$1.5k/mo. Pick the
 NVMe vs RAM-only variant from the Day-1 take() benchmark: if object-store
 take() on the eps band is inside budget, RAM-only; else NVMe.
 
-Latency budget (N=8, warm): encode 40ms + fan-out ~10ms + per-worker scan
-32GB at 20-40GB/s effective = 0.8-1.6s + band take() (band ~1e-4 => ~12.5k
-rows/worker, 1 IOP each; local NVMe ~ms, object store 0.5-2s) + union
-50-200ms => **~1-3s**, inside 10s even with a straggler retry. Cold pod
-hydration: 32GB at ~5GB/s NIC ≈ 7s once per pod lifetime, not per query.
-@100M the same fleet runs at N=2-4.
+Latency budget (N=8, warm, SELECTIVE query): encode 40ms + fan-out ~10ms +
+per-worker scan 32GB at 20-40GB/s effective = 0.8-1.6s + take() (1 IOP/row;
+local NVMe ~ms, object store 0.5-2s) + union 50-200ms => **~1-3s**, inside
+10s even with a straggler retry. Cold pod hydration: 32GB at ~5GB/s NIC ≈ 7s
+once per pod lifetime, not per query. @100M the same fleet runs at N=2-4.
+
+take() volume is the full RESULT set (ABOVE union BAND, both re-ranked; see
+Lance dataset spec's take()-only note), not just the BAND width: BAND ~1e-4
+selectivity (~12.5k rows/worker @1B N=8) is the mandatory-re-rank sliver
+around tau, but ABOVE (score provably >= tau, no BAND ambiguity) can be
+far larger for a broad/low-tau query and is re-ranked unconditionally for a
+consistent exact score (Correctness spec). The ~1-3s figure above holds when
+the WHOLE result is ~1e-4 selective (the realistic regime for a tight
+threshold query); a broad query's take() volume — and therefore its
+object-store cost and the NVMe-vs-RAM node choice — scales with the result
+size, not the band alone. Size the node variant and per-query deadline from
+the expected result-set selectivity of the actual workload, not the band
+selectivity in isolation.
 
 ## Rejected alternatives
 
@@ -213,13 +237,20 @@ One dataset (replaces the rank=NNNNN/ sharded lancedb tables):
   | column | type | bytes/row @1B | role |
   |---|---|---|---|
   | embedding_i8 | FSL<int8,256> | 256 GB | screen scan (the only column scanned) |
-  | vector_fp | FSL<float32,256> | 1 TB | exact re-rank, take()-only |
+  | vector_fp | FSL<float32,256> | 1 TB | re-rank, take()-only |
   | tail_norm_f16 | float16 | 2 GB | reserved for optional progressive pruning |
   | run_uuid, chunk_start_unix, chunk_end_unix, segment_id, vehicle | scalars | ~50-80 GB | metadata + filters |
 
   Dropped: chunk_id, source_media_uri — derivable row-exact from
   run_uuid + chunk_start (proven in gpu_corpus.py); ~185GB saved @1B.
   PCA basis + per-dim quant scales live in dataset schema metadata.
+  `vector_fp` is the true pre-quantization PCA-256 projection when the
+  writer's artifact provides one (`lance_writer.PRE_QUANT_FP32_FILE`);
+  today's production artifact pipeline does not, so it falls back to
+  `int8 * scale / 127` (a deterministic function of `embedding_i8`, carrying
+  no information beyond it) -- see `lance_writer.py`'s module docstring. The
+  eps-bound re-rank's guarantee is against whichever of these `vector_fp`
+  actually holds.
 - Scalar indices: BTREE(chunk_start_unix), BTREE(segment_id),
   BITMAP(vehicle) (equality only — BITMAP range queries are documented
   slow; date ranges go to the BTREE).
@@ -242,15 +273,26 @@ query q projected to the PCA basis:
 
 - **Hard bound (Cauchy-Schwarz)**: |q . e| <= ||q||_2 * ||s||_2/254
   = ||s||_2/254. This eps makes tau-eps a provable superset (GEMINI/LBP).
-  Hoelder fallback: sum_d |q_d| s_d / 254.
-- int8 score >= tau + eps => guaranteed member (re-rank only if exact
-  export scores are needed). [tau-eps, tau+eps) band => mandatory fp32
-  re-rank. Below tau-eps => provably excluded.
+  Hoelder fallback: sum_d |q_d| s_d / 254. This bound is against whichever
+  fp32 value the re-rank column holds; see the Lance dataset spec's
+  `vector_fp` entry and `eps_bound.py`'s module docstring for when that is
+  the true pre-quantization score vs a dequantized-int8 fallback.
+- int8 score >= tau + eps => guaranteed member. The implementation
+  unconditionally re-ranks these rows too (not "only if exact export scores
+  are needed" as an earlier draft of this spec said): re-ranking is cheap
+  relative to ABOVE's own take() cost, and it makes "every returned score
+  >= tau" hold outright rather than resting on the (empirically large but
+  formally unbounded) margin between the fastmath-fp32 screening kernel and
+  the fp64 re-rank. [tau-eps, tau+eps) band => mandatory fp32 re-rank.
+  Below tau-eps => provably excluded.
 - **Never prune on a partial inner-product sum** — IP is not monotone in
   dimensions. Progressive pruning (if ever adopted) must use the per-row
   tail bound partial_IP + ||q_tail|| * tail_norm_row.
-- CI check per corpus build: measured band population vs eps on a 1M
-  sample; alert if band selectivity drifts above the take() budget.
+- CI check per corpus build (not implemented in this PR — see Implementation
+  plan): measured band population vs eps on a 1M sample; alert if band
+  selectivity drifts above the take() budget. Note this bounds BAND
+  selectivity, not the take() volume that actually drives cost (ABOVE union
+  BAND -- see Node sizing's latency budget).
 
 ## Optional accelerator (benchmark-gated, exactness-preserving)
 
@@ -325,7 +367,12 @@ serves it ships on Day 5.
 
 **Out of scope this week.** The optional progressive head/tail accelerator
 and any IVF_PQ browse-only side index (Optional accelerator section) —
-revisit only if the Day-1 gate or production margins demand.
+revisit only if the Day-1 gate or production margins demand. Also out of
+scope in the current single-node `threshold_search` module: date/segment/
+vehicle prefiltering against the scalar indices this spec builds (needs a
+`take()`-addressable filtered scan, which needs stable row ids or Lance's
+internal row-address API — see `threshold_search.py`'s module docstring) and
+the distributed fleet itself (aggregator, striping, coverage protocol).
 
 ## Risks
 
@@ -334,7 +381,7 @@ revisit only if the Day-1 gate or production margins demand.
 | Worker down => incomplete results | RF2 interactive; coverage protocol makes incompleteness explicit, never silent; batch retries |
 | Straggler blows the budget | striped shards equalize load; hedged retry to replica; per-worker deadline < budget |
 | Commodity-node scan slower than repo's 49GB/s | P0 measures the actual shape; N is the free variable |
-| Object-store take() latency (RAM-only nodes) | band ~1e-4 selectivity; Lance parallel take at 64-256 IO threads; NVMe variants make it ~ms |
+| Object-store take() latency (RAM-only nodes) | take() volume = ABOVE + BAND (the full result set, not just band ~1e-4 selectivity — see Node sizing); Lance parallel take at 64-256 IO threads; NVMe variants make it ~ms; size the node variant from the workload's expected result selectivity |
 | Post-compaction reshuffle churn | ~1 min/worker rehydration; compact off-peak; defer_index_remap |
 | Cross-cloud hop (app Cloud Run us-west1, workers OKE us-phoenix-1) | aggregator co-located on OKE; only cross-cloud call is app to aggregator (KB request / MB response); workers stay in-region to the corpus bucket |
 | eps band drift with future models | CI band-population check per corpus build |
