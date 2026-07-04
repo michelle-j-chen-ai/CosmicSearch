@@ -77,21 +77,28 @@ def test_embedding_i8_roundtrips_input() -> None:
         tmp_path = Path(tmp)
         artifact_dir = _write_synthetic_artifacts(tmp_path, n=300)
         input_i8 = np.load(artifact_dir / lance_writer.CORPUS_INT8_FILE)
-        input_starts = pq.read_table(artifact_dir / lance_writer.METADATA_FILE).column(
-            "chunk_start_unix"
-        ).to_numpy(zero_copy_only=False)
+        input_segment_ids = (
+            pq.read_table(artifact_dir / lance_writer.METADATA_FILE)
+            .column("segment_id")
+            .to_pylist()
+        )
+        # segment_id is generated as f"seg-{i}" (unique per row) by
+        # _write_synthetic_artifacts, so it is a reliable row identifier even
+        # when chunk_start_unix/vehicle sort keys collide across rows.
+        row_by_segment_id = {seg: i for i, seg in enumerate(input_segment_ids)}
+        assert len(row_by_segment_id) == len(input_segment_ids), "segment_id not unique"
 
         ds = lance_writer.build_dataset(artifact_dir, str(tmp_path / "out.lance"))
-        out_table = ds.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN, "chunk_start_unix"])
+        out_table = ds.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN, "segment_id"])
         out_i8 = np.stack(out_table.column(lance_writer.EMBEDDING_I8_COLUMN).to_pylist())
-        out_starts = out_table.column("chunk_start_unix").to_numpy(zero_copy_only=False)
+        out_segment_ids = out_table.column("segment_id").to_pylist()
 
-        # Match written rows back to input rows by chunk_start_unix + row content,
-        # since the writer physically reorders rows.
-        order = np.argsort(input_starts, kind="stable")
-        expected = input_i8[order]
+        # Match each written row back to its input row by segment_id, not by
+        # re-deriving the writer's sort order -- this stays correct regardless
+        # of ties in the (chunk_start_unix, vehicle) sort keys.
+        expected_order = [row_by_segment_id[seg] for seg in out_segment_ids]
+        expected = input_i8[expected_order]
         assert out_i8.shape == expected.shape, (out_i8.shape, expected.shape)
-        np.testing.assert_array_equal(out_starts, input_starts[order])
         np.testing.assert_array_equal(out_i8.astype(np.int8), expected)
 
 
@@ -120,16 +127,46 @@ def test_scalar_indices_exist() -> None:
         assert by_column[("vehicle",)] == "Bitmap", by_column
 
 
-def test_compact_files_is_noop_on_already_1m_row_fragments() -> None:
+def test_compact_files_merges_small_fragments_then_is_noop() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        # Small dataset -> a single fragment, already well under the 1M target,
-        # so compaction should not touch it.
         artifact_dir = _write_synthetic_artifacts(tmp_path, n=100)
-        ds = lance_writer.build_dataset(artifact_dir, str(tmp_path / "out.lance"))
+        out_uri = str(tmp_path / "out.lance")
+
+        # Write with a small max_rows_per_file so the 100 synthetic rows land
+        # in multiple small fragments -- build_dataset's own compact_files
+        # call would immediately merge these, so write directly via
+        # build_table + lance.write_dataset to observe the pre-compaction
+        # fragment layout.
+        table = lance_writer.build_table(artifact_dir)
+        lance.write_dataset(
+            table,
+            out_uri,
+            mode="create",
+            data_storage_version=lance_writer.DATA_STORAGE_VERSION,
+            max_rows_per_file=10,
+        )
+        ds = lance.dataset(out_uri)
+        fragments_before = len(ds.get_fragments())
+        assert fragments_before > 1, (
+            "expected multiple fragments before compaction, got "
+            f"{fragments_before}"
+        )
+
+        # Real compaction: fragments should actually merge toward one
+        # 1M-row-target fragment, not just report success trivially.
         metrics = ds.optimize.compact_files(target_rows_per_fragment=1_000_000)
-        assert metrics.fragments_removed == 0, metrics
-        assert metrics.files_added == 0, metrics
+        ds = lance.dataset(out_uri)
+        fragments_after = len(ds.get_fragments())
+        assert metrics.fragments_removed == fragments_before, metrics
+        assert fragments_after == 1, (fragments_after, metrics)
+        assert ds.count_rows() == 100, ds.count_rows()
+
+        # Now a second compaction call on the now-single, already-at-target
+        # fragment is a genuine no-op.
+        noop_metrics = ds.optimize.compact_files(target_rows_per_fragment=1_000_000)
+        assert noop_metrics.fragments_removed == 0, noop_metrics
+        assert noop_metrics.files_added == 0, noop_metrics
 
 
 def test_builder_runs_from_synthetic_artifacts_with_no_real_corpus() -> None:
