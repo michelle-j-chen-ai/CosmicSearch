@@ -353,6 +353,19 @@ def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
     if (local_dir / local_cache.NPY_MATRIX_FILE).exists():
         return _load_corpus_npy(local_dir, matrix_dtype)
     if embeddings_uri.rstrip("/").endswith(".lance"):
+        import lance
+
+        import lance_writer
+
+        ds = lance.dataset(str(local_dir))
+        if lance_writer.is_v21_dataset(ds):
+            # Exact-threshold Lance 2.1 layout (embedding_i8 + vector_fp) ->
+            # threshold_search's screen-then-rerank path, dispatched below via
+            # duck-typing (rank_top_k / score_corpus don't need to support
+            # this corpus type; threshold retrieval is a separate call path).
+            import threshold_search
+
+            return threshold_search.ThresholdCorpus(ds)
         return _load_corpus_lance_dataset(local_dir, matrix_dtype)
     return _load_corpus_lance(local_dir, embeddings_uri, matrix_dtype)
 

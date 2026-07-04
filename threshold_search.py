@@ -39,6 +39,30 @@ import gpu_corpus
 import lance_writer
 
 
+class ThresholdCorpus:
+    """Duck-type corpus wrapper around a Lance 2.1 exact-threshold dataset.
+
+    `search_engine.load_corpus` returns this for a dataset built by
+    `lance_writer.build_dataset` (detected via `lance_writer.is_v21_dataset`)
+    so callers doing threshold retrieval can call `.threshold_search(...)`
+    the same way a GPU-backed corpus exposes `.gpu_score`/`.gpu_argsort`.
+    Top-k ranking (`rank_top_k` / `score_corpus` in `search_engine.py`) is a
+    different workload that needs a resident matrix and is not implemented
+    here; this wrapper intentionally has no `.matrix` attribute.
+    """
+
+    def __init__(self, dataset: lance.LanceDataset) -> None:
+        self._dataset = dataset
+
+    @property
+    def num_rows(self) -> int:
+        return self._dataset.count_rows()
+
+    def threshold_search(self, query: np.ndarray, tau: float) -> list[ThresholdHit]:
+        """Every row with exact fp32 cosine score >= `tau`; see `threshold_search`."""
+        return threshold_search(query, tau, self._dataset)
+
+
 @dataclasses.dataclass(frozen=True)
 class ThresholdHit:
     """One row of a `threshold_search` result."""
