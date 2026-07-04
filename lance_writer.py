@@ -7,11 +7,22 @@ vector columns:
 
   embedding_i8  FSL<int8,256>    the resident screen column (gpu_corpus'
                                  `_score_i8` numba kernel scans this directly)
-  vector_fp     FSL<float32,256> exact re-rank column, take()-only
+  vector_fp     FSL<float32,256> re-rank column, take()-only
 
-`vector_fp` is the int8 dequantized back to fp32 (`int8 * scale / 127`) -- this
-builder does not re-fit SVD or have access to a pre-quantization fp32 corpus,
-it only converts the artifact that already exists.
+`vector_fp` is populated from an optional `pca_projection_fp32.npy` artifact
+file (the true PRE-quantization PCA-256 projection) when the artifact
+provides one. When it does not -- today's production reality, since the
+offline artifact pipeline currently emits only the quantized `corpus_int8.npy`
+-- `vector_fp` falls back to the int8 dequantized back to fp32
+(`int8 * scale / 127`). This fallback carries no information beyond
+`embedding_i8` + the schema-stored scale: dequant(int8) is a deterministic
+function of the int8 bytes already resident for screening, so the "re-rank"
+in this configuration only re-derives the screening score in float64 instead
+of the numba kernel's float32, and cannot correct for quantization error. The
+zero-false-negative guarantee `eps_bound.py` proves is against WHATEVER
+`vector_fp` holds; it is a guarantee against the true pre-quantization score
+only when a real `pca_projection_fp32.npy` is supplied. See `eps_bound.py`'s
+module docstring for the precise scope of what the bound covers.
 
 Both vector columns are >=128 bytes/value (256 * 4 = 1024B, 256 * 1 = 256B),
 so under `data_storage_version="2.1"` they get Lance's full-zip encoding,
@@ -41,6 +52,11 @@ PCA_FILE = "pca_components.npy"
 SCALE_FILE = "quant_scales.npy"
 CORPUS_INT8_FILE = "corpus_int8.npy"
 METADATA_FILE = "metadata.parquet"
+# Optional: the true pre-quantization PCA-256 projection (N, D) fp32. Not part
+# of today's production artifact contract; if a builder ever emits it under
+# this name, build_table stores it as vector_fp instead of falling back to
+# dequant(int8) -- see module docstring.
+PRE_QUANT_FP32_FILE = "pca_projection_fp32.npy"
 
 DATA_STORAGE_VERSION = "2.1"
 EMBEDDING_I8_COLUMN = "embedding_i8"
@@ -73,6 +89,17 @@ def decode_array(encoded: bytes) -> np.ndarray:
 def read_pca_metadata(ds: lance.LanceDataset) -> tuple[np.ndarray, np.ndarray]:
     """Return (pca_components, quant_scales) stored in `ds`'s schema metadata."""
     meta = ds.schema.metadata or {}
+    missing = [
+        k.decode()
+        for k in (META_KEY_PCA_COMPONENTS, META_KEY_QUANT_SCALES)
+        if k not in meta
+    ]
+    if missing:
+        raise ValueError(
+            f"dataset schema metadata is missing {missing} -- not a dataset "
+            f"written by lance_writer.build_dataset (or metadata was stripped "
+            f"by a downstream copy/compaction)"
+        )
     return (
         decode_array(meta[META_KEY_PCA_COMPONENTS]),
         decode_array(meta[META_KEY_QUANT_SCALES]),
@@ -113,10 +140,14 @@ def _read_metadata_table(metadata_path: Path, n_rows: int) -> pa.Table:
 
     return pa.table(
         {
-            "run_uuid": required("run_uuid"),
+            # Cast to a canonical string type so the written schema (and the
+            # BTREE index built on segment_id) does not vary with how the
+            # source parquet happened to encode the column (e.g.
+            # dictionary<string> vs plain string).
+            "run_uuid": required("run_uuid").cast(pa.string()),
             "chunk_start_unix": required("chunk_start_unix").cast(pa.int64()),
             "chunk_end_unix": optional("chunk_end_unix", pa.int64()).cast(pa.int64()),
-            "segment_id": required("segment_id"),
+            "segment_id": required("segment_id").cast(pa.string()),
             "vehicle": vehicle.cast(pa.string()),
         }
     )
@@ -127,6 +158,11 @@ def build_table(artifact_dir: Path) -> pa.Table:
 
     Does not write anything; separated from `build_dataset` so a caller (or a
     test) can inspect the pre-write table.
+
+    `vector_fp` is the true pre-quantization PCA-256 projection when
+    `artifact_dir` contains `PRE_QUANT_FP32_FILE`; otherwise it falls back to
+    the int8 dequantized back to fp32 -- see the module docstring for what
+    that fallback does and does not guarantee.
     """
     artifact_dir = Path(artifact_dir)
     pca = np.load(artifact_dir / PCA_FILE).astype("float32")  # (D, 768)
@@ -141,7 +177,18 @@ def build_table(artifact_dir: Path) -> pa.Table:
             f"quant_scales D={scale.shape[0]}"
         )
 
-    vector_fp = corpus_i8.astype("float32") * (scale / 127.0)  # (N, D) dequantized
+    pre_quant_path = artifact_dir / PRE_QUANT_FP32_FILE
+    if pre_quant_path.exists():
+        vector_fp = np.load(pre_quant_path).astype("float32")  # (N, D), true pre-quant
+        if vector_fp.shape != (n, d):
+            raise ValueError(
+                f"{PRE_QUANT_FP32_FILE} shape {vector_fp.shape} does not match "
+                f"corpus_int8 shape {(n, d)}"
+            )
+    else:
+        # Fallback: no independent fp32 source available, so vector_fp is a
+        # deterministic function of embedding_i8 + scale (see module docstring).
+        vector_fp = corpus_i8.astype(np.float32) * (scale / np.float32(127.0))
 
     scalars = _read_metadata_table(artifact_dir / METADATA_FILE, n)
 
@@ -171,7 +218,24 @@ def build_dataset(
     Writes, compacts to `target_rows_per_fragment`-row fragments, and creates
     the BTREE(chunk_start_unix) / BTREE(segment_id) / BITMAP(vehicle) scalar
     indices. Returns the resulting dataset handle.
+
+    Raises `FileExistsError` up front if `out_uri` already exists (this
+    builder only supports `mode="create"`; there is no append/overwrite path).
+    A dataset that already exists but is missing its scalar indices (e.g. from
+    a prior run that failed partway through compact_files/create_scalar_index)
+    must be deleted before retrying -- this builder does not repair in place.
     """
+    try:
+        lance.dataset(out_uri)
+    except ValueError:
+        pass  # does not exist yet, as expected for mode="create"
+    else:
+        raise FileExistsError(
+            f"{out_uri!r} already exists; build_dataset only writes fresh "
+            f"datasets (mode='create'). Delete it first if you intend to "
+            f"rebuild, or a prior build failed partway through and left an "
+            f"incomplete dataset (missing scalar indices) that needs cleanup."
+        )
     table = build_table(artifact_dir)
     lance.write_dataset(
         table,
@@ -189,10 +253,18 @@ def build_dataset(
 
 
 def is_v21_dataset(ds: lance.LanceDataset) -> bool:
-    """True if `ds` is an exact-threshold Lance 2.1 dataset (vs legacy .lance)."""
+    """True if `ds` is an exact-threshold Lance 2.1 dataset (vs legacy .lance).
+
+    Also requires the PCA schema metadata `read_pca_metadata` needs, so a
+    caller that gates on this before calling `read_pca_metadata` never hits
+    an unexpected missing-metadata error.
+    """
     names = set(ds.schema.names)
+    meta = ds.schema.metadata or {}
     return (
         ds.data_storage_version == DATA_STORAGE_VERSION
         and EMBEDDING_I8_COLUMN in names
         and VECTOR_FP_COLUMN in names
+        and META_KEY_PCA_COMPONENTS in meta
+        and META_KEY_QUANT_SCALES in meta
     )
