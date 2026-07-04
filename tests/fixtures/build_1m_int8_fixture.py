@@ -1,12 +1,28 @@
-"""One-off fixture-gen script: real ~1M-row embeddings -> gpu_corpus int8 artifact.
+"""One-time, offline fixture-generation tool: real ~1M-row embeddings -> a
+pre-built Lance 2.1 dataset for `tests/test_real_corpus_integration.py`.
 
-NOT part of the shipped production writer. `lance_writer.py` only ever converts
-an *existing* `gpu_corpus`-style int8 PCA artifact (pca_components.npy +
-quant_scales.npy + corpus_int8.npy + metadata.parquet) -- it deliberately never
-re-fits SVD. The real embeddings used by `tests/test_real_corpus_integration.py`
-are raw fp32 (no PCA/int8 applied yet), so this script performs that one-time
-conversion, offline, to produce the 3 artifacts `lance_writer.build_dataset`
-consumes. Keep this out of any shipped import path.
+This is NOT invoked by the test suite at runtime and is NOT part of the
+shipped production writer. `lance_writer.py` only ever converts an *existing*
+`gpu_corpus`-style int8 PCA artifact (pca_components.npy + quant_scales.npy +
+corpus_int8.npy + metadata.parquet) -- it deliberately never re-fits SVD.
+`tests/test_real_corpus_integration.py` only ever opens an already-built
+Lance 2.1 dataset (`lance.dataset(...)`) via the `NLS_REAL_CORPUS_LANCE_DIR`
+env var; it never calls into this script. Whoever needs to (re)generate that
+fixture -- e.g. because the source embeddings changed, or the fixture needs
+to be copied to a new environment -- runs this script by hand, once, followed
+by `lance_writer.build_dataset(...)` on its output, and stores the resulting
+`.lance` directory wherever `NLS_REAL_CORPUS_LANCE_DIR` will point.
+
+Regeneration procedure (run once, whenever the fixture needs rebuilding):
+    1. Download the raw embeddings (see below).
+    2. Run this script to produce the 3 int8-artifact files (uncentered SVD +
+       per-dim int8 quant) -- this is the one live SVD fit, done here, not in
+       the test.
+    3. Build the Lance 2.1 dataset from those artifacts:
+           python3 -c "import lance_writer; lance_writer.build_dataset(
+               '<artifact-dir>', '/path/to/nls_real_corpus.lance')"
+    4. Point `NLS_REAL_CORPUS_LANCE_DIR` at `/path/to/nls_real_corpus.lance`
+       when running `tests/test_real_corpus_integration.py`.
 
 Input data (download once, not committed):
     aws --profile oci.phx --region us-phoenix-1 \\

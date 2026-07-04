@@ -1,31 +1,31 @@
 """Zero-false-negative check against the real ~902,827-row NLS embeddings corpus.
 
 Opt-in / skipped by default: `python -m pytest tests/` does NOT run this file
-(it is skipped, not collected-and-failed) unless `NLS_INTEGRATION_TEST_DATA_DIR`
-is set. It needs a 2.77GB download and OCI object-storage credentials that are
-not available in a normal CI/dev checkout, and this repo's `tests/` suite must
-stay hermetic and fast.
+(it is skipped, not collected-and-failed) unless `NLS_REAL_CORPUS_LANCE_DIR`
+is set. This test loads an already-converted, already-built Lance 2.1 dataset
+directly -- it does NOT download raw embeddings and does NOT fit SVD at test
+time. Those one-time steps live in `tests/fixtures/build_1m_int8_fixture.py`
+(see that module's docstring for the regeneration procedure); this file only
+ever opens the pre-built dataset (`lance.dataset(...)`) and runs the same
+zero-false-negative oracle checks `threshold_search` is proven against
+everywhere else in this suite.
 
-Setup (once):
-    mkdir -p /path/to/nls_real_data
-    aws --profile oci.phx --region us-phoenix-1 \\
-        --endpoint-url https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com \\
-        s3 cp s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/embeddings/v3_lr_5e5-ckpt-6549_npy/embeddings.npy /path/to/nls_real_data/
-    aws --profile oci.phx --region us-phoenix-1 \\
-        --endpoint-url https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com \\
-        s3 cp s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/embeddings/v3_lr_5e5-ckpt-6549_npy/metadata.parquet /path/to/nls_real_data/
-
-`aws configure list --profile oci.phx` must show valid credentials (OCI's
-S3-compatible interop endpoint, not plain AWS S3 -- see
-`tests/fixtures/build_1m_int8_fixture.py`'s module docstring). Also needs
-`scikit-learn` installed (only for this opt-in test; not a default dependency).
+Fixture location: point `NLS_REAL_CORPUS_LANCE_DIR` at a pre-built Lance 2.1
+dataset directory -- the output of running `tests/fixtures/build_1m_int8_fixture.py`
+once against the real embeddings, then once through `lance_writer.build_dataset`
+(e.g. `~/nls_fixtures/nls_real_corpus.lance`). That directory is not committed
+to this repo: at ~1.2GB it is analogous to the raw source data living in OCI
+object storage rather than repo-tracked test data, so each environment that
+wants to run this opt-in test regenerates or copies it once and points the
+env var at it.
 
 Run:
-    NLS_INTEGRATION_TEST_DATA_DIR=/path/to/nls_real_data \\
+    NLS_REAL_CORPUS_LANCE_DIR=/path/to/nls_real_corpus.lance \\
         python -m pytest tests/test_real_corpus_integration.py -v -s
 
-Expected runtime: ~30-60s (SVD fit ~25-30s on a modern multi-core CPU, Lance
-dataset build ~5s, threshold_search itself sub-second per tau value).
+Expected runtime: a few seconds total -- dataset open plus a handful of
+`threshold_search` calls, each sub-second at this row count. No download, no
+SVD fit.
 """
 
 from __future__ import annotations
@@ -40,19 +40,17 @@ import numpy as np
 import pytest
 import threshold_search as ts
 
-from tests.fixtures.build_1m_int8_fixture import build_fixture
-
-_DATA_DIR_ENV = "NLS_INTEGRATION_TEST_DATA_DIR"
+_LANCE_DIR_ENV = "NLS_REAL_CORPUS_LANCE_DIR"
 _EXPECTED_ROW_COUNT = 902_827
 
 pytestmark = pytest.mark.integration
 
-_data_dir_str = os.environ.get(_DATA_DIR_ENV)
-_data_dir = Path(_data_dir_str) if _data_dir_str else None
+_lance_dir_str = os.environ.get(_LANCE_DIR_ENV)
+_lance_dir = Path(_lance_dir_str) if _lance_dir_str else None
 _skip_reason = (
-    f"set {_DATA_DIR_ENV} to a directory containing embeddings.npy + "
-    "metadata.parquet (see this file's module docstring for the download "
-    "command) to run this opt-in real-corpus integration test"
+    f"set {_LANCE_DIR_ENV} to a pre-built Lance 2.1 dataset directory (see "
+    "this file's module docstring, and tests/fixtures/build_1m_int8_fixture.py, "
+    "for how to regenerate it) to run this opt-in real-corpus integration test"
 )
 
 
@@ -74,28 +72,27 @@ def _brute_force_oracle_scores(ds: lance.LanceDataset, query: np.ndarray) -> np.
 
 
 @pytest.fixture(scope="module")
-def real_dataset(tmp_path_factory: pytest.TempPathFactory) -> lance.LanceDataset:
-    if _data_dir is None:
+def real_dataset() -> lance.LanceDataset:
+    if _lance_dir is None:
         pytest.skip(_skip_reason)
-    embeddings_npy = _data_dir / "embeddings.npy"
-    metadata_parquet = _data_dir / "metadata.parquet"
-    if not embeddings_npy.exists() or not metadata_parquet.exists():
+    if not _lance_dir.exists():
+        pytest.skip(f"{_LANCE_DIR_ENV}={_lance_dir} does not exist")
+
+    t0 = time.time()
+    ds = lance.dataset(str(_lance_dir))
+    print(f"\n[real-corpus] opened pre-built dataset: {time.time() - t0:.3f}s")
+
+    if not lance_writer.is_v21_dataset(ds):
         pytest.skip(
-            f"{_DATA_DIR_ENV}={_data_dir} is missing embeddings.npy and/or "
-            "metadata.parquet"
+            f"{_LANCE_DIR_ENV}={_lance_dir} is not a Lance 2.1 exact-threshold "
+            "dataset (missing data_storage_version=2.1 or the embedding_i8/"
+            "vector_fp columns) -- regenerate it via "
+            "tests/fixtures/build_1m_int8_fixture.py + lance_writer.build_dataset"
         )
-
-    work_dir = tmp_path_factory.mktemp("nls_real_corpus")
-    artifact_dir = work_dir / "artifact"
-    t0 = time.time()
-    build_fixture(embeddings_npy, metadata_parquet, artifact_dir)
-    print(f"\n[real-corpus] fixture-gen (SVD + int8 quant): {time.time() - t0:.1f}s")
-
-    t0 = time.time()
-    ds = lance_writer.build_dataset(artifact_dir, str(work_dir / "corpus.lance"))
-    print(f"[real-corpus] lance_writer.build_dataset: {time.time() - t0:.1f}s")
-
-    assert ds.count_rows() == _EXPECTED_ROW_COUNT
+    assert ds.count_rows() == _EXPECTED_ROW_COUNT, (
+        f"{_LANCE_DIR_ENV}={_lance_dir} has {ds.count_rows()} rows, expected "
+        f"{_EXPECTED_ROW_COUNT} -- wrong or stale fixture"
+    )
     return ds
 
 
