@@ -28,6 +28,17 @@ just query-dependent rather than reusable across queries.
 
 This module is pure numpy: no Lance/dataset dependency, so it is testable in
 isolation from the corpus storage layer.
+
+Scope of the guarantee: the math above bounds |q . e| where `e` is the
+per-row int8 quantization error against WHATEVER fp32 value the caller
+re-ranks against. The guarantee is against the true pre-quantization score
+only if that fp32 value genuinely is the pre-quantization projection.
+`lance_writer.py`'s current artifact contract does not always have one --
+see its module docstring -- in which case its `vector_fp` falls back to
+`dequant(int8)`, and re-ranking against it only re-derives the int8 screening
+score in higher precision; the zero-false-negative property this module
+proves still holds (against `vector_fp`), but it is a materially weaker
+guarantee than "against the true fp32-256 embedding" in that configuration.
 """
 
 from __future__ import annotations

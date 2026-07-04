@@ -1,4 +1,4 @@
-"""Zero-false-negative check against a real ~50,000-row NLS embeddings sample.
+"""Self-consistency check against a real ~50,000-row NLS embeddings sample.
 
 Runs by default as part of `python -m pytest tests/`.  The fixture
 (`tests/fixtures/nls_real_corpus_sample.lance/`) is a Lance 2.1 dataset
@@ -6,6 +6,16 @@ committed directly to this repo -- a 50,000-row random sample (fixed seed 42,
 numpy.random.default_rng) drawn from the full ~902,827-row real NLS corpus.
 It carries the same column layout and PCA / quant-scale metadata as the full
 dataset, so `threshold_search` exercises the identical code path.
+
+Scope: this fixture has no `pca_projection_fp32.npy`, so its `vector_fp` is
+the int8 dequantized back to fp32 (see `lance_writer.py`'s module docstring),
+NOT an independent pre-quantization reference. This test therefore proves
+threshold_search's screen/take/re-rank plumbing is self-consistent on a real
+score distribution at realistic scale -- it does NOT prove zero false
+negatives against the true pre-quantization score (an eps bound too small for
+real int8 quantization error would still pass this test). For that property,
+see `test_threshold_search.py::test_zero_false_negatives_against_true_pre_quantization_score`,
+which supplies a genuine independent fp32 reference.
 
 The sample is small enough (~65 MB) to commit and fast enough (~sub-second per
 `threshold_search` call) to run in the default suite without a CI budget concern.
@@ -40,9 +50,11 @@ def _query(seed: int) -> np.ndarray:
 
 
 def _brute_force_oracle_scores(ds: lance.LanceDataset, query: np.ndarray) -> np.ndarray:
-    """Exact fp32 cosine score for every row (reads the whole vector_fp column
-    once, deliberately -- this is the independent reference, not the fast
-    path under test)."""
+    """vector_fp-based reference score for every row (reads the whole
+    vector_fp column once, deliberately -- this is the slow, independently
+    re-derived path, not the fast path under test). On this fixture vector_fp
+    is dequant(int8) (see module docstring), so this reference is NOT
+    independent of the int8 corpus threshold_search screens."""
     pca, _scale = lance_writer.read_pca_metadata(ds)
     query_pca = ts._project_query(query, pca).astype(np.float64)
     table = ds.to_table(columns=[lance_writer.VECTOR_FP_COLUMN])
@@ -67,10 +79,12 @@ def real_dataset() -> lance.LanceDataset:
 
 
 def test_zero_false_negatives_real_corpus(real_dataset: lance.LanceDataset) -> None:
-    """threshold_search finds every row with exact score >= tau across several
-    tau values on the real 50,000-row corpus sample -- an oracle property test.
-    Band selectivity and timing are reported informally; they are not gated
-    (real data, unknown distribution)."""
+    """threshold_search finds every row with re-rank score >= tau across
+    several tau values on the real 50,000-row corpus sample -- a
+    self-consistency check on a real score distribution (see module
+    docstring for why this is not an independent-oracle test). Band
+    selectivity and timing are reported informally; they are not gated (real
+    data, unknown distribution)."""
     query = _query(seed=42)
     scores = _brute_force_oracle_scores(real_dataset, query)
 
