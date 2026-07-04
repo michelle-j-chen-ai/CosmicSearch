@@ -1,16 +1,21 @@
-"""End-to-end check for search_engine.load_corpus's Lance 2.1 dispatch.
+"""End-to-end check for search_engine's Lance 2.1 dispatch.
 
 Builds a real Lance 2.1 exact-threshold dataset (via lance_writer.build_dataset,
 same synthetic-artifact fixture as test_threshold_search.py), points
-search_engine.load_corpus at it by monkeypatching local_cache.ensure_corpus_local
-(no network / no S3 / no model download), and checks:
+search_engine at it by monkeypatching local_cache.ensure_corpus_local (no
+network / no S3 / no model download), and checks:
 
-  1. A real 2.1 dataset dispatches to threshold_search.ThresholdCorpus, and its
-     .threshold_search(...) matches a brute-force fp32 oracle exactly.
-  2. A legacy (non-2.1) `.lance` dataset does NOT false-dispatch to
-     ThresholdCorpus -- it still goes through the existing
-     _load_corpus_lance_dataset path and returns a plain Corpus.
-  3. The npy path (_load_corpus_npy -> rank_top_k) is unaffected by this
+  1. load_threshold_corpus opens a real 2.1 dataset as a ThresholdCorpus, and
+     its .threshold_search(...) matches a brute-force fp32 oracle exactly.
+  2. load_corpus -- the shared entry point web_server.py/app.py use, whose
+     callers assume a full Corpus (rank_top_k/score_corpus/.matrix/.time_span)
+     -- raises a clear error for a v2.1 dataset instead of silently returning
+     a ThresholdCorpus those callers cannot use (see search_engine.py's
+     load_corpus docstring for why they are split).
+  3. A legacy (non-2.1) `.lance` dataset does NOT false-trigger that error --
+     it still goes through the existing _load_corpus_lance_dataset path and
+     returns a plain Corpus.
+  4. The npy path (_load_corpus_npy -> rank_top_k) is unaffected by this
      change -- no behavior regression on the existing top-k path.
 
 Run from the repo root:
@@ -98,7 +103,7 @@ def _patch_ensure_corpus_local(local_dir: Path):
     return _Restorer()
 
 
-def test_load_corpus_dispatches_v21_dataset_to_threshold_corpus() -> None:
+def test_load_threshold_corpus_opens_v21_dataset() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         artifact_dir = _write_synthetic_artifacts(tmp_path, n=5_000, seed=0)
@@ -107,13 +112,12 @@ def test_load_corpus_dispatches_v21_dataset_to_threshold_corpus() -> None:
 
         restorer = _patch_ensure_corpus_local(out_dir)
         try:
-            corpus = search_engine.load_corpus("s3://bucket/corpus.lance", "float16")
+            corpus = search_engine.load_threshold_corpus("s3://bucket/corpus.lance")
         finally:
             restorer.restore()
 
         assert isinstance(corpus, ts.ThresholdCorpus), (
-            f"expected ThresholdCorpus dispatch for a real 2.1 dataset, got "
-            f"{type(corpus)!r}"
+            f"expected a ThresholdCorpus for a real 2.1 dataset, got {type(corpus)!r}"
         )
 
         ds = lance.dataset(str(out_dir))
@@ -137,9 +141,31 @@ def test_load_corpus_dispatches_v21_dataset_to_threshold_corpus() -> None:
         )
         for h in hits:
             assert h.score >= tau
+            assert h.segment_id, "ThresholdHit should carry resolvable metadata"
 
 
-def test_load_corpus_does_not_false_dispatch_on_legacy_lance_dataset() -> None:
+def test_load_corpus_raises_on_v21_dataset() -> None:
+    """load_corpus (the shared Corpus-returning entrypoint) must refuse a v2.1
+    exact-threshold dataset with a clear error rather than silently handing
+    web_server.py/app.py an object that breaks on their first .matrix/
+    .time_span()/score_corpus() call."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        artifact_dir = _write_synthetic_artifacts(tmp_path, n=500, seed=1)
+        out_dir = tmp_path / "corpus.lance"
+        lance_writer.build_dataset(artifact_dir, str(out_dir))
+
+        restorer = _patch_ensure_corpus_local(out_dir)
+        try:
+            import pytest
+
+            with pytest.raises(ValueError, match="load_threshold_corpus"):
+                search_engine.load_corpus("s3://bucket/corpus.lance", "float16")
+        finally:
+            restorer.restore()
+
+
+def test_load_corpus_does_not_false_trigger_on_legacy_lance_dataset() -> None:
     """A plain (pre-2.1) `.lance` dataset must still use _load_corpus_lance_dataset."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)

@@ -342,6 +342,13 @@ def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
     (_load_corpus_npy); otherwise the Lance `rank=NNNNN/` shards are read and
     converted (_load_corpus_lance). The download is cached and lock-guarded, so
     repeat users of the same URI never re-pay the transfer.
+
+    Always returns a `Corpus`-compatible object (resident matrix or
+    `gpu_score`/`.matrix`), which `rank_top_k`/`score_corpus` and every
+    existing caller (web_server.py, app.py) depend on. A Lance 2.1
+    exact-threshold dataset (embedding_i8 + vector_fp) has no resident 768-d
+    matrix and cannot satisfy that contract -- use `load_threshold_corpus` for
+    those instead of routing them through here.
     """
     local_dir = local_cache.ensure_corpus_local(embeddings_uri, oci_s3.s3_client())
     import gpu_corpus
@@ -359,15 +366,36 @@ def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
 
         ds = lance.dataset(str(local_dir))
         if lance_writer.is_v21_dataset(ds):
-            # Exact-threshold Lance 2.1 layout (embedding_i8 + vector_fp) ->
-            # threshold_search's screen-then-rerank path, dispatched below via
-            # duck-typing (rank_top_k / score_corpus don't need to support
-            # this corpus type; threshold retrieval is a separate call path).
-            import threshold_search
-
-            return threshold_search.ThresholdCorpus(ds)
+            raise ValueError(
+                f"{embeddings_uri!r} is a Lance 2.1 exact-threshold dataset "
+                "(embedding_i8 + vector_fp columns); it has no resident matrix "
+                "for rank_top_k/score_corpus. Use "
+                "search_engine.load_threshold_corpus() for threshold retrieval "
+                "against this dataset instead of load_corpus()."
+            )
         return _load_corpus_lance_dataset(local_dir, matrix_dtype)
     return _load_corpus_lance(local_dir, embeddings_uri, matrix_dtype)
+
+
+def load_threshold_corpus(embeddings_uri: str) -> "threshold_search.ThresholdCorpus":
+    """Download (if needed) and open `embeddings_uri` for threshold retrieval.
+
+    Separate from `load_corpus`: a Lance 2.1 exact-threshold dataset has no
+    resident 768-d matrix, so it cannot satisfy the `Corpus` contract
+    `rank_top_k`/`score_corpus` need (see `load_corpus`'s docstring). Callers
+    doing threshold retrieval (all rows with score >= tau) use this entry
+    point explicitly instead.
+    """
+    local_dir = local_cache.ensure_corpus_local(embeddings_uri, oci_s3.s3_client())
+    import lance
+
+    import lance_writer
+    import threshold_search
+
+    ds = lance.dataset(str(local_dir))
+    if not lance_writer.is_v21_dataset(ds):
+        raise ValueError(f"{embeddings_uri!r} is not a Lance 2.1 exact-threshold dataset")
+    return threshold_search.ThresholdCorpus(ds)
 
 
 def _internal_ids_from_arrow(arrow_table: object) -> list[int] | None:
