@@ -198,3 +198,46 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 - **Encoder throughput**: a single CPU encode is ~40ms, so one warm instance
   handles ~25 queries/s/core. Raise `max_instances` for more concurrent users;
   the model is stateless across requests.
+
+## Exact threshold-search PoC benchmark
+
+`bench_threshold_search.py` is a standalone harness that proves the exact
+cosine-threshold primitive (`threshold_search` over a Lance 2.1 dataset) meets
+its goal on a real sample corpus: **return every row with cosine >= tau (zero
+false negatives), in a measured time**. It needs no model/torch and no pytest;
+run it in any container/VM that has the OCI S3-compat credentials `oci_s3`
+reads from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_ENDPOINT_URL_S3`, `AWS_REGION`). The `build` step also needs
+`scikit-learn` (`pip install scikit-learn`; deliberately not a default
+dependency, so the app image stays light).
+
+Stage a sample dataset from the fp32 corpus on S3, then benchmark it:
+
+```bash
+# 1) fp32 embeddings.npy on S3 -> sampled, SVD 768->256 + int8 quant ->
+#    v2.1 .lance (with a genuine fp32 re-rank column) -> uploaded to S3
+python bench_threshold_search.py build \
+    --embeddings-uri s3://bucket/prefix/embeddings.npy \
+    --sample-rows 1000000 \
+    --out-uri s3://bucket/prefix/nls_sample.lance
+
+# 2) open it (lance reads fragments straight from S3), time it, prove zero-FN
+python bench_threshold_search.py bench \
+    --dataset-uri s3://bucket/prefix/nls_sample.lance \
+    --repeats 10 --json result.json
+```
+
+`bench` reports **cold hydration** (resident int8 loaded once, as a pod would),
+**warm per-query** latency (min/p50/p95 — the number the <10s goal is about),
+int8 screen GB/s, match/band counts, and an **exactness verdict**: it scores
+every row against the dataset's fp32 re-rank column as an independent oracle
+and asserts `threshold_search` drops none of the rows with score >= tau. The
+process **exits non-zero if any false negative is found**, so a cloud trigger
+can gate on it directly. Because the sampled dataset stores the SVD's true
+pre-quantization projection as `vector_fp` (not a dequantized-int8 copy), the
+oracle is genuinely independent of the int8 screen, so the check actually
+exercises the eps quantization bound rather than a tautology.
+
+`all` runs both halves in one process against the just-built local dataset
+(skips the S3 round-trip for the bench half); `bench --dataset-local <path>`
+benchmarks an already-downloaded dataset.
