@@ -90,6 +90,7 @@ function showCurateView() {
   if (state.offlineScan !== false) loadScanJobs();
   // Dock the shared filter controls inline so the scan's scope is visible + editable in place.
   dockFiltersInline();
+  renderExportPanel();
 }
 
 async function showHistoryView() {
@@ -288,17 +289,38 @@ function wireEvents() {
   $("threshold-btn").addEventListener("click", () => loadThresholdSearch());
   $("save-vec-btn").addEventListener("click", saveVector);
   $("search-export-btn").addEventListener("click", exportSearchCsv);
-  // Export view: history picker + Download CSV (resident corpus) + launch offline scan.
-  $("curate-csv-btn").addEventListener("click", downloadCsv);
-  $("curate-scan-btn").addEventListener("click", launchCurateScan);
+  // Saved-searches page: history picker + a SINGLE Export action that adapts to the
+  // deployment (instant CSV over the resident corpus, or an offline per-segment scan).
+  $("export-btn").addEventListener("click", doExport);
   $("export-hist-reload").addEventListener("click", loadExportHistory);
-  $("export-hist-all").addEventListener("click", () => exportHistSelectAll(true));
-  $("export-hist-none").addEventListener("click", () => exportHistSelectAll(false));
+  $("export-hist-all").addEventListener("click", () => { exportHistSelectAll(true); renderExportPanel(); });
+  $("export-hist-none").addEventListener("click", () => { exportHistSelectAll(false); renderExportPanel(); });
   $("export-hist-filter").addEventListener("input", filterExportHistory);
-  // Per-tag "open ↗": reload that tag's saved search into the Search view to iterate.
+  // Per-tag "resume ↗" + selection-count refresh when a row is ticked.
   $("export-history").addEventListener("click", (e) => {
     const b = e.target.closest("button.exp-resume");
     if (b && b.dataset.id) resumeSession(b.dataset.id);
+  });
+  $("export-history").addEventListener("change", (e) => {
+    if (e.target.classList && e.target.classList.contains("exp-pick")) renderExportPanel();
+  });
+
+  // ⚙ corpus/model settings popover.
+  $("settings-gear").addEventListener("click", toggleSettings);
+  // Guided-rail Step 3 -> Save drawer; overlay / × close it.
+  $("save-open-btn").addEventListener("click", openSaveDrawer);
+  $("drawer-close").addEventListener("click", closeSaveDrawer);
+  $("drawer-overlay").addEventListener("click", closeSaveDrawer);
+  // Single-export panel: cutoff (τ / top-k) + sample (interval / segment) selectors.
+  $("cutoff-seg").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-mode]"); if (b) setCutoffMode(b.dataset.mode);
+  });
+  $("sample-seg").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-mode]"); if (b) setSampleMode(b.dataset.mode);
+  });
+  // Keep the (hidden) scan register flag in sync with the single visible toggle.
+  $("curate-csv-segset").addEventListener("change", () => {
+    $("curate-scan-segset").checked = $("curate-csv-segset").checked;
   });
   $("scan-jobs-reload").addEventListener("click", loadScanJobs);
   $("load-corpus").addEventListener("click", loadCorpus);
@@ -1075,6 +1097,12 @@ function updateMarkCount() {
       ? `auto-refining from ${up} 👍 / ${down} 👎`
       : (down ? `${down} 👎 marked (mark a 👍 to re-rank)` : "");
   }
+  // Rail Step 1 summary + progress bars (target ~3 of each for a reliable sweep).
+  const sum = $("rail-refine-summary");
+  if (sum) sum.textContent = `${up} 👍 · ${down} 👎`;
+  const ub = $("rail-up-bar"); if (ub) ub.style.width = Math.min(up / 3 * 100, 100) + "%";
+  const db = $("rail-down-bar"); if (db) db.style.width = Math.min(down / 3 * 100, 100) + "%";
+  const rn = $("step-refine-num"); if (rn) rn.classList.toggle("done", up > 0 || down > 0);
 }
 
 function clearMarks() {
@@ -1174,7 +1202,12 @@ async function saveVector() {
     });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
     const { dim } = await r.json();
-    scanNote(noteId, `saved <strong>${escapeHtml(tag)}</strong> (${dim}-d) ✓ — pick it on the Export tab`);
+    scanNote(noteId, `saved <strong>${escapeHtml(tag)}</strong> (${dim}-d) ✓`);
+    // Drawer flow: land on Saved searches with this tag ready to export.
+    closeSaveDrawer();
+    showToast(`Saved "${tag}" — configure export below`);
+    showCurateView();
+    loadExportHistory();
   } catch (e) {
     scanNote(noteId, "Save failed: " + escapeHtml(e.message), true);
   } finally {
@@ -1195,7 +1228,7 @@ async function launchCurateScan() {
   const defThr = parseFloat($("curate-threshold").value) || 0.3;
   const thresholds = {};
   set.forEach((x) => { thresholds[x.query] = x.threshold > 0 ? x.threshold : defThr; });
-  const btn = $("curate-scan-btn");
+  const btn = $("export-btn");
   btn.disabled = true;
   scanNote(noteId, `Launching per-segment scan over ${tags.length} tag(s)…`);
   try {
@@ -1469,6 +1502,7 @@ async function loadThresholdSearch() {
       body: JSON.stringify(body),
     }).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
     showThreshold(data);
+    updateRailThresh(data.threshold != null ? data.threshold : data.suggested_threshold);
     $("threshold-view").scrollIntoView({ behavior: "smooth", block: "start" });
     const tn = data.threshold != null ? ` · τ ${data.threshold.toFixed(3)}` : "";
     previewNote(`threshold search — ${data.num_up} 👍 / ${data.num_down} 👎${tn} — scrolled below ↓`);
@@ -1743,8 +1777,7 @@ function buildThreshold(data) {
   return wrap;
 }
 
-// ---------- curate from config (preview → select → export) ----------
-const CURATE_CAP = 60; // cards rendered in the selection grid before "show all"
+// ---------- export config helpers (assemble tags -> CSV / scan) ----------
 
 // Parse a `query, k, threshold` textarea. Trailing comma-separated numbers are read
 // right-to-left: a float in (0,1] is the per-tag threshold, an integer is k. Both are
@@ -1857,6 +1890,9 @@ function renderExportHistory() {
       <thead><tr><th></th><th>tag</th><th>query</th><th>corpus model · vec</th><th>filters</th><th>k</th><th>thresh</th><th></th></tr></thead>
       <tbody>${body}</tbody></table>`;
   filterExportHistory();
+  const cnt = $("saved-count");
+  if (cnt) cnt.textContent = rows.length ? `(${rows.length})` : "";
+  renderExportPanel();
 }
 
 // Show only rows whose query or tag matches the filter box (case-insensitive substring).
@@ -1999,45 +2035,6 @@ function scheduleScanJobsPoll() {
   _scanPollTimer = setTimeout(tick, 20000);
 }
 
-async function loadCuratePreview() {
-  const queries = collectExportQueries();
-  if (!queries.length) { curateNote("Tick at least one saved search (or add an ad-hoc line).", true); return; }
-  if (!state.embeddingsUri) { curateNote("Load a corpus first.", true); return; }
-  curateNote(`Running ${queries.length} queries…`);
-  $("curate-load").disabled = true;
-  try {
-    const body = {
-      queries,
-      from_date: $("from-date").value || null,
-      to_date: $("to-date").value || null,
-      segment_set_uuid: state.segUuid,
-      segment_set_name: state.segName,
-      filter_lance_uri: state.filterLanceUri || null,
-      vehicle: _vehicleValue(),
-      embeddings_uri: state.embeddingsUri,
-    };
-    const resp = await fetch("/api/curate_preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      let d; try { d = (await resp.json()).detail; } catch (_e) { /* non-JSON */ }
-      throw new Error(d || ("preview " + resp.status));
-    }
-    const data = await resp.json();
-    state.curate = { perQuery: data.per_query || [], selected: new Set(), rows: [], showAll: false };
-    const total = state.curate.perQuery.reduce((s, g) => s + g.num_hits, 0);
-    curateNote(`Loaded ${state.curate.perQuery.length} queries · ${fmtInt(total)} matches. Select what to keep, then Export.`);
-    $("curate-toolbar").classList.remove("hidden");
-    renderCurate(true);
-  } catch (e) {
-    curateNote("Preview failed: " + e.message, true);
-  } finally {
-    $("curate-load").disabled = false;
-  }
-}
-
 // Direct local export: each assembled tag's top-k from the LOADED (resident) corpus,
 // concatenated into one CSV (+ parquet to S3). No preview/selection needed -- this is
 // the "download CSV" for the small corpus. (The toolbar's "Download selected" exports a
@@ -2046,9 +2043,13 @@ async function downloadCsv() {
   const set = collectExportQueries();
   if (!set.length) { curateNote("Tick at least one saved search (or add an ad-hoc line).", true); return; }
   if (!state.embeddingsUri) { curateNote("Load a corpus first.", true); return; }
-  const queries = set.map((x) => ({ query: x.query, k: x.k, threshold: x.threshold || 0 }));
+  // Cutoff selector: Top-K forces pure top-k (threshold 0); Threshold keeps each row's τ.
+  const queries = set.map((x) => ({
+    query: x.query, k: x.k,
+    threshold: _cutoffMode === "topk" ? 0 : (x.threshold || 0),
+  }));
   curateNote(`Exporting ${queries.length} tag(s) from the loaded corpus…`);
-  $("curate-csv-btn").disabled = true;
+  $("export-btn").disabled = true;
   try {
     const resp = await fetch("/api/export_config", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -2082,184 +2083,121 @@ async function downloadCsv() {
   } catch (e) {
     curateNote("Download failed: " + e.message, true);
   } finally {
-    $("curate-csv-btn").disabled = false;
+    $("export-btn").disabled = false;
   }
 }
 
-// Compute the rows to display from the per-query preview, honoring the inline
-// dedupe toggle. Dedupe collapses a chunk that surfaced in multiple queries to its
-// highest-scoring occurrence (recording every query it matched). Each row carries a
-// stable `key` for the selection set.
-function curateDisplayRows(dedupe) {
-  const pq = (state.curate && state.curate.perQuery) || [];
-  if (dedupe) {
-    const byChunk = new Map();
-    for (const g of pq) {
-      for (const h of g.hits) {
-        const e = byChunk.get(h.chunk_id);
-        if (!e) byChunk.set(h.chunk_id, { h, query: g.query, matched: new Set([g.query]) });
-        else { e.matched.add(g.query); if (h.score > e.h.score) { e.h = h; e.query = g.query; } }
-      }
-    }
-    return [...byChunk.values()]
-      .sort((a, b) => b.h.score - a.h.score)
-      .map((e) => ({ h: e.h, query: e.query, matched: [...e.matched], key: e.h.chunk_id }));
-  }
-  const rows = [];
-  for (const g of pq) {
-    for (const h of g.hits) {
-      rows.push({ h, query: g.query, matched: [g.query], key: g.query + "\u0000" + h.chunk_id });
-    }
-  }
-  return rows.sort((a, b) => b.h.score - a.h.score);
+// ---------- new shell: settings gear, save drawer, single-export panel ----------
+
+// ⚙ corpus/model settings popover (relocated header controls).
+function toggleSettings() {
+  const pop = $("settings-pop");
+  const open = pop.classList.toggle("hidden") === false;
+  $("settings-gear").setAttribute("aria-expanded", String(open));
 }
 
-function renderCurate(resetSelection) {
-  const dedupe = $("curate-dedupe").checked;
-  const rows = curateDisplayRows(dedupe);
-  state.curate.rows = rows;
-  if (resetSelection) state.curate.selected = new Set(rows.map((r) => r.key));
+// Save drawer (guided-rail Step 3). Reuses the save-vec-* inputs + saveVector().
+function openSaveDrawer() {
+  if (!state.query) { setStatus("Run a search or refine first to define a vector.", true); return; }
+  const vals = Object.values(state.marks);
+  const up = vals.filter((m) => m.mark === "up").length;
+  const down = vals.filter((m) => m.mark === "down").length;
+  const modeLbl = state.mode === "refine" ? "refined" : (state.mode === "resume" ? "resumed" : "text");
+  $("save-vec-summary").innerHTML =
+    `query <b>${escapeHtml(state.query)}</b><br>vector <b>${modeLbl}</b> · votes <b>${up} 👍 / ${down} 👎</b>`;
+  if (!($("save-vec-tag").value || "").trim()) $("save-vec-tag").value = _querySlug(state.query);
+  $("drawer-overlay").classList.add("open");
+  $("save-drawer").classList.add("open");
+}
+function closeSaveDrawer() {
+  $("drawer-overlay").classList.remove("open");
+  $("save-drawer").classList.remove("open");
+}
 
-  const wrap = $("curate-results");
-  wrap.innerHTML = "";
+// Reflect the fitted/suggested τ in the rail's Threshold step.
+function updateRailThresh(tau) {
+  const el = $("rail-thresh-val");
+  if (el) el.textContent = (tau == null) ? "—" : `τ ${Number(tau).toFixed(3)}`;
+  const num = $("step-thresh-num");
+  if (num) num.classList.toggle("done", tau != null);
+}
 
-  // --- Selection grid (the export set): selectable cards, capped with "show all". ---
-  const selHead = document.createElement("div");
-  selHead.className = "curate-section-head";
-  selHead.textContent = "Selection (what will be exported)";
-  wrap.appendChild(selHead);
+// ---------- single-export panel (Saved searches page) ----------
+// Cutoff = Top-K sends each row's k (pure top-k); Cutoff = Threshold sends each row's
+// cosine threshold (kept >= tau, capped at k) — the real /api/export_config semantics,
+// no fictional conversion.
+let _cutoffMode = "threshold";
+// Interval (merge contiguous above-threshold clips) vs Segment (one best clip per
+// segment). Offline-scan deployments only (merge_intervals lives on the scan path).
+let _sampleMode = "interval";
 
-  const grid = document.createElement("div");
-  grid.className = "grid curate-grid";
-  const shown = state.curate.showAll ? rows : rows.slice(0, CURATE_CAP);
-  shown.forEach((r) => grid.appendChild(curateCard(r, dedupe)));
-  wrap.appendChild(grid);
+function setCutoffMode(mode) {
+  _cutoffMode = mode === "topk" ? "topk" : "threshold";
+  renderExportPanel();
+}
+function setSampleMode(mode) {
+  _sampleMode = mode === "segment" ? "segment" : "interval";
+  // The scan reads merge_intervals from this checkbox.
+  const m = $("curate-scan-merge");
+  if (m) m.checked = _sampleMode === "interval";
+  renderExportPanel();
+}
 
-  if (!state.curate.showAll && rows.length > CURATE_CAP) {
-    const more = document.createElement("button");
-    more.className = "ghost curate-more";
-    more.textContent = `Show all ${fmtInt(rows.length)} cards`;
-    more.onclick = () => { state.curate.showAll = true; renderCurate(false); };
-    wrap.appendChild(more);
+function _selectedTagCount() {
+  return $("export-history").querySelectorAll("tbody tr .exp-pick:checked").length;
+}
+
+function renderExportPanel() {
+  const offline = state.offlineScan !== false;
+  const badge = $("mech-badge");
+  if (badge) {
+    badge.textContent = offline ? "async" : "instant";
+    badge.className = "mech-badge " + (offline ? "async" : "instant");
   }
+  // Active states on the segmented selectors.
+  $("cutoff-seg").querySelectorAll("button[data-mode]").forEach((b) =>
+    b.classList.toggle("active", b.dataset.mode === _cutoffMode));
+  $("sample-seg").querySelectorAll("button[data-mode]").forEach((b) =>
+    b.classList.toggle("active", b.dataset.mode === _sampleMode));
+  const cd = $("cutoff-desc");
+  if (cd) cd.textContent = _cutoffMode === "topk"
+    ? "Each tag exports its top-K clips (pure ranking; ignores threshold)."
+    : "Each tag keeps clips at or above its saved cosine threshold τ (capped at k).";
+  const sd = $("sample-desc");
+  if (sd) sd.textContent = _sampleMode === "segment"
+    ? "One best (highest-scoring) clip per segment — no interval merge."
+    : "Merge contiguous above-threshold clips per segment into time intervals.";
 
-  // --- Per-query groups (which segments matched which query): compact, collapsed. ---
-  const byHead = document.createElement("div");
-  byHead.className = "curate-section-head";
-  byHead.textContent = "Matches by query";
-  wrap.appendChild(byHead);
-  for (const g of state.curate.perQuery) {
-    const det = document.createElement("details");
-    det.className = "curate-group";
-    const rowsHtml = g.hits
-      .map((h) => `<li><span class="score">${h.score.toFixed(3)}</span>
-        <span class="seg">${escapeHtml(h.segment_id || h.chunk_id)}</span>
-        <a href="/api/video?uri=${encodeURIComponent(h.source_media_uri)}" target="_blank" rel="noopener">play</a></li>`)
-      .join("");
-    det.innerHTML = `<summary>${escapeHtml(g.query)} <span class="muted">· ${fmtInt(g.num_hits)} matches</span></summary>
-      <ul class="curate-group-list">${rowsHtml}</ul>`;
-    wrap.appendChild(det);
+  const n = _selectedTagCount();
+  const note = $("selection-note");
+  if (note) {
+    note.classList.toggle("empty", n === 0);
+    note.textContent = n === 0
+      ? "No searches selected — tick one or more rows above to export."
+      : `Exporting ${n} search${n === 1 ? "" : "es"}.`;
   }
-
-  curateUpdateCounts();
-}
-
-function curateCard(r, dedupe) {
-  const h = r.h;
-  const checked = state.curate.selected.has(r.key);
-  const badge = dedupe && r.matched.length > 1
-    ? `${r.query}  +${r.matched.length - 1}`
-    : r.query;
-  const card = buildHitCard(h, {
-    cardClass: "curate-card" + (checked ? "" : " unpicked"),
-    badge,
-    controls: `<label class="curate-keep"><input type="checkbox" ${checked ? "checked" : ""}/> keep</label>`,
-  });
-  const cb = card.querySelector(".curate-keep input");
-  cb.onchange = () => {
-    if (cb.checked) state.curate.selected.add(r.key);
-    else state.curate.selected.delete(r.key);
-    card.classList.toggle("unpicked", !cb.checked);
-    curateUpdateCounts();
-  };
-  return card;
-}
-
-function curateUpdateCounts() {
-  const rows = (state.curate && state.curate.rows) || [];
-  const sel = state.curate.selected;
-  const kept = rows.filter((r) => sel.has(r.key));
-  const segs = new Set(kept.map((r) => r.h.segment_id).filter(Boolean));
-  $("curate-counts").textContent =
-    `${fmtInt(rows.length)} matches · ${fmtInt(kept.length)} selected · ${fmtInt(segs.size)} segments`;
-}
-
-function curateSelectAll(on) {
-  if (!state.curate) return;
-  state.curate.selected = on ? new Set(state.curate.rows.map((r) => r.key)) : new Set();
-  // Update checkboxes + card state in place (avoid reloading every video).
-  $("curate-results").querySelectorAll(".curate-card").forEach((card) => {
-    const cb = card.querySelector(".curate-keep input");
-    if (cb) { cb.checked = on; card.classList.toggle("unpicked", !on); }
-  });
-  curateUpdateCounts();
-}
-
-async function curateExport() {
-  if (!state.curate || !state.curate.rows.length) { curateNote("Load a preview first.", true); return; }
-  const sel = state.curate.selected;
-  const kept = state.curate.rows.filter((r) => sel.has(r.key));
-  if (!kept.length) { curateNote("Select at least one segment to export.", true); return; }
-  const rows = kept.map((r) => ({
-    query: r.query,
-    rank: r.h.rank,
-    score: r.h.score,
-    segment_id: r.h.segment_id,
-    chunk_id: r.h.chunk_id,
-    run_uuid: r.h.run_uuid,
-    start_timestamp_ns: r.h.start_timestamp_ns,
-    end_timestamp_ns: r.h.end_timestamp_ns,
-    source_media_uri: r.h.source_media_uri,
-  }));
-  curateNote(`Exporting ${fmtInt(rows.length)} rows…`);
-  $("curate-export-btn").disabled = true;
-  try {
-    const resp = await fetch("/api/curate_export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        rows,
-        create_segment_set: $("curate-segset-toggle").checked,
-        embeddings_uri: state.embeddingsUri,
-        segment_set_uuid: state.segUuid,
-        filter_lance_uri: state.filterLanceUri || null,
-        from_date: $("from-date").value || null,
-        to_date: $("to-date").value || null,
-      }),
-    });
-    if (!resp.ok) {
-      let d; try { d = (await resp.json()).detail; } catch (_e) { /* non-JSON */ }
-      throw new Error(d || ("export " + resp.status));
-    }
-    const parquet = resp.headers.get("X-NLS-Parquet") || "";
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = exportFilename(resp, "curate_export.csv");
-    document.body.appendChild(a); a.click(); a.remove();
-    URL.revokeObjectURL(url);
-    const segs = new Set(kept.map((r) => r.h.segment_id).filter(Boolean));
-    curateNote(
-      `Exported ${fmtInt(rows.length)} rows · ${fmtInt(segs.size)} segments` +
-        (parquet ? ` · parquet → ${parquet}` : " · ⚠ parquet not written") +
-        segsetNote(resp),
-      !parquet,
-    );
-  } catch (e) {
-    curateNote("Export failed: " + e.message, true);
-  } finally {
-    $("curate-export-btn").disabled = false;
+  const btn = $("export-btn");
+  if (btn) {
+    btn.textContent = offline ? "🚀 Export (offline scan)" : "⬇ Export CSV";
+    btn.className = "btn-export " + (offline ? "async" : "instant");
+    btn.disabled = n === 0;
   }
+}
+
+// One button, deployment-aware: instant CSV (resident corpus) or async per-segment scan.
+function doExport() {
+  if (state.offlineScan !== false) launchCurateScan();
+  else downloadCsv();
+}
+
+let _toastTimer = null;
+function showToast(msg) {
+  const t = $("toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove("show"), 3000);
 }
 
 function setStatus(msg, isError) {
