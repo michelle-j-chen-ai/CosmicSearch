@@ -2134,7 +2134,7 @@ def score_distribution(req: ExportRequest, request: Request) -> dict:
 
 
 @app.post("/api/threshold_search")
-def threshold_search(req: ThresholdSearchRequest) -> dict:
+def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
     """Choose a similarity cutoff for the current query from labeled 👍/👎 marks,
     and return the next batch of boundary clips to label.
 
@@ -2201,10 +2201,16 @@ def threshold_search(req: ThresholdSearchRequest) -> dict:
         )
 
     tau = float(fit["threshold"]) if fit else None
+    # First-pass, label-free policy: a heuristic cutoff from THIS query's own score
+    # distribution, so a fresh tag gets a sensible tau before any labeling. When
+    # there's no fit yet, it also centers the boundary sampling + histogram mark.
+    stats = search_engine.score_stats(scores)
+    suggested = search_engine.heuristic_threshold(stats)
+    tau_for_sampling = tau if tau is not None else suggested
     # Next active-labeling batch: boundary-biased, excludes already-labeled rows,
     # restricted to the same filtered candidate set the search is ranking.
     sample_idx = search_engine.stratified_boundary_sample(
-        scores, allowed, labeled, req.sample_size, tau=tau, band=req.band
+        scores, allowed, labeled, req.sample_size, tau=tau_for_sampling, band=req.band
     )
     rank_of = np.empty(corpus.num_rows, dtype=np.int64)
     rank_of[order] = np.arange(1, order.size + 1)
@@ -2213,9 +2219,35 @@ def threshold_search(req: ThresholdSearchRequest) -> dict:
         for i in sample_idx
     ]
 
-    hist = _score_histogram(scores, tau)
+    # Log a training episode when a labeled fit exists: (score features, suggested
+    # tau, fit tau, metrics). Accumulates rows for a future learned policy; the
+    # data is otherwise transient. insert_threshold_episode is best-effort (it
+    # swallows DB errors internally, like insert_export), so this never blocks.
+    if fit is not None:
+        db.insert_threshold_episode(
+            {
+                "user_email": _current_user(request),
+                "query": req.query.strip(),
+                "tag": req.query.strip(),
+                "model_uri": _state["cfg"].model_artifact_uri,
+                "embeddings_uri": uri,
+                "features": stats,
+                "suggested_tau": suggested,
+                "fit_tau": tau,
+                "f1": fit["f1"],
+                "precision": fit["precision"],
+                "recall": fit["recall"],
+                "average_precision": fit["average_precision"],
+                "objective": fit["objective"],
+                "n_pos": fit["n_pos"],
+                "n_neg": fit["n_neg"],
+            }
+        )
+
+    hist = _score_histogram(scores, tau_for_sampling)
     return {
         "threshold": tau,
+        "suggested_threshold": suggested,
         "fit": fit,
         "note": note,
         "num_up": len(pos_idx),

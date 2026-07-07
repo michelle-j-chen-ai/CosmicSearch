@@ -1376,3 +1376,44 @@ def stratified_boundary_sample(
     picks = list(dict.fromkeys(picks))[:n]  # dedupe, cap
     picks.sort(key=lambda i: -float(np.asarray(scores)[i]))  # high score first
     return picks
+
+
+# ---------------------------------------------------------------------------
+# First-pass threshold policy: a label-free heuristic cutoff from the query's
+# own score distribution, plus the feature vector used to log training episodes
+# (so a learned linear policy can be fit later; see scripts/fit_threshold_policy).
+# ---------------------------------------------------------------------------
+
+
+def score_stats(scores: np.ndarray) -> dict:
+    """Summary statistics of a query's corpus similarity scores, used both as the
+    heuristic-threshold input and as the logged feature vector for a future policy.
+
+    ``top_gap`` = how many std devs the extreme right tail sits above the mean —
+    large when a distinct set of matches detaches from the bulk (a clear concept),
+    small when scores are diffuse (a vague query). Returns finite floats only.
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    s = s[np.isfinite(s)]
+    if s.size == 0:
+        return {"mean": 0.0, "std": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0,
+                "p99_9": 0.0, "max": 0.0, "top_gap": 0.0, "n": 0}
+    mean = float(s.mean())
+    std = float(s.std())
+    p50, p90, p99, p99_9 = (float(np.percentile(s, q)) for q in (50, 90, 99, 99.9))
+    mx = float(s.max())
+    top_gap = (p99_9 - mean) / std if std > 1e-9 else 0.0
+    return {"mean": round(mean, 6), "std": round(std, 6), "p50": round(p50, 6),
+            "p90": round(p90, 6), "p99": round(p99, 6), "p99_9": round(p99_9, 6),
+            "max": round(mx, 6), "top_gap": round(top_gap, 6), "n": int(s.size)}
+
+
+def heuristic_threshold(stats: dict, k: float = 3.0) -> float:
+    """Label-free cutoff = mean + k*std of the query's score distribution, clamped
+    to [0.05, 0.9]. Per-query by construction (each query's own mean/std), so it
+    calibrates across concepts without any labels — the first-pass policy that
+    gives every tag a sensible starting tau. ``k`` ~= the mean+3*std pattern seen
+    across hand-tuned tags; it's the single knob a learned policy later replaces.
+    """
+    tau = float(stats.get("mean", 0.0)) + k * float(stats.get("std", 0.0))
+    return float(min(max(tau, 0.05), 0.9))

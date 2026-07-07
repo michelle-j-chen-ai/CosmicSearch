@@ -415,6 +415,29 @@ def test_stratified_boundary_sample_respects_candidate_mask() -> None:
     assert picks and all(i < 20 for i in picks), picks
 
 
+def test_score_stats_basic() -> None:
+    s = np.array([0.0, 0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    st = search_engine.score_stats(s)
+    assert st["n"] == 5
+    assert abs(st["mean"] - 0.2) < 1e-6, st
+    assert abs(st["max"] - 0.4) < 1e-6, st
+    assert st["std"] > 0
+    # NaNs are dropped, not counted.
+    st2 = search_engine.score_stats(np.array([0.1, np.nan, 0.3], dtype=np.float64))
+    assert st2["n"] == 2, st2
+
+
+def test_heuristic_threshold_monotone_and_clamped() -> None:
+    tight = search_engine.score_stats(np.array([0.10, 0.11, 0.12, 0.13]))
+    wide = search_engine.score_stats(np.array([0.10, 0.20, 0.30, 0.40]))
+    # Wider spread -> higher cutoff (mean+k*std).
+    assert search_engine.heuristic_threshold(wide) > search_engine.heuristic_threshold(tight)
+    # Clamped into [0.05, 0.9].
+    hi = search_engine.heuristic_threshold({"mean": 5.0, "std": 5.0})
+    lo = search_engine.heuristic_threshold({"mean": -1.0, "std": 0.0})
+    assert hi == 0.9 and lo == 0.05, (hi, lo)
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -186,8 +186,9 @@
     <div id="filterbar" class="filterbar hidden"></div>
 
     <!-- REFINE (relevance feedback) -->
+    <!-- Marking clips 👍/👎 LIVE re-ranks the results (debounced) — no button. The
+         text query stays blended in (fixed weight) to anchor the refinement. -->
     <div id="refinebar" class="refinebar hidden">
-      <button id="refine-btn" class="primary" disabled>Refine (mark 👍 first)</button>
       <button id="clear-marks" class="ghost">Clear marks</button>
       <!-- On click: show the whole-corpus similarity histogram and jump to it;
            drag/click the chart to set the threshold. Not shown until clicked. -->
@@ -198,15 +199,14 @@
       <button id="threshold-btn" type="button" class="ghost"
               title="Teach a cutoff from 👍/👎 examples, then save it to a tag">Tune threshold</button>
       <span id="mark-count" class="note"></span>
-      <span class="refine-knobs">
-        <label title="How hard to push away from 👎">avoid-👎
-          <input id="neg-weight" type="range" min="0" max="2" step="0.1" value="0.5" />
-        </label>
-        <!-- Classic Rocchio query term (alpha*q0): anchoring refine to the
-             original query reduces drift, so it's on by default. -->
-        <label><input id="blend-text" type="checkbox" checked /> blend text query</label>
-        <input id="text-weight" type="range" min="0" max="1" step="0.05" value="0.3" />
-      </span>
+      <span id="refine-status" class="note"></span>
+      <label class="refine-knobs" title="How hard to push away from 👎 when re-ranking">avoid-👎
+        <select id="avoid-neg">
+          <option value="0">off</option>
+          <option value="0.5" selected>medium</option>
+          <option value="1.0">strong</option>
+        </select>
+      </label>
     </div>
 
     <!-- SIMILARITY DISTRIBUTION — whole-corpus score histogram, shown at the TOP

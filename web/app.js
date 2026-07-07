@@ -21,6 +21,9 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+// Monotonic stamp for in-flight rankings; _issue drops superseded responses so
+// rapid live auto-refines can't clobber each other out of order.
+let _issueSeq = 0;
 
 function fmtInt(n) { return n.toLocaleString("en-US"); }
 
@@ -278,11 +281,9 @@ function wireEvents() {
     const s = parseFloat($("jump-score").value);
     if (!Number.isNaN(s)) reload({ start_score: s });
   });
-  $("refine-btn").addEventListener("click", () => runRefine({ page: 0 }));
   $("clear-marks").addEventListener("click", clearMarks);
-  $("blend-text").addEventListener("change", (e) => {
-    $("text-weight").disabled = !e.target.checked;
-  });
+  // Changing the avoid-👎 strength re-ranks immediately if there are 👍 marks.
+  $("avoid-neg").addEventListener("change", () => scheduleAutoRefine(0));
   $("dist-btn").addEventListener("click", loadScoreDistribution);
   $("threshold-btn").addEventListener("click", () => loadThresholdSearch());
   $("save-vec-btn").addEventListener("click", saveVector);
@@ -631,14 +632,37 @@ async function runRefine(startOpts) {
   }));
   if (!marks.some((m) => m.mark === "up")) { setStatus("Mark at least one 👍 to refine.", true); return; }
   state.mode = "refine";
+  const rs = $("refine-status"); if (rs) rs.textContent = "refining…";
   await _issue("/api/refine", {
     query: state.query,
     marks,
-    negative_weight: parseFloat($("neg-weight").value),
-    text_weight: $("blend-text").checked ? parseFloat($("text-weight").value) : 0.0,
+    // avoid-👎 preset -> negative_weight; text query stays blended at a fixed weight
+    // to anchor the refinement (classic Rocchio alpha*q0), no separate control.
+    negative_weight: parseFloat($("avoid-neg").value),
+    text_weight: 0.3,
     ...(startOpts || {}),
     ..._filterBody(),
   }, "refine");
+}
+
+// Debounced live refine: as the user marks clips, re-rank in place (no button).
+// Coalesces rapid multi-marking into one call. Only in the normal results view —
+// in the Tune-threshold dedicated view marks feed the fit, and the grid is hidden.
+let _refineTimer = null;
+function scheduleAutoRefine(delay = 450) {
+  const sv = $("search-view");
+  if (!sv || sv.classList.contains("threshold-active") || !state.query) return;
+  clearTimeout(_refineTimer);
+  _refineTimer = setTimeout(() => {
+    const up = Object.values(state.marks).filter((m) => m.mark === "up").length;
+    if (up > 0) {
+      runRefine({ page: 0 });
+    } else if (state.mode === "refine") {
+      // Last 👍 removed -> fall back to the plain text ranking.
+      state.mode = "search";
+      runSearch({ page: 0 });
+    }
+  }, delay);
 }
 
 // Paging / jumps / filter changes preserve the current mode.
@@ -777,6 +801,10 @@ async function resumeSession(id) {
 }
 
 async function _issue(endpoint, body, mode) {
+  // Race guard: live auto-refine can fire several requests in quick succession;
+  // stamp each and drop any response that a newer request has superseded, so a
+  // slow earlier ranking can't clobber the latest one.
+  const seq = ++_issueSeq;
   setStatus(mode === "refine" ? "Refining…" : "Searching…");
   $("grid").innerHTML = "";
   showDistribution(null);  // a new ranking invalidates any shown distribution
@@ -801,9 +829,12 @@ async function _issue(endpoint, body, mode) {
       return r.json();
     });
   } catch (e) {
-    setStatus((mode === "refine" ? "Refine" : "Search") + " failed: " + e.message, true);
+    if (seq === _issueSeq) setStatus((mode === "refine" ? "Refine" : "Search") + " failed: " + e.message, true);
+    if (seq === _issueSeq) { const rs = $("refine-status"); if (rs) rs.textContent = ""; }
     return;
   }
+  if (seq !== _issueSeq) return;  // a newer request superseded this one — drop it
+  const rs = $("refine-status"); if (rs) rs.textContent = "";
   state.total = data.total;
   state.page = data.page;
   state.label = data.label;
@@ -1031,6 +1062,7 @@ function toggleMark(hit, kind, card) {
   upBtn.classList.toggle("on", !!m && m.mark === "up");
   downBtn.classList.toggle("on", !!m && m.mark === "down");
   updateMarkCount();
+  scheduleAutoRefine();  // live: marking re-ranks the results (debounced)
 }
 
 function updateMarkCount() {
@@ -1038,11 +1070,10 @@ function updateMarkCount() {
   const up = vals.filter((m) => m.mark === "up").length;
   const down = vals.filter((m) => m.mark === "down").length;
   const el = $("mark-count");
-  if (el) el.textContent = up || down ? `${up} 👍 / ${down} 👎 marked` : "";
-  const rb = $("refine-btn");
-  if (rb) {
-    rb.disabled = up === 0;
-    rb.textContent = up ? `Refine (${up} 👍 / ${down} 👎)` : "Refine (mark 👍 first)";
+  if (el) {
+    el.textContent = up
+      ? `auto-refining from ${up} 👍 / ${down} 👎`
+      : (down ? `${down} 👎 marked (mark a 👍 to re-rank)` : "");
   }
 }
 
@@ -1050,6 +1081,8 @@ function clearMarks() {
   state.marks = {};
   document.querySelectorAll(".mark.on").forEach((b) => b.classList.remove("on"));
   updateMarkCount();
+  // If we were showing a refined ranking, revert to the plain query immediately.
+  if (state.mode === "refine") { state.mode = "search"; runSearch({ page: 0 }); }
 }
 
 function renderPager(data) {
@@ -1572,6 +1605,10 @@ function buildThreshold(data) {
   const fit = data.fit;
   const hasFit = !!fit;
   const tau = data.threshold;
+  // First-pass policy: a label-free suggested τ from the query's score distribution.
+  // effTau is what Save uses — the labeled fit when present, else the suggestion.
+  const suggested = data.suggested_threshold;
+  const effTau = hasFit ? tau : suggested;
   const up = data.num_up || 0, down = data.num_down || 0;
   const enough = up >= 3 && down >= 3;
   const pct = (x) => (x == null ? "—" : (100 * x).toFixed(1) + "%");
@@ -1580,8 +1617,8 @@ function buildThreshold(data) {
   let hint;
   if (!hasFit) {
     hint = up === 0 && down === 0
-      ? "Mark a few clips below 👍 (a match) / 👎 (not a match) to compute a cutoff."
-      : `Need at least one 👍 and one 👎 — you have ${up} 👍 / ${down} 👎.`;
+      ? `Suggested τ ${effTau != null ? effTau.toFixed(3) : "—"} is set from the score distribution — save it as-is, or mark clips 👍/👎 to refine.`
+      : `Need at least one 👍 and one 👎 to refine — you have ${up} 👍 / ${down} 👎 (suggested τ still available below).`;
   } else if (!enough) {
     hint = `Cutoff from few labels (${up} 👍 / ${down} 👎). Label more + Sharpen for a reliable τ.`;
   } else {
@@ -1625,45 +1662,52 @@ function buildThreshold(data) {
         <button id="thr-more" type="button" class="ghost">More clips to label</button>
       </section>
 
-      <section class="thr-step ${hasFit ? "active" : "disabled"}">
+      <section class="thr-step active">
         <div class="thr-step-head"><span class="thr-step-num">2</span> See the cutoff</div>
-        ${hasFit ? `
-          ${metrics}
+        ${hasFit
+          ? `${metrics}
           <div class="thr-controls">
             <label>optimize for
               <select id="thr-objective">${objOptions}</select>
             </label>
             <label class="thr-minp-wrap">min precision
-              <input id="thr-minp" type="number" step="0.05" min="0" max="1" value="${fit.objective === "precision" ? "0.90" : "0.90"}" />
+              <input id="thr-minp" type="number" step="0.05" min="0" max="1" value="0.90" />
             </label>
             <button id="thr-sharpen" type="button" class="ghost">Sharpen (more labels + re-fit)</button>
-          </div>
-          <div class="thr-charts">
-            <div class="thr-strip">${_labeledStripSvg(data)}<div id="thr-hist"></div></div>
-            <div class="thr-pr">${_prCurveSvg(fit.curve)}</div>
           </div>`
-          : `<div class="sub muted">Label at least one 👍 and one 👎 above and the cutoff appears here.</div>`}
+          : `<span class="sub">Suggested τ <b>${effTau != null ? effTau.toFixed(3) : "—"}</b>
+               — from this query's score distribution (label clips above to refine).</span>`}
+        <div class="thr-charts">
+          <div class="thr-strip">${_labeledStripSvg(data)}<div id="thr-hist"></div></div>
+          ${hasFit ? `<div class="thr-pr">${_prCurveSvg(fit.curve)}</div>` : ""}
+        </div>
       </section>
 
-      <section class="thr-step ${hasFit ? "active" : "disabled"}">
+      <section class="thr-step active">
         <div class="thr-step-head"><span class="thr-step-num">3</span> Save it</div>
         <div class="thr-save-row">
           <label>tag <input id="thr-tag" type="text" placeholder="tag name" value="${escapeHtml(_querySlug(state.query))}" /></label>
-          <button id="thr-save" type="button" class="primary" ${hasFit ? "" : "disabled"}>Save threshold to tag</button>
+          <button id="thr-save" type="button" class="primary" ${effTau != null ? "" : "disabled"}>Save threshold to tag</button>
         </div>
         <div id="thr-save-note" class="note"></div>
         <div class="sub sd-hint">Saves τ + this query to the tag — the value Download CSV and the offline scan use.</div>
       </section>
     </div>`;
 
-  // Corpus histogram (reuse the distribution chart, marking the fitted τ).
-  if (hasFit && data.histogram) {
+  // Corpus histogram (reuse the distribution chart). The endpoint marks it at the
+  // fitted τ when labeled, else the suggested τ — so it's shown in both cases.
+  if (data.histogram) {
     const h = Object.assign({}, data.histogram, { mode: "score" });
     wrap.querySelector("#thr-hist").appendChild(buildDistribution(h));
   }
 
   wrap.querySelector("#thr-back").onclick = () => exitThresholdView();
   wrap.querySelector("#thr-more").onclick = () => loadThresholdSearch();
+  // Save works with or without labels — persists the fit τ if present, else the
+  // suggested τ, so a fresh tag can be saved with zero labeling.
+  if (effTau != null) {
+    wrap.querySelector("#thr-save").onclick = () => saveThresholdToTag(effTau);
+  }
 
   if (hasFit) {
     const objSel = wrap.querySelector("#thr-objective");
@@ -1675,7 +1719,6 @@ function buildThreshold(data) {
     objSel.addEventListener("change", () => { syncMinp(); loadThresholdSearch(); });
     wrap.querySelector("#thr-minp").addEventListener("change", () => loadThresholdSearch());
     wrap.querySelector("#thr-sharpen").onclick = () => loadThresholdSearch();
-    wrap.querySelector("#thr-save").onclick = () => saveThresholdToTag(tau);
   }
 
   // Active-labeling grid: standard cards + mark buttons; marking then Sharpen/More

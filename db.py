@@ -36,6 +36,11 @@ _BARE = _TABLE.split(".")[-1]
 # Launched per-segment scans (Lilypad workloads). A durable record so the Export
 # tab can show what is running / completed and its workload id across reloads.
 _SCAN_TABLE = f"{SCHEMA_NAME}.scan_jobs"
+# Threshold-tuning episodes: one row per labeled fit, holding the query's score
+# features + the fitted tau + metrics. Training data for a future learned
+# threshold policy (see scripts/fit_threshold_policy.py); append-only.
+_EPISODE_TABLE = f"{SCHEMA_NAME}.threshold_episodes"
+_BARE_EPISODE = _EPISODE_TABLE.split(".")[-1]
 
 _engine: Engine | None = None
 _engine_lock = threading.Lock()
@@ -129,6 +134,28 @@ _DDL = [
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS idem_key TEXT",
     f"CREATE UNIQUE INDEX IF NOT EXISTS scan_jobs_idem_idx ON {_SCAN_TABLE} (idem_key) "
     f"WHERE idem_key IS NOT NULL",
+    # Threshold-tuning episodes: (score-distribution features, suggested tau, fitted
+    # tau, metrics) captured each time a labeled fit is produced. Append-only training
+    # data for a future learned threshold policy; no unique key (many tunes per tag).
+    f"""CREATE TABLE IF NOT EXISTS {_EPISODE_TABLE} (
+        id                 BIGSERIAL PRIMARY KEY,
+        created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+        user_email         TEXT,
+        query              TEXT,
+        tag                TEXT,
+        model_uri          TEXT,
+        embeddings_uri     TEXT,
+        features           JSONB,
+        suggested_tau      DOUBLE PRECISION,
+        fit_tau            DOUBLE PRECISION,
+        f1                 DOUBLE PRECISION,
+        precision          DOUBLE PRECISION,
+        recall             DOUBLE PRECISION,
+        average_precision  DOUBLE PRECISION,
+        objective          TEXT,
+        n_pos              INTEGER,
+        n_neg              INTEGER
+    )""",
 ]
 
 # Upsert keyed on `tag` (the true key): a row with a non-empty tag conflicts with the
@@ -278,6 +305,53 @@ def insert_export(record: dict, upsert_by_tag: bool = True) -> bool:
         return False
 
 
+_INSERT_EPISODE = text(
+    f"""INSERT INTO {_BARE_EPISODE}
+        (user_email, query, tag, model_uri, embeddings_uri, features, suggested_tau,
+         fit_tau, f1, precision, recall, average_precision, objective, n_pos, n_neg)
+        VALUES (:user_email, :query, :tag, :model_uri, :embeddings_uri, CAST(:features AS JSONB),
+                :suggested_tau, :fit_tau, :f1, :precision, :recall, :average_precision,
+                :objective, :n_pos, :n_neg)
+        RETURNING id"""
+)
+
+
+def insert_threshold_episode(record: dict) -> bool:
+    """Append one threshold-tuning episode (features + fitted tau + metrics).
+
+    Best-effort training-data capture for a future learned threshold policy;
+    swallows connection/SQL errors so tuning never breaks when the DB is
+    unreachable. Returns True iff the row was committed."""
+    params = {
+        "user_email": record.get("user_email"),
+        "query": record.get("query"),
+        "tag": record.get("tag"),
+        "model_uri": record.get("model_uri"),
+        "embeddings_uri": record.get("embeddings_uri"),
+        "features": json.dumps(record.get("features", {})),
+        "suggested_tau": record.get("suggested_tau"),
+        "fit_tau": record.get("fit_tau"),
+        "f1": record.get("f1"),
+        "precision": record.get("precision"),
+        "recall": record.get("recall"),
+        "average_precision": record.get("average_precision"),
+        "objective": record.get("objective"),
+        "n_pos": record.get("n_pos"),
+        "n_neg": record.get("n_neg"),
+    }
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            row_id = conn.execute(_INSERT_EPISODE, params).scalar_one()
+        logger.info("DB: threshold_episode row %s written (tag=%r)", row_id, params["tag"])
+        return True
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: insert_threshold_episode failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
 # Read side -- backs the /analytics view. The search_vector column is large
 # (a 768-float JSON array per row) so it is deliberately excluded here; only its
 # length is surfaced. Both helpers are best-effort and return [] when exp-db is
@@ -411,6 +485,29 @@ def set_tag_thresholds(thresholds: dict[str, float]) -> bool:
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: set_tag_thresholds failed (%s): %s", type(exc).__name__, exc)
         return False
+
+
+def threshold_episodes(limit: int = 10000) -> list[dict]:
+    """All logged threshold-tuning episodes, newest-first. Training data for the
+    offline threshold-policy fit (scripts/fit_threshold_policy.py). Best-effort:
+    returns [] when exp-db is unreachable."""
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            rows = conn.execute(
+                text(
+                    f"SELECT features, suggested_tau, fit_tau, f1, tag, objective, "
+                    f"n_pos, n_neg FROM {_BARE_EPISODE} "
+                    f"ORDER BY created_at DESC LIMIT :lim"
+                ),
+                {"lim": int(limit)},
+            ).mappings().all()
+        return [dict(r) for r in rows]
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: threshold_episodes failed (%s): %s", type(exc).__name__, exc)
+        return []
 
 
 def get_session(session_id: int) -> dict | None:
