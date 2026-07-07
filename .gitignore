@@ -20,3 +20,6 @@ __pycache__/
 .venv/
 venv/
 .env
+
+# Local deploy artifacts (logs + service-config snapshots) — never push
+.deploy_backup/
