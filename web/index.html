@@ -1,390 +1,301 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CosmicSearch</title>
-  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..800&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/style.css" />
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CosmicSearch</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+<link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <div class="grain"></div>
 
-  <header class="topbar">
+<div class="app">
+  <div class="topbar">
     <div class="brand">
-      <span id="platform-tag" class="platform-tag" title="Active platform"></span>
-      <h1 class="brand-title">CosmicSearch</h1>
-      <div id="corpus-pill" class="corpus-pill" title="Active corpus">loading corpus…</div>
+      <span class="tag" id="brandTag"></span>
+      <h1>CosmicSearch</h1>
+      <span class="corpus-pill" id="corpusPill">loading corpus…</span>
     </div>
-    <div class="topright">
-      <button id="settings-gear" type="button" class="icon-btn" title="Corpus &amp; model settings" aria-expanded="false">⚙</button>
-    </div>
-  </header>
+    <button class="icon-btn" id="settingsGear" title="Corpus &amp; model settings">⚙</button>
+  </div>
 
-  <!-- CORPUS / MODEL SETTINGS — tucked behind the ⚙ gear so the header stays clean.
-       Same controls + IDs as before; only relocated. -->
-  <div id="settings-pop" class="settings-pop hidden" role="dialog" aria-label="Corpus and model settings">
-    <div class="settings-row">
-      <label class="pagesize" title="Results shown per page">results per page
-        <select id="page-size">
-          <option>12</option><option selected>24</option><option>48</option><option>96</option>
-        </select>
-      </label>
-    </div>
+  <div class="nav">
+    <button class="active" id="navSearch">Search</button>
+    <button id="navSaved">Saved searches <span class="count" id="savedCount"></span></button>
+  </div>
+
+  <!-- ⚙ corpus / model settings (backend switcher; hidden until opened) -->
+  <div class="settings-pop hidden" id="settingsPop">
     <div class="settings-row">
       <span class="corpus-k">corpus</span>
-      <input id="embeddings-uri" type="text" class="plain"
-             placeholder="s3://…/chunks.lance  or  s3://…/embeddings/<session>/" />
+      <input id="embeddings-uri" type="text" class="plain" placeholder="s3://…/chunks.lance  or  s3://…/embeddings/<session>/" />
       <button id="load-corpus" type="button" class="ghost">Load</button>
       <span id="corpus-note" class="note"></span>
     </div>
     <div class="settings-row">
       <span class="corpus-k">model</span>
-      <input id="model-uri" type="text" class="plain"
-             placeholder="s3://…/models/<ckpt>/   (empty = base Cosmos-Embed1)" />
+      <input id="model-uri" type="text" class="plain" placeholder="s3://…/models/<ckpt>/   (empty = base Cosmos-Embed1)" />
       <button id="load-model" type="button" class="ghost">Load</button>
       <span id="model-note" class="note"></span>
     </div>
   </div>
 
-  <nav class="maintabs" aria-label="Primary">
-    <a href="/" class="tab active">Search</a>
-    <a href="/curate" class="tab">Saved searches <span id="saved-count" class="count"></span></a>
-  </nav>
+  <!-- ============ SEARCH PAGE ============ -->
+  <div class="page active" id="page-search">
+    <div id="emptyState">
+      <div class="searchbar">
+        <span style="color:var(--muted-2)">🔍</span>
+        <input id="searchInput" placeholder="Describe a moment — e.g. ego makes an unprotected left turn across oncoming traffic">
+        <button id="searchBtn">Search</button>
+      </div>
+      <div class="hero-sub"><button class="link-btn" id="clipToggle">▶ Search by video clip instead</button></div>
+      <div class="empty-hint">Type a query to get a starting search vector — you'll refine it with 👍/👎 on the next screen.</div>
 
-  <main>
-    <!-- FILTERS FLYOUT — collapsed strip on the RIGHT edge; hover (or focus) slides
-         the vertical filter panel out. The SAME .filter-body node is docked inline on
-         the Saved-searches page (one source of truth for all filter values). -->
-    <aside id="filter-panel" class="filter-panel" aria-label="Filters">
-      <div class="flyout-tab"><span>Filters</span></div>
-      <div class="filter-body">
-        <div class="control">
-          <label>Date range (UTC)</label>
-          <div class="date-stack">
-            <input id="from-date" type="date" />
-            <span class="dash">→</span>
-            <input id="to-date" type="date" />
-          </div>
+      <!-- search by video clip (query-by-example over the corpus) -->
+      <div class="video-search-panel hidden" id="clipPanel">
+        <div class="vsp-row">
+          <label class="vsp-field">drive (run_uuid)<input id="vs-run-uuid" placeholder="019eb27f-…  (or use segment id)"></label>
+          <label class="vsp-field">segment id<input id="vs-segment-id" placeholder="30s source segment_id (optional)"></label>
         </div>
-
-        <div class="control">
-          <label>Data Explorer segment set <span class="muted">(superset)</span></label>
-          <div id="segset-combo" class="combo">
-            <input id="segset-filter" type="text" autocomplete="off" role="combobox"
-                   aria-expanded="false" aria-autocomplete="list"
-                   placeholder="type a keyword to search sets… (none by default)" />
-            <button id="segset-clear" type="button" class="combo-clear hidden" title="Clear segment set" aria-label="Clear segment set">×</button>
-            <div id="segset-menu" class="combo-menu hidden" role="listbox"></div>
-          </div>
-          <div id="segset-note" class="note"></div>
-        </div>
-
-        <div class="control">
-          <label>Lance dataset downsample <span class="muted">(segment cross-ref)</span></label>
-          <div id="lance-combo" class="combo">
-            <input id="lance-filter" type="text" autocomplete="off"
-                   placeholder="s3://…/seg_map.parquet  or  s3://…/dataset.lance  — Enter to apply" />
-            <button id="lance-clear" type="button" class="combo-clear hidden" title="Clear dataset" aria-label="Clear dataset">×</button>
-          </div>
-          <div id="lance-note" class="note">keeps only chunks whose segment_id is in this dataset</div>
-        </div>
-
-        <div class="control">
-          <label>Vehicle id <span class="muted">(comma/space-separated)</span></label>
-          <div id="vehicle-combo" class="combo">
-            <input id="vehicle-filter" type="text" autocomplete="off"
-                   placeholder="e.g. truck-808, truck-810  — Enter to apply" />
-            <button id="vehicle-clear" type="button" class="combo-clear hidden" title="Clear vehicle" aria-label="Clear vehicle">×</button>
-          </div>
-          <div id="vehicle-note" class="note">keeps only chunks from these vehicles (corpus must carry a vehicle column)</div>
-        </div>
-
-        <div class="control">
-          <label>Drive id <span class="muted">(run_uuid, comma/space-separated)</span></label>
-          <div id="drive-combo" class="combo">
-            <input id="drive-filter" type="text" autocomplete="off"
-                   placeholder="e.g. 019eb27f-…, 019e69c5-…  — Enter to apply" />
-            <button id="drive-clear" type="button" class="combo-clear hidden" title="Clear drive id" aria-label="Clear drive id">×</button>
-          </div>
-          <div id="drive-note" class="note">keeps only chunks from these drives (run_uuids)</div>
+        <div class="vsp-row">
+          <label class="vsp-field">start<input id="vs-start" placeholder="unix s or ns — blank = whole drive/segment"></label>
+          <label class="vsp-field">end<input id="vs-end" placeholder="unix s or ns — blank = open"></label>
+          <button class="primary" id="vs-search-btn">Search by clip</button>
         </div>
       </div>
-    </aside>
+    </div>
 
-    <!-- ============ SEARCH PAGE ============ -->
-    <div id="search-view">
-      <section class="search-block">
-        <form id="search-form" class="search-bar" autocomplete="off">
-          <span class="search-icon">⌕</span>
-          <input id="query" type="text" placeholder="Describe a moment — e.g. ego makes an unprotected left turn across oncoming traffic" />
-          <button id="search-btn" type="submit">Search</button>
-        </form>
-        <div id="examples" class="examples"></div>
-        <!-- SEARCH BY VIDEO CLIP — query-by-example over the pre-embedded corpus. -->
-        <div class="video-search">
-          <button id="video-search-toggle" type="button" class="ghost"
-                  aria-expanded="false" title="Search by an example video clip instead of text">
-            ▶ Search by video clip</button>
-          <div id="video-search-panel" class="video-search-panel hidden">
-            <div class="vsp-row">
-              <label class="vsp-field">drive (run_uuid)
-                <input id="vs-run-uuid" type="text" autocomplete="off"
-                       placeholder="019eb27f-…  (or use segment id)" />
-              </label>
-              <label class="vsp-field">segment id
-                <input id="vs-segment-id" type="text" autocomplete="off"
-                       placeholder="30s source segment_id (optional)" />
-              </label>
-            </div>
-            <div class="vsp-row">
-              <label class="vsp-field">start
-                <input id="vs-start" type="text" autocomplete="off"
-                       placeholder="unix s or ns — blank = whole drive/segment" />
-              </label>
-              <label class="vsp-field">end
-                <input id="vs-end" type="text" autocomplete="off"
-                       placeholder="unix s or ns — blank = open" />
-              </label>
-              <button id="vs-search-btn" type="button" class="primary">Search by clip</button>
-            </div>
-            <div id="vs-note" class="note">averages the ~8s chunks overlapping the window into the query vector</div>
-          </div>
+    <div id="resultsState" style="display:none;">
+      <div class="searchbar">
+        <span style="color:var(--muted-2)">🔍</span>
+        <input id="searchInput2">
+        <button id="searchBtn2">Search</button>
+      </div>
+
+      <div class="meta-row">
+        <div class="meta-left">
+          <span class="chip active" id="vectorChip">vector</span>
+          <span class="chip" id="filtersChip" style="cursor:pointer;">⚙ filters &amp; view</span>
         </div>
-      </section>
+        <div class="result-count" id="resultCountText"></div>
+      </div>
 
-      <!-- QUERY FILMSTRIP — the matched example chunks for a video-clip search. -->
-      <section id="query-strip" class="query-strip hidden"></section>
+      <!-- matched query-clip filmstrip (video-clip search only) -->
+      <div class="query-strip hidden" id="queryStrip"></div>
 
-      <!-- ACTIVE FILTERS + STATUS -->
-      <div id="filterbar" class="filterbar hidden"></div>
+      <div class="results-toolbar">
+        <div class="rt-group">
+          <button class="rt-btn" id="pagePrev">← Prev</button>
+          <span class="rt-page" id="pageLabel">page 1 / 1</span>
+          <button class="rt-btn" id="pageNext">Next →</button>
+        </div>
+        <div class="rt-divider"></div>
+        <div class="rt-group">
+          <span class="rt-label">rank</span>
+          <input class="rt-input" id="jumpRank" placeholder="#">
+          <button class="rt-btn" id="jumpRankBtn">Jump</button>
+        </div>
+        <div class="rt-group">
+          <span class="rt-label">sim ≤</span>
+          <input class="rt-input" id="jumpSim" placeholder="0.00">
+          <button class="rt-btn" id="jumpSimBtn">Go</button>
+        </div>
+        <div class="rt-divider"></div>
+        <label class="rt-checkbox"><input type="checkbox" id="quickDedup"> dedup by segment</label>
+        <div class="rt-divider"></div>
+        <div class="rt-group">
+          <span class="rt-label">per page</span>
+          <select class="rt-select" id="perPage"><option>24</option><option selected>50</option><option>100</option></select>
+        </div>
+      </div>
 
-      <!-- SWEEP / THRESHOLD workspace — shown above the grid. The threshold view is a
-           dedicated workspace (hides the grid via .threshold-active); the corpus
-           distribution renders here too. -->
-      <section id="score-dist-view" class="score-dist-view hidden"></section>
-      <section id="threshold-view" class="score-dist-view hidden"></section>
+      <div class="filters-panel" id="searchFiltersPanel" style="display:none;">
+        <div class="sub">Narrow what you're browsing and refining right now — carries over as a starting point when you save.</div>
+        <div class="filters-grid">
+          <div class="field"><label>Date from</label><input type="date" id="sf-dateFrom"></div>
+          <div class="field"><label>Date to</label><input type="date" id="sf-dateTo"></div>
+          <div class="field"><label>Vehicle ID</label><input id="sf-vehicle" placeholder="e.g. truck-808, truck-810"></div>
+          <div class="field"><label>Drive ID (run_uuid)</label><input id="sf-drive" placeholder="e.g. 019eb27f-…"></div>
+          <div class="field"><label>Data Explorer segment set</label><input id="sf-dxset" placeholder="type a keyword to search sets…"><div class="hint" id="sf-dxset-note"></div></div>
+          <div class="field"><label>Lance dataset downsample</label><input id="sf-lance" placeholder="s3://…/seg_map.parquet"><div class="hint" id="sf-lance-note">preview only this downsample while browsing</div></div>
+        </div>
+        <button class="rail-btn primary" style="width:auto; padding:9px 22px; margin-top:14px;" id="applyFiltersBtn">Apply — update view</button>
+      </div>
 
-      <!-- Two-column: results grid + guided rail. -->
+      <div class="sweep-panel" id="sweepPanel">
+        <div class="sweep-head">
+          <div><h3>Sweep threshold</h3><p>Score distribution across the corpus, with your labeled clips plotted at their real score. Drag the line to set τ.</p></div>
+          <button class="sweep-close" id="sweepClose">×</button>
+        </div>
+        <div style="margin-top:14px;"><svg id="sweepSvg" width="100%" height="180" viewBox="0 0 1000 180" preserveAspectRatio="none" style="overflow:visible; cursor:ew-resize;"></svg></div>
+        <div class="sweep-stats">
+          <div class="stat pos">captures<b id="statCapture">—</b></div>
+          <div class="stat neg">excludes<b id="statExclude">—</b></div>
+          <div class="stat">est. matches in corpus<b id="statCorpus" style="color:var(--text)">—</b></div>
+        </div>
+        <div class="sweep-footer">
+          <div class="tau-readout">τ = <b id="tauReadout">—</b></div>
+          <button class="rail-btn primary" style="width:auto; padding:9px 22px; margin:0;" id="useThresholdBtn">Use this threshold</button>
+        </div>
+      </div>
+
       <div class="layout">
-        <div class="grid-col">
-          <!-- PAGER + JUMP -->
-          <nav id="pager" class="pager hidden">
-            <button id="prev" class="ghost">← Prev</button>
-            <span id="page-label" class="page-label"></span>
-            <button id="next" class="ghost">Next →</button>
-            <span class="jump">
-              <input id="jump-rank" type="number" min="1" placeholder="rank #" />
-              <button id="jump-rank-btn" class="ghost">Jump</button>
-              <input id="jump-score" type="number" step="0.01" placeholder="sim ≤" />
-              <button id="jump-score-btn" class="ghost">Go</button>
-            </span>
-            <!-- Direct top-k CSV export of the current search — only where there is no
-                 offline workflow (e.g. trucking). -->
-            <span class="search-export requires-no-offline-scan">
-              <label class="dedup-toggle" title="Keep only the best clip per segment_id">
-                <input id="search-export-dedup" type="checkbox" /> dedup by segment
-              </label>
-              <input id="search-export-k" type="number" min="1" value="100" title="how many top results to export to CSV" />
-              <button id="search-export-btn" type="button" class="ghost" title="Download a CSV of the current search's top-k from the loaded corpus">Download CSV</button>
-            </span>
-          </nav>
+        <div class="grid-col"><div class="grid" id="resultsGrid"></div><div id="gridStatus" class="status"></div></div>
 
-          <section id="status" class="status">Type a query above to begin.</section>
-          <section id="grid" class="grid"></section>
+        <div class="rail">
+          <div class="rail-card accordion" id="stepCard-refine">
+            <div class="rail-header" data-step="refine">
+              <h4><span class="step-num" id="stepRefineNum">1</span> Refine with feedback</h4>
+              <span class="rail-summary" id="refineSummary">0 👍 · 0 👎</span>
+              <span class="chev">⌄</span>
+            </div>
+            <div class="rail-body">
+              <div class="rail-desc">Vote on clips in the grid — each label counts toward the sweep.</div>
+              <div class="vote-tally"><span id="voteLabel">0 👍 · 0 👎</span></div>
+              <div class="progress-track" style="margin-bottom:12px;"><div class="progress-up" id="upBar" style="width:0%"></div><div class="progress-down" id="downBar" style="width:0%"></div></div>
+              <button class="rail-btn" id="refineBtn" disabled>Re-rank with feedback</button>
+            </div>
+          </div>
+
+          <div class="rail-card accordion" id="stepCard-thresh">
+            <div class="rail-header" data-step="thresh">
+              <h4><span class="step-num" id="stepThreshNum">2</span> Threshold</h4>
+              <span class="rail-summary" id="threshSummary">—</span>
+              <span class="chev">⌄</span>
+            </div>
+            <div class="rail-body">
+              <div class="thresh-val" id="threshVal">—</div>
+              <div class="thresh-sub" id="threshSub">Label clips (or just open the sweep) to set a cutoff</div>
+              <button class="rail-btn" id="sweepBtn">Sweep threshold →</button>
+            </div>
+          </div>
+
+          <div class="rail-card accordion" id="stepCard-save">
+            <div class="rail-header" data-step="save">
+              <h4><span class="step-num" id="stepSaveNum">3</span> Save search</h4>
+              <span class="rail-summary">→ Saved searches</span>
+              <span class="chev">⌄</span>
+            </div>
+            <div class="rail-body">
+              <div class="rail-desc">Exporting happens on the Saved searches page — saving takes you there.</div>
+              <button class="rail-btn primary" id="saveOpenBtn">💾 Save &amp; configure →</button>
+            </div>
+          </div>
         </div>
-
-        <!-- GUIDED RAIL — Refine → Threshold → Save. -->
-        <aside class="rail" id="rail">
-          <div class="rail-card" id="railstep-refine">
-            <div class="rail-head"><span class="step-num" id="step-refine-num">1</span> Refine with feedback
-              <span class="rail-summary" id="rail-refine-summary">0 👍 · 0 👎</span></div>
-            <div class="rail-body">
-              <p class="rail-desc">Mark clips 👍 / 👎 in the grid — results re-rank live as you label.</p>
-              <div class="progress-track"><div class="progress-up" id="rail-up-bar"></div><div class="progress-down" id="rail-down-bar"></div></div>
-              <!-- Refine controls (live auto-refine; no manual button needed). -->
-              <div id="refinebar" class="refinebar">
-                <span id="mark-count" class="note"></span>
-                <span id="refine-status" class="note"></span>
-                <div class="refine-row">
-                  <label class="refine-knobs" title="How hard to push away from 👎 when re-ranking">avoid-👎
-                    <select id="avoid-neg">
-                      <option value="0">off</option>
-                      <option value="0.5" selected>medium</option>
-                      <option value="1.0">strong</option>
-                    </select>
-                  </label>
-                  <button id="clear-marks" type="button" class="ghost">Clear marks</button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div class="rail-card" id="railstep-thresh">
-            <div class="rail-head"><span class="step-num" id="step-thresh-num">2</span> Threshold
-              <span class="rail-summary" id="rail-thresh-val">—</span></div>
-            <div class="rail-body">
-              <p class="rail-desc">Fit a cosine cutoff from your 👍/👎 (or use the label-free suggestion), and sweep it against the corpus distribution.</p>
-              <button id="threshold-btn" type="button" class="rail-btn primary"
-                      title="Teach a cutoff from 👍/👎 examples, sweep it, then save it to a tag">Sweep threshold →</button>
-              <button id="dist-btn" type="button" class="rail-btn"
-                      title="Show the whole-corpus similarity distribution for this search">Corpus distribution</button>
-            </div>
-          </div>
-
-          <div class="rail-card" id="railstep-save">
-            <div class="rail-head"><span class="step-num" id="step-save-num">3</span> Save search</div>
-            <div class="rail-body">
-              <p class="rail-desc">Store this (refined) search vector + threshold under a tag — it lands on Saved searches, ready to export.</p>
-              <button id="save-open-btn" type="button" class="rail-btn primary">💾 Save &amp; configure →</button>
-            </div>
-          </div>
-        </aside>
       </div>
-    </div><!-- /search-view -->
-
-    <!-- ============ SAVED SEARCHES PAGE ============ -->
-    <section id="curate-view" class="hidden">
-      <div class="curate-head">
-        <h2>Saved searches</h2>
-        <p class="curate-sub">One row per <strong>tag</strong> (its saved vector, <code>k</code>, threshold,
-          and filters). Tick the ones you want, then <strong>Export</strong> below — an instant CSV from the
-          loaded corpus, or<span class="requires-offline-scan"> an offline per-segment scan over the FULL corpus.</span>
-          Export honors all active <strong>Filters</strong>.</p>
-
-        <div class="export-history-bar">
-          <input id="export-hist-filter" type="text" class="plain" placeholder="filter by query or tag…" />
-          <label class="curate-k-label" title="k applied to a row when first ticked, and to ad-hoc lines">
-            default k <input id="curate-k" type="number" min="1" value="50" />
-          </label>
-          <label class="curate-k-label" title="default per-tag cosine threshold (blank/0 = top-k)">
-            default threshold <input id="curate-threshold" type="number" step="0.01" min="0" max="1" value="0" />
-          </label>
-          <span class="curate-toolbar-spacer"></span>
-          <button id="export-hist-all" type="button" class="ghost">Select all</button>
-          <button id="export-hist-none" type="button" class="ghost">Select none</button>
-          <button id="export-hist-reload" type="button" class="ghost">Reload</button>
-        </div>
-        <div id="export-history" class="export-history"></div>
-
-        <details class="export-adhoc">
-          <summary>add ad-hoc queries (not in history) — <code>query, k, threshold</code> per line</summary>
-          <textarea id="curate-queries" rows="3" spellcheck="false"
-            placeholder="one query, k, threshold per line (k/threshold optional)&#10;straight highway, 50, 0.30&#10;highway entrances or exits, 50, 0.28"></textarea>
-        </details>
-
-        <!-- Filters dock: the SAME filter controls, relocated inline so the export scope
-             is visible + editable in place. -->
-        <div class="curate-filter-dock">
-          <div class="curate-filter-dock-head">
-            <span>Filters</span>
-            <span class="note">applied to the export, and saved with each launched vector — edit or clear any below</span>
-          </div>
-          <div id="curate-filter-host"></div>
-        </div>
-
-        <!-- ===== SINGLE EXPORT PANEL ===== -->
-        <div class="section-label">Export</div>
-        <div class="exp2-panel">
-          <div class="exp2-top">
-            <h4>Export</h4>
-            <span class="mech-badge" id="mech-badge">instant</span>
-          </div>
-          <div class="selection-note" id="selection-note"></div>
-
-          <div class="exp2-sub">
-            <h5>Cutoff</h5>
-            <div class="segmented" id="cutoff-seg">
-              <button type="button" class="active" data-mode="threshold">Threshold (τ)</button>
-              <button type="button" data-mode="topk">Top-K</button>
-            </div>
-            <p class="mode-desc" id="cutoff-desc"></p>
-          </div>
-
-          <div class="exp2-sub requires-offline-scan">
-            <h5>Sample output as</h5>
-            <div class="segmented" id="sample-seg">
-              <button type="button" class="active" data-mode="interval">Interval</button>
-              <button type="button" data-mode="segment">Segment</button>
-            </div>
-            <p class="mode-desc" id="sample-desc"></p>
-          </div>
-
-          <div class="toggle-row">
-            <div><div class="toggle-label">Deduplicate by segment</div>
-              <div class="toggle-sub">Keep only the best clip per segment_id (CSV holds distinct segments)</div></div>
-            <label class="switch"><input id="curate-csv-dedup" type="checkbox" /><span class="slider-toggle"></span></label>
-          </div>
-          <!-- Scan-only: merge contiguous above-threshold clips into time intervals. -->
-          <div class="toggle-row requires-offline-scan" id="merge-row">
-            <div><div class="toggle-label">Merge into intervals</div>
-              <div class="toggle-sub">Merge contiguous above-threshold clips per segment (unchecked = one best clip per segment)</div></div>
-            <label class="switch"><input id="curate-scan-merge" type="checkbox" checked /><span class="slider-toggle"></span></label>
-          </div>
-          <div class="toggle-row">
-            <div><div class="toggle-label">Register as Data Explorer segment set</div>
-              <div class="toggle-sub">Makes the export browsable + cross-referenceable in DX</div></div>
-            <label class="switch">
-              <input id="curate-csv-segset" type="checkbox" /><span class="slider-toggle"></span></label>
-          </div>
-          <!-- The scan uses its own register flag; kept in sync with the CSV one via JS. -->
-          <input id="curate-scan-segset" type="checkbox" class="hidden" />
-
-          <div class="exp2-action">
-            <button id="export-btn" type="button" class="btn-export">⬇ Export</button>
-            <div id="curate-note" class="note export-note"></div>
-            <div id="curate-scan-note" class="note export-note"></div>
-          </div>
-        </div>
-
-        <!-- Recent launched scans (offline-scan deployments only). -->
-        <div class="scan-jobs-head requires-offline-scan">
-          <span>Recent scans</span>
-          <button id="scan-jobs-reload" type="button" class="ghost">Reload</button>
-        </div>
-        <div id="scan-jobs" class="scan-jobs requires-offline-scan"></div>
-      </div>
-    </section>
-
-    <!-- SEARCH HISTORY (loaded client-side, no full reload) -->
-    <section id="history-view" class="hidden"></section>
-  </main>
-
-  <!-- ===== SAVE DRAWER (search page) ===== -->
-  <div id="drawer-overlay" class="overlay"></div>
-  <aside id="save-drawer" class="save-drawer" aria-label="Save search">
-    <div class="drawer-head">
-      <div><h3>Save search</h3><p class="sub">Configure &amp; run the export on the Saved searches page.</p></div>
-      <button id="drawer-close" type="button" class="close-btn" aria-label="Close">×</button>
     </div>
-    <div class="drawer-body">
-      <div class="dsection">
-        <h5>Current search vector</h5>
-        <div class="vec-summary" id="save-vec-summary"></div>
-      </div>
-      <div class="dsection">
-        <h5>Tag</h5>
-        <input id="save-vec-tag" type="text" placeholder="tag name (e.g. left_turn)" />
-        <div class="export-row">
-          <label class="curate-k-label" title="top-k to remember for this tag's export">
-            k <input id="save-vec-k" type="number" min="1" value="50" />
-          </label>
-          <label class="curate-k-label" title="cosine threshold to remember (blank = top-k)">
-            threshold <input id="save-vec-threshold" type="number" step="0.01" min="0" max="1" placeholder="top-k" />
-          </label>
-        </div>
-      </div>
-      <button id="save-vec-btn" type="button" class="btn-export">💾 Save</button>
-      <div id="save-vec-note" class="note"></div>
-      <p class="drawer-next-note">Saving takes you to Saved searches with this row ready to export.</p>
+  </div>
+
+  <!-- ============ SAVED SEARCHES PAGE ============ -->
+  <div class="page" id="page-saved">
+    <div class="filterbar">
+      <input type="text" id="savedFilter" placeholder="Filter by query or tag…">
+      <button class="icon-btn-sm" id="newSearchBtn">+ New search</button>
+      <button class="icon-btn-sm" id="savedReload">↻ Reload</button>
     </div>
-  </aside>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:30px"></th><th>Tag</th><th>Query</th><th>Corpus · model</th><th>Date range</th><th>Threshold</th><th></th></tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
 
-  <div id="toast" class="toast"></div>
+    <div class="section-label">Filters</div>
+    <div class="filters-panel">
+      <div class="sub">Applied to export below, and saved with the search when you tag it.</div>
+      <div class="filters-grid">
+        <div class="field"><label>Date from</label><input type="date" id="ex-dateFrom"></div>
+        <div class="field"><label>Date to</label><input type="date" id="ex-dateTo"></div>
+        <div class="field"><label>Vehicle ID</label><input id="ex-vehicle" placeholder="e.g. truck-808, truck-810"></div>
+        <div class="field"><label>Drive ID (run_uuid)</label><input id="ex-drive" placeholder="e.g. 019eb27f-…"></div>
+        <div class="field"><label>Data Explorer segment set (superset)</label><input id="ex-dxset" placeholder="type a keyword to search sets…"><div class="hint">keeps only chunks whose segment_id is in this dataset</div></div>
+        <div class="field"><label>Lance dataset downsample</label><input id="ex-lance" placeholder="s3://…/seg_map.parquet"><div class="hint">segment cross-ref — keeps only chunks present in this downsample</div></div>
+      </div>
+    </div>
 
-  <script src="/static/app.js"></script>
+    <div class="section-label">Export</div>
+    <div class="export-panel">
+      <div class="export-top">
+        <h4>Export</h4>
+        <span class="mech-badge" id="mechBadge">instant</span>
+      </div>
+      <div class="selection-note" id="selectionNote"></div>
+      <div class="carried-note" id="carriedNote"></div>
+
+      <div class="subsection">
+        <h5>Cutoff</h5>
+        <div class="mode-desc" style="margin-bottom:10px;">What's stored is always a search vector, a threshold, and similarity scores. Top-K is just a way to <i>specify</i> the cutoff — typing a K shows the equivalent τ.</div>
+        <div class="segmented" id="cutoffSeg">
+          <button class="active" data-mode="threshold">Threshold (τ)</button>
+          <button data-mode="topk">Top-K</button>
+        </div>
+        <div class="cutoff-field" id="cutoffField"></div>
+      </div>
+
+      <div class="subsection">
+        <h5>Sample output as</h5>
+        <div class="pillgroup" id="sampleSeg">
+          <button class="active" data-mode="interval">Interval</button>
+          <button data-mode="segment">Segment</button>
+        </div>
+        <div class="mode-desc" id="sampleDesc"></div>
+      </div>
+
+      <div class="toggle-row">
+        <div><div class="toggle-label">Deduplicate by segment</div><div class="toggle-sub" id="dedupSub"></div></div>
+        <label class="switch" id="dedupSwitch"><input type="checkbox" id="dedupInput" checked><span class="slider-toggle"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div><div class="toggle-label">Register as Data Explorer segment set</div><div class="toggle-sub">Makes the export browsable and cross-referenceable in DX</div></div>
+        <label class="switch"><input type="checkbox" id="segsetInput"><span class="slider-toggle"></span></label>
+      </div>
+
+      <div class="export-action">
+        <button class="btn-export" id="exportBtn">⬇ Export</button>
+        <div class="export-note" id="exportNote"></div>
+        <div class="job-status" id="jobStatus"></div>
+      </div>
+    </div>
+
+    <div class="scans-section" id="scansSection" style="display:none;">
+      <div class="section-label" style="display:flex; align-items:center; justify-content:space-between;">
+        <span>Recent scans</span>
+        <button class="icon-btn-sm" id="scansReload">↻ Reload</button>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Launched</th><th>Scan</th><th>Tags (@threshold)</th><th>Filters</th><th>Status</th><th>Output (segments.lance)</th><th>Data Explorer (segment set)</th></tr></thead>
+          <tbody id="scansBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- save drawer (search page only) -->
+<div class="overlay" id="overlay"></div>
+<div class="drawer" id="drawer">
+  <div class="drawer-head">
+    <div><h3>Save search</h3><p>You'll configure and run the export on the next screen.</p></div>
+    <button class="close-btn" id="drawerClose">×</button>
+  </div>
+  <div class="drawer-body">
+    <div class="dsection">
+      <h5>Current search vector</h5>
+      <div class="vec-summary" id="vecSummaryBox"></div>
+    </div>
+    <div class="dsection">
+      <h5>Tag</h5>
+      <div class="field2"><input id="tagInput" placeholder="e.g. left-turn-v2"></div>
+    </div>
+    <button class="btn-export instant" style="width:100%;" id="finalSaveBtn">💾 Save</button>
+    <div id="saveNote" class="note"></div>
+    <div class="drawer-next-note">Saving jumps you straight to Saved searches, with this row selected and ready to export.</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
 </body>
 </html>
