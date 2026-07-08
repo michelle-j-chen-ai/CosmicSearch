@@ -409,7 +409,6 @@ async function openSweep() {
   if (!state.query) { showToast("Run a search first"); return; }
   state.sweepActive = true;
   $("sweepPanel").classList.add("open");
-  $("resultsGrid").classList.add("compact");
   setActiveStep("thresh");
   await refreshSweep();   // fetches the stratified sample + renders it in the grid
   $("sweepPanel").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -469,13 +468,26 @@ function drawSweep() {
     <text x="${tk((lo + hi) / 2)}" y="${H - 8}" fill="#55555e" font-size="11" font-family="IBM Plex Mono" text-anchor="middle">${((lo + hi) / 2).toFixed(2)}</text>
     <text x="${tk(hi)}" y="${H - 8}" fill="#55555e" font-size="11" font-family="IBM Plex Mono" text-anchor="end">${hi.toFixed(2)}</text>`;
   svg.innerHTML = bars + axis + ticks + line;
-  let dragging = false;
-  const valueAt = (clientX) => { const r = svg.getBoundingClientRect(); const ux = (clientX - r.left) / r.width * W; return lo + ((ux - padL) / (W - padL - padR)) * span; };
-  const move = (e) => { state.tempTau = Math.max(lo, Math.min(hi, valueAt(e.clientX))); updateSweepStats(); drawSweep(); };
-  svg.onpointerdown = (e) => { dragging = true; move(e); };
-  svg.onpointermove = (e) => { if (dragging) move(e); };
-  window.onpointerup = () => { dragging = false; };
+  // Bind drag handlers ONCE on the <svg> (survives innerHTML redraws). Drag state +
+  // value mapping read live from state.sweep, so the τ line tracks the pointer.
+  if (!svg._sweepBound) {
+    svg._sweepBound = true;
+    svg.addEventListener("pointerdown", (e) => { _sweepDragging = true; try { svg.setPointerCapture(e.pointerId); } catch (_e) { } _sweepDragTo(e.clientX); e.preventDefault(); });
+    svg.addEventListener("pointermove", (e) => { if (_sweepDragging) _sweepDragTo(e.clientX); });
+    window.addEventListener("pointerup", () => { _sweepDragging = false; });
+  }
   updateSweepStats();
+}
+let _sweepDragging = false;
+function _sweepDragTo(clientX) {
+  const sw = state.sweep; if (!sw) return;
+  const svg = $("sweepSvg"), W = 1000, padL = 10, padR = 10;
+  const lo = sw.edges[0], hi = sw.edges[sw.edges.length - 1], span = (hi - lo) || 1;
+  const r = svg.getBoundingClientRect();
+  const ux = (clientX - r.left) / r.width * W;
+  state.tempTau = Math.max(lo, Math.min(hi, lo + ((ux - padL) / (W - padL - padR)) * span));
+  updateSweepStats();
+  drawSweep();
 }
 function _clipsAtOrAbove(v) {
   const sw = state.sweep; let c = 0;
