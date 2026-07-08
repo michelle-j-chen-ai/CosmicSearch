@@ -1887,6 +1887,14 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 filter_key, filter_ids = _scan_downsample_ids(req.filter_lance_uri.strip())
             except (ValueError, botocore.exceptions.ClientError) as exc:
                 raise HTTPException(400, f"could not read downsample dataset: {exc}")
+        # Resolve the DX segment set to its external segment_ids so the worker can restrict
+        # output to the set (the scan corpus has no dx column; matching is by segment_id).
+        seg_set_ids: list[str] = []
+        if req.segment_set_uuid:
+            try:
+                seg_set_ids = sorted(dora_client.fetch_segment_ids(req.segment_set_uuid))
+            except dora_client.DoraUnavailable as exc:
+                raise HTTPException(400, f"could not resolve segment set: {exc}")
         try:
             res = nls_launcher.launch_segment_scan(
                 search_vectors=search_vectors,
@@ -1901,6 +1909,7 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 filter_lance_uri=req.filter_lance_uri or "",
                 filter_key=filter_key,
                 filter_segment_ids=filter_ids,
+                segment_set_ids=seg_set_ids,
                 vehicle=req.vehicle or "",
                 drive_id=req.drive_id or "",
                 merge_intervals=bool(req.merge_intervals),

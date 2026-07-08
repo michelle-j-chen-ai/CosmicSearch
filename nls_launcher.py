@@ -172,6 +172,7 @@ def launch_segment_scan(
     filter_lance_uri: str = "",
     filter_key: str = "",
     filter_segment_ids: list[str] | None = None,
+    segment_set_ids: list[str] | None = None,
     vehicle: str = "",
     drive_id: str = "",
     merge_intervals: bool = True,
@@ -218,6 +219,10 @@ def launch_segment_scan(
         # passed inline so the worker filters output to these segments WITHOUT listing S3.
         "filter_key": filter_key or "",
         "filter_segment_ids": list(filter_segment_ids or []),
+        # DX segment-set membership (external segment_ids resolved app-side); the worker
+        # keeps clips whose segment is in this set. Separate from the lance downsample so
+        # both can apply together.
+        "segment_set_ids": list(segment_set_ids or []),
     }
     ec["filters"] = filters
     if sid:
