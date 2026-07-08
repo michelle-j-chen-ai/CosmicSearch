@@ -116,7 +116,13 @@
           <div class="field"><label>Date to</label><input type="date" id="sf-dateTo"></div>
           <div class="field"><label>Vehicle ID</label><input id="sf-vehicle" placeholder="e.g. truck-808, truck-810"></div>
           <div class="field"><label>Drive ID (run_uuid)</label><input id="sf-drive" placeholder="e.g. 019eb27f-…"></div>
-          <div class="field"><label>Data Explorer segment set</label><input id="sf-dxset" placeholder="type a keyword to search sets…"><div class="hint" id="sf-dxset-note"></div></div>
+          <div class="field"><label>Data Explorer segment set</label>
+            <div class="combo" id="sf-dxset-combo">
+              <input id="sf-dxset" autocomplete="off" placeholder="type a keyword to search sets…">
+              <div class="combo-menu hidden" id="sf-dxset-menu" role="listbox"></div>
+            </div>
+            <div class="hint" id="sf-dxset-note"></div>
+          </div>
           <div class="field"><label>Lance dataset downsample</label><input id="sf-lance" placeholder="s3://…/seg_map.parquet"><div class="hint" id="sf-lance-note">preview only this downsample while browsing</div></div>
         </div>
         <button class="rail-btn primary" style="width:auto; padding:9px 22px; margin-top:14px;" id="applyFiltersBtn">Apply — update view</button>

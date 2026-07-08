@@ -32,6 +32,7 @@ const state = {
   searchSegUuid: null, searchSegName: null,
   // threshold
   tempTau: null, confirmedTau: null, suggestedTau: null,
+  tauUserSet: false,         // true once the user drags/confirms τ (then labels stop moving it)
   sweep: null,               // {edges,counts,total,min,max,mean, up[], down[]}
   sweepActive: false,        // grid shows the stratified boundary sample while sweeping
   sweepSample: [],           // active-learning batch from /api/threshold_search
@@ -105,6 +106,7 @@ function wireEvents() {
 
   $("filtersChip").onclick = toggleSearchFilters;
   $("applyFiltersBtn").onclick = applySearchFilters;
+  wireDxCombo();
 
   $("pagePrev").onclick = () => reload({ page: state.page - 1 });
   $("pageNext").onclick = () => reload({ page: state.page + 1 });
@@ -183,22 +185,48 @@ function toggleSearchFilters() {
   const p = $("searchFiltersPanel");
   p.style.display = p.style.display === "none" ? "block" : "none";
 }
-// Resolve the free-text segment-set keyword to a DORA set uuid (no dropdown UI).
-async function resolveSearchSegset() {
-  const kw = $("sf-dxset").value.trim();
-  if (!kw) { state.searchSegUuid = null; state.searchSegName = null; $("sf-dxset-note").textContent = ""; return; }
-  try {
-    const sets = await fetch("/api/segment_sets?name_filter=" + encodeURIComponent(kw)).then((r) => r.json());
-    if (sets && sets.length) {
-      const s = sets[0];
-      state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`;
-      $("sf-dxset-note").textContent = `using ${s.name} v${s.version} (${fmtInt(s.num_segments)} segs)` + (sets.length > 1 ? ` · ${sets.length} matched, using first` : "");
-      fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
-    } else { state.searchSegUuid = null; state.searchSegName = null; $("sf-dxset-note").textContent = "no Data Explorer set matched that keyword"; }
-  } catch (e) { state.searchSegUuid = null; $("sf-dxset-note").textContent = "couldn't reach Data Explorer"; }
+// Data Explorer segment-set combobox: type -> live DORA search -> dropdown -> pick.
+let _dxTimer = null, _dxItems = [];
+function wireDxCombo() {
+  const inp = $("sf-dxset");
+  inp.addEventListener("input", () => {
+    clearTimeout(_dxTimer);
+    state.searchSegUuid = null; state.searchSegName = null;   // editing abandons the pick
+    $("sf-dxset-combo").classList.remove("chosen");
+    const v = inp.value.trim();
+    if (v.length < 2) { hideDxMenu(); $("sf-dxset-note").textContent = v ? "keep typing… (min 2 characters)" : ""; return; }
+    _dxTimer = setTimeout(() => loadDxSets(v), 300);
+  });
+  inp.addEventListener("focus", () => { if (_dxItems.length && inp.value.trim().length >= 2 && !$("sf-dxset-combo").classList.contains("chosen")) showDxMenu(); });
+  inp.addEventListener("blur", () => setTimeout(hideDxMenu, 150));
 }
-async function applySearchFilters() {
-  await resolveSearchSegset();
+async function loadDxSets(kw) {
+  $("sf-dxset-note").textContent = "loading segment sets…";
+  try {
+    const sets = await fetch("/api/segment_sets?name_filter=" + encodeURIComponent(kw)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); });
+    _dxItems = sets || [];
+    const menu = $("sf-dxset-menu");
+    if (!_dxItems.length) { menu.innerHTML = '<div class="combo-msg">no sets match that name</div>'; showDxMenu(); $("sf-dxset-note").textContent = "no sets match that name"; return; }
+    menu.innerHTML = _dxItems.map((s, i) => `<div class="combo-opt" data-i="${i}" role="option"><span class="opt-name">${escapeHtml(s.name)}</span><span class="opt-meta">v${escapeHtml(String(s.version))} · ${fmtInt(s.num_segments)} segments</span></div>`).join("");
+    menu.querySelectorAll(".combo-opt").forEach((o) => o.addEventListener("mousedown", (e) => { e.preventDefault(); chooseDx(_dxItems[parseInt(o.dataset.i, 10)]); }));
+    showDxMenu();
+    $("sf-dxset-note").textContent = `${_dxItems.length} set${_dxItems.length > 1 ? "s" : ""} — pick one to downsample`;
+  } catch (e) { $("sf-dxset-note").textContent = "couldn't reach Data Explorer: " + e.message; hideDxMenu(); }
+}
+function chooseDx(s) {
+  if (!s) return;
+  state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`;
+  $("sf-dxset").value = state.searchSegName;
+  $("sf-dxset-combo").classList.add("chosen");
+  $("sf-dxset-note").textContent = `using ${s.name} v${s.version} (${fmtInt(s.num_segments)} segs)`;
+  hideDxMenu();
+  fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
+  if (state.query) reload({ page: 0 });
+}
+function showDxMenu() { $("sf-dxset-menu").classList.remove("hidden"); }
+function hideDxMenu() { $("sf-dxset-menu").classList.add("hidden"); }
+
+function applySearchFilters() {
   $("filtersChip").classList.add("active");
   $("filtersChip").textContent = "⚙ filters & view (active)";
   if (state.query) reload({ page: 0 });
@@ -366,18 +394,40 @@ function vote(chunkId, dir) {
   const cur = state.marks[chunkId];
   if (cur && cur.mark === dir) delete state.marks[chunkId];
   else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, rank: h.rank, score: h.score };
+  // Toggle ONLY the clicked card in place — never re-render the whole grid (that
+  // would reload every video on every click).
+  const m = state.marks[chunkId];
+  const card = $("resultsGrid").querySelector(`.card[data-chunk="${(window.CSS && CSS.escape) ? CSS.escape(chunkId) : chunkId}"]`);
+  if (card) {
+    card.classList.toggle("voted-up", !!m && m.mark === "up");
+    card.classList.toggle("voted-down", !!m && m.mark === "down");
+    card.querySelector(".vote-btn.up").classList.toggle("active", !!m && m.mark === "up");
+    card.querySelector(".vote-btn.down").classList.toggle("active", !!m && m.mark === "down");
+  }
   updateRail();
-  renderGrid();
-  // While sweeping: reflect the new label on the chart immediately (local — marks
-  // carry real scores), then (debounced) pull a FRESH stratified boundary batch +
-  // re-fit from the backend — the active-learning loop. Each fit is logged to
-  // threshold_episodes, so the feedback accumulates for the linear policy.
-  if (state.sweepActive && state.sweep) { drawSweep(); scheduleSweepRefetch(); }
+  // While sweeping: plot the label immediately (local), then (debounced) re-fit the
+  // threshold from the backend so τ moves with the labels — WITHOUT replacing the
+  // stratified grid (no video reload). Each fit is logged to threshold_episodes.
+  if (state.sweepActive && state.sweep) { drawSweep(); scheduleFit(); }
 }
-let _sweepTimer = null;
-function scheduleSweepRefetch() {
-  clearTimeout(_sweepTimer);
-  _sweepTimer = setTimeout(() => { if (state.sweepActive) refreshSweep(); }, 700);
+let _fitTimer = null;
+function scheduleFit() { clearTimeout(_fitTimer); _fitTimer = setTimeout(fitOnly, 500); }
+async function fitOnly() {
+  if (!state.sweepActive) return;
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "" }));
+  const f = _searchFilters();
+  try {
+    const thr = await fetch("/api/threshold_search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
+    if (!thr) return;
+    state.suggestedTau = thr.suggested_threshold;
+    const fitTau = thr.threshold;
+    // Move τ to the fresh fit/suggestion unless the user has manually set it.
+    if (!state.tauUserSet && (fitTau != null || state.suggestedTau != null)) state.tempTau = (fitTau != null) ? fitTau : state.suggestedTau;
+    const fit = thr.fit;
+    if (fit && fitTau != null) $("threshSub").textContent = `fit τ ${fitTau.toFixed(3)} · P ${(100 * fit.precision).toFixed(0)}% · R ${(100 * fit.recall).toFixed(0)}% · F1 ${(100 * fit.f1).toFixed(0)}% (${fit.n_pos}👍/${fit.n_neg}👎)`;
+    else if (state.suggestedTau != null) $("threshSub").textContent = `suggested τ ${state.suggestedTau.toFixed(3)} — label 👍/👎 to fit`;
+    drawSweep();
+  } catch (e) { /* transient */ }
 }
 function _markScores() {
   const up = [], down = [];
@@ -408,6 +458,9 @@ function setActiveStep(step) {
 async function openSweep() {
   if (!state.query) { showToast("Run a search first"); return; }
   state.sweepActive = true;
+  // A confirmed τ stays put; otherwise let labels drive it.
+  if (state.confirmedTau != null) { state.tempTau = state.confirmedTau; state.tauUserSet = true; }
+  else { state.tempTau = null; state.tauUserSet = false; }
   $("sweepPanel").classList.add("open");
   setActiveStep("thresh");
   await refreshSweep();   // fetches the stratified sample + renders it in the grid
@@ -486,6 +539,7 @@ function _sweepDragTo(clientX) {
   const r = svg.getBoundingClientRect();
   const ux = (clientX - r.left) / r.width * W;
   state.tempTau = Math.max(lo, Math.min(hi, lo + ((ux - padL) / (W - padL - padR)) * span));
+  state.tauUserSet = true;   // manual drag pins τ; labels no longer move it
   updateSweepStats();
   drawSweep();
 }
@@ -511,6 +565,7 @@ function updateSweepStats() {
 function confirmThreshold() {
   if (state.tempTau == null) return;
   state.confirmedTau = state.tempTau;
+  state.tauUserSet = true;
   $("threshVal").textContent = state.confirmedTau.toFixed(3);
   $("threshSummary").textContent = `τ ${state.confirmedTau.toFixed(3)}`;
   $("threshSub").textContent = "Set from sweep";
