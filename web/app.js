@@ -129,6 +129,7 @@ function wireEvents() {
   $("savedReload").onclick = loadSaved;
   $("newSearchBtn").onclick = () => setPage("search");
   $("savedFilter").oninput = renderTable;
+  $("modelFilter").onchange = renderTable;
   $("scansReload").onclick = loadScanJobs;
   $("tbody").onclick = (e) => {
     const b = e.target.closest("button.resume-link");
@@ -623,18 +624,33 @@ async function loadSaved() {
   renderTable();
   renderExportPanel();
 }
-// A saved search is usable only against the embedding space it was built in, so
-// the table lists only rows matching the currently loaded corpus.
-function _corpusMatch(e) {
-  if (!state.embeddingsUri) return true;                 // corpus not loaded yet -> show all
-  if (e.embeddings_uri) return e.embeddings_uri === state.embeddingsUri;
-  if (state.corpus && e.vec_dim) return e.vec_dim === state.corpus.dim;  // legacy rows w/o uri
-  return false;
+function _rowModel(e) { return e.model_label || _uriShort(e.model_uri) || "base"; }
+// Populate the model dropdown: loaded model first (default selection), then the
+// other models present in history, then "All models". Rebuilt only when the set
+// changes, preserving the user's current pick.
+function _syncModelFilter(all) {
+  const sel = $("modelFilter");
+  const loaded = state.corpus ? state.corpus.model : null;
+  const models = [...new Set(all.map(_rowModel))].filter(Boolean).sort();
+  const sig = (loaded || "") + "::" + models.join("|");
+  if (sel._sig === sig) return;
+  sel._sig = sig;
+  const seen = new Set(); const opts = [];
+  if (loaded) { opts.push(`<option value="${escapeHtml(loaded)}">${escapeHtml(loaded)} (loaded)</option>`); seen.add(loaded); }
+  models.forEach((m) => { if (!seen.has(m)) { opts.push(`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`); seen.add(m); } });
+  opts.push(`<option value="__all__">All models</option>`);
+  const prev = sel.value;
+  sel.innerHTML = opts.join("");
+  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;   // keep user's pick
+  else sel.value = (loaded && seen.has(loaded)) ? loaded : "__all__";             // default: loaded model
 }
 function renderTable() {
   const all = state.savedRows || [];
   const q = ($("savedFilter").value || "").trim().toLowerCase();
-  const matched = all.map((e, i) => ({ e, i })).filter(({ e }) => _corpusMatch(e));
+  _syncModelFilter(all);
+  const modelSel = $("modelFilter").value;
+  const matched = all.map((e, i) => ({ e, i }))
+    .filter(({ e }) => modelSel === "__all__" || _rowModel(e) === modelSel);
   const hidden = all.length - matched.length;
   $("savedCount").textContent = matched.length ? `(${matched.length})` : "";
   const body = matched.map(({ e, i }) => {
@@ -654,8 +670,8 @@ function renderTable() {
     </tr>`;
   }).join("");
   let html = body;
-  if (!body) html = `<tr><td colspan="7" style="color:var(--muted-2)">${all.length ? "No saved searches match this corpus / filter." : "No saved searches yet — run a search and Save."}</td></tr>`;
-  if (hidden > 0) html += `<tr><td colspan="7" style="color:var(--muted-2);font-size:12px;">${hidden} saved search${hidden === 1 ? "" : "es"} hidden — saved on a different corpus than the one loaded.</td></tr>`;
+  if (!body) html = `<tr><td colspan="7" style="color:var(--muted-2)">${all.length ? "No saved searches for this model / filter — pick another model above." : "No saved searches yet — run a search and Save."}</td></tr>`;
+  if (hidden > 0 && modelSel !== "__all__") html += `<tr><td colspan="7" style="color:var(--muted-2);font-size:12px;">${hidden} search${hidden === 1 ? "" : "es"} from other models hidden — choose “All models” above to see them.</td></tr>`;
   $("tbody").innerHTML = html;
 }
 async function resumeSession(id) {
