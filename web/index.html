@@ -215,7 +215,13 @@
         <div class="field"><label>Date to</label><input type="date" id="ex-dateTo"></div>
         <div class="field"><label>Vehicle ID</label><input id="ex-vehicle" placeholder="e.g. truck-808, truck-810"></div>
         <div class="field"><label>Drive ID (run_uuid)</label><input id="ex-drive" placeholder="e.g. 019eb27f-…"></div>
-        <div class="field"><label>Data Explorer segment set (superset)</label><input id="ex-dxset" placeholder="type a keyword to search sets…"><div class="hint">keeps only chunks whose segment_id is in this dataset</div></div>
+        <div class="field"><label>Data Explorer segment set (superset)</label>
+          <div class="combo" id="ex-dxset-combo">
+            <input id="ex-dxset" autocomplete="off" placeholder="type a keyword to search sets…">
+            <div class="combo-menu hidden" id="ex-dxset-menu" role="listbox"></div>
+          </div>
+          <div class="hint" id="ex-dxset-note">keeps only chunks whose segment_id is in this dataset</div>
+        </div>
         <div class="field"><label>Lance dataset downsample</label><input id="ex-lance" placeholder="s3://…/seg_map.parquet"><div class="hint">segment cross-ref — keeps only chunks present in this downsample</div></div>
       </div>
     </div>

@@ -28,8 +28,9 @@ const state = {
   windowReq: null,
   resumeVec: null,
   resumeLabel: "",
-  // filters resolved from the search-page panel
+  // filters resolved from the search-page panel + the saved-searches (export) panel
   searchSegUuid: null, searchSegName: null,
+  exportSegUuid: null, exportSegName: null,
   // threshold
   tempTau: null, confirmedTau: null, suggestedTau: null,
   tauUserSet: false,         // true once the user drags/confirms τ (then labels stop moving it)
@@ -187,45 +188,56 @@ function toggleSearchFilters() {
   p.style.display = p.style.display === "none" ? "block" : "none";
 }
 // Data Explorer segment-set combobox: type -> live DORA search -> dropdown -> pick.
-let _dxTimer = null, _dxItems = [];
-function wireDxCombo() {
-  const inp = $("sf-dxset");
+// A factory so both the Search filter and the Saved-searches (export) filter get
+// the same type-ahead dropdown, each writing to its own state.
+function _makeDxCombo(cfg) {
+  const inp = $(cfg.inputId), combo = $(cfg.comboId), menu = $(cfg.menuId), note = $(cfg.noteId);
+  if (!inp) return;
+  let timer = null, items = [];
+  const show = () => menu.classList.remove("hidden");
+  const hide = () => menu.classList.add("hidden");
   inp.addEventListener("input", () => {
-    clearTimeout(_dxTimer);
-    state.searchSegUuid = null; state.searchSegName = null;   // editing abandons the pick
-    $("sf-dxset-combo").classList.remove("chosen");
+    clearTimeout(timer);
+    combo.classList.remove("chosen");
+    cfg.onClear();
     const v = inp.value.trim();
-    if (v.length < 2) { hideDxMenu(); $("sf-dxset-note").textContent = v ? "keep typing… (min 2 characters)" : ""; return; }
-    _dxTimer = setTimeout(() => loadDxSets(v), 300);
+    if (v.length < 2) { hide(); if (note) note.textContent = v ? "keep typing… (min 2 characters)" : ""; return; }
+    timer = setTimeout(async () => {
+      if (note) note.textContent = "loading segment sets…";
+      try {
+        items = (await fetch("/api/segment_sets?name_filter=" + encodeURIComponent(v)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); })) || [];
+        if (!items.length) { menu.innerHTML = '<div class="combo-msg">no sets match that name</div>'; show(); if (note) note.textContent = "no sets match that name"; return; }
+        menu.innerHTML = items.map((s, i) => `<div class="combo-opt" data-i="${i}" role="option"><span class="opt-name">${escapeHtml(s.name)}</span><span class="opt-meta">v${escapeHtml(String(s.version))} · ${fmtInt(s.num_segments)} segments</span></div>`).join("");
+        menu.querySelectorAll(".combo-opt").forEach((o) => o.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          const s = items[parseInt(o.dataset.i, 10)];
+          inp.value = `${s.name} v${s.version}`;
+          combo.classList.add("chosen");
+          if (note) note.textContent = `using ${s.name} v${s.version} (${fmtInt(s.num_segments)} segs)`;
+          hide();
+          fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
+          cfg.onChoose(s);
+        }));
+        show();
+        if (note) note.textContent = `${items.length} set${items.length > 1 ? "s" : ""} — pick one to downsample`;
+      } catch (e) { if (note) note.textContent = "couldn't reach Data Explorer: " + e.message; hide(); }
+    }, 300);
   });
-  inp.addEventListener("focus", () => { if (_dxItems.length && inp.value.trim().length >= 2 && !$("sf-dxset-combo").classList.contains("chosen")) showDxMenu(); });
-  inp.addEventListener("blur", () => setTimeout(hideDxMenu, 150));
+  inp.addEventListener("focus", () => { if (items.length && inp.value.trim().length >= 2 && !combo.classList.contains("chosen")) show(); });
+  inp.addEventListener("blur", () => setTimeout(hide, 150));
 }
-async function loadDxSets(kw) {
-  $("sf-dxset-note").textContent = "loading segment sets…";
-  try {
-    const sets = await fetch("/api/segment_sets?name_filter=" + encodeURIComponent(kw)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); });
-    _dxItems = sets || [];
-    const menu = $("sf-dxset-menu");
-    if (!_dxItems.length) { menu.innerHTML = '<div class="combo-msg">no sets match that name</div>'; showDxMenu(); $("sf-dxset-note").textContent = "no sets match that name"; return; }
-    menu.innerHTML = _dxItems.map((s, i) => `<div class="combo-opt" data-i="${i}" role="option"><span class="opt-name">${escapeHtml(s.name)}</span><span class="opt-meta">v${escapeHtml(String(s.version))} · ${fmtInt(s.num_segments)} segments</span></div>`).join("");
-    menu.querySelectorAll(".combo-opt").forEach((o) => o.addEventListener("mousedown", (e) => { e.preventDefault(); chooseDx(_dxItems[parseInt(o.dataset.i, 10)]); }));
-    showDxMenu();
-    $("sf-dxset-note").textContent = `${_dxItems.length} set${_dxItems.length > 1 ? "s" : ""} — pick one to downsample`;
-  } catch (e) { $("sf-dxset-note").textContent = "couldn't reach Data Explorer: " + e.message; hideDxMenu(); }
+function wireDxCombo() {
+  _makeDxCombo({
+    inputId: "sf-dxset", comboId: "sf-dxset-combo", menuId: "sf-dxset-menu", noteId: "sf-dxset-note",
+    onClear: () => { state.searchSegUuid = null; state.searchSegName = null; },
+    onChoose: (s) => { state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`; if (state.query) reload({ page: 0 }); },
+  });
+  _makeDxCombo({
+    inputId: "ex-dxset", comboId: "ex-dxset-combo", menuId: "ex-dxset-menu", noteId: "ex-dxset-note",
+    onClear: () => { state.exportSegUuid = null; state.exportSegName = null; },
+    onChoose: (s) => { state.exportSegUuid = s.uuid; state.exportSegName = `${s.name} v${s.version}`; },
+  });
 }
-function chooseDx(s) {
-  if (!s) return;
-  state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`;
-  $("sf-dxset").value = state.searchSegName;
-  $("sf-dxset-combo").classList.add("chosen");
-  $("sf-dxset-note").textContent = `using ${s.name} v${s.version} (${fmtInt(s.num_segments)} segs)`;
-  hideDxMenu();
-  fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
-  if (state.query) reload({ page: 0 });
-}
-function showDxMenu() { $("sf-dxset-menu").classList.remove("hidden"); }
-function hideDxMenu() { $("sf-dxset-menu").classList.add("hidden"); }
 
 function applySearchFilters() {
   $("filtersChip").classList.add("active");
@@ -765,7 +777,7 @@ function _exportFilters() {
   return {
     from_date: $("ex-dateFrom").value || null, to_date: $("ex-dateTo").value || null,
     filter_lance_uri: _splitList($("ex-lance").value), vehicle: _splitList($("ex-vehicle").value), drive_id: _splitList($("ex-drive").value),
-    segment_set_uuid: null, segment_set_name: null,
+    segment_set_uuid: state.exportSegUuid, segment_set_name: state.exportSegName,
   };
 }
 function _exportFilename(resp, fb) { const n = resp.headers.get("X-NLS-Export-Name") || ""; return n ? n + ".csv" : fb; }
