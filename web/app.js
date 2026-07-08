@@ -20,7 +20,7 @@ const state = {
   label: "",
   mode: "search",            // search | refine | window | resume
   page: 0,
-  pageSize: 50,
+  pageSize: 24,
   total: 0,
   scoreHi: 0.4,
   hits: [],                  // current page hits
@@ -33,6 +33,9 @@ const state = {
   // threshold
   tempTau: null, confirmedTau: null, suggestedTau: null,
   sweep: null,               // {edges,counts,total,min,max,mean, up[], down[]}
+  sweepActive: false,        // grid shows the stratified boundary sample while sweeping
+  sweepSample: [],           // active-learning batch from /api/threshold_search
+  rendered: [],              // clips currently in the grid (for vote lookup)
   // saved searches
   savedRows: [], selected: new Set(),
   scanJobs: [],
@@ -108,7 +111,7 @@ function wireEvents() {
   $("jumpRankBtn").onclick = () => { const r = parseInt($("jumpRank").value, 10); if (r >= 1) reload({ start_rank: r }); };
   $("jumpSimBtn").onclick = () => { const s = parseFloat($("jumpSim").value); if (!Number.isNaN(s)) reload({ start_score: s }); };
   $("quickDedup").onchange = () => renderGrid();
-  $("perPage").onchange = () => { state.pageSize = parseInt($("perPage").value, 10) || 50; if (state.query) reload({ page: 0 }); };
+  $("perPage").onchange = () => { state.pageSize = parseInt($("perPage").value, 10) || 24; if (state.query) reload({ page: 0 }); };
 
   $("refineBtn").onclick = () => runRefine({ page: 0 });
   $("sweepBtn").onclick = openSweep;
@@ -303,7 +306,10 @@ function _dedupHits(hits) {
 function renderGrid() {
   const grid = $("resultsGrid");
   const compact = grid.classList.contains("compact");
-  const hits = _dedupHits(state.hits);
+  // While sweeping, the grid shows the stratified boundary sample (clips near the
+  // cutoff, where labels matter most) — the active-learning loop.
+  const hits = state.sweepActive ? (state.sweepSample || []) : _dedupHits(state.hits);
+  state.rendered = hits;
   const maxS = Math.max(state.scoreHi, 0.001);
   grid.innerHTML = hits.map((h) => {
     const m = state.marks[h.chunk_id];
@@ -314,7 +320,7 @@ function renderGrid() {
       <div class="thumb">
         <span class="rank-badge">#${fmtInt(h.rank)}</span>
         <span class="score-badge" style="background:${col}">${h.score.toFixed(3)}</span>
-        <video preload="metadata" playsinline src="${vsrc}#t=0.1"></video>
+        <video controls preload="metadata" playsinline src="${vsrc}#t=0.1"></video>
       </div>
       <div class="card-body">
         <div class="confidence-bar"><div class="confidence-fill" style="width:${Math.max(h.score, 0) / maxS * 100}%; background:${col}"></div></div>
@@ -341,7 +347,7 @@ function renderQueryStrip(data) {
   if (!clips || !clips.length) { strip.classList.add("hidden"); strip.innerHTML = ""; return; }
   const cards = clips.map((h) => `<div class="card"><div class="thumb">
       <span class="score-badge" style="background:${scoreColor(h.score)}">${h.score.toFixed(3)}</span>
-      <video preload="metadata" playsinline src="/api/video?uri=${encodeURIComponent(h.source_media_uri || "")}#t=0.1"></video>
+      <video controls preload="metadata" playsinline src="/api/video?uri=${encodeURIComponent(h.source_media_uri || "")}#t=0.1"></video>
       <span class="card-badge">query</span></div></div>`).join("");
   strip.innerHTML = `<div class="query-strip-head">Query clip — averaged ${fmtInt(data.query_chunk_count)} chunk(s)${data.query_span_seconds ? " · " + fmtInt(data.query_span_seconds) + "s" : ""}</div><div class="query-strip-row">${cards}</div>`;
   strip.classList.remove("hidden");
@@ -355,13 +361,20 @@ function renderPager() {
 
 /* ===================== votes / rail ===================== */
 function vote(chunkId, dir) {
-  const h = state.hits.find((x) => x.chunk_id === chunkId); if (!h) return;
+  const h = (state.rendered || []).find((x) => x.chunk_id === chunkId) || state.hits.find((x) => x.chunk_id === chunkId); if (!h) return;
   const cur = state.marks[chunkId];
   if (cur && cur.mark === dir) delete state.marks[chunkId];
   else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, rank: h.rank, score: h.score };
   updateRail();
   renderGrid();
-  if ($("sweepPanel").classList.contains("open")) refreshSweep();
+  // While sweeping, reflect the new label on the chart immediately (local — the
+  // marks carry real scores), without re-fetching the whole stratified batch.
+  if (state.sweepActive && state.sweep) drawSweep();
+}
+function _markScores() {
+  const up = [], down = [];
+  Object.values(state.marks).forEach((m) => { if (typeof m.score === "number") (m.mark === "up" ? up : down).push(m.score); });
+  return { up, down };
 }
 function _counts() {
   const v = Object.values(state.marks);
@@ -386,14 +399,19 @@ function setActiveStep(step) {
 /* ===================== threshold sweep (real data) ===================== */
 async function openSweep() {
   if (!state.query) { showToast("Run a search first"); return; }
+  state.sweepActive = true;
   $("sweepPanel").classList.add("open");
   $("resultsGrid").classList.add("compact");
-  renderGrid();
   setActiveStep("thresh");
-  await refreshSweep();
+  await refreshSweep();   // fetches the stratified sample + renders it in the grid
   $("sweepPanel").scrollIntoView({ behavior: "smooth", block: "start" });
 }
-function closeSweep() { $("sweepPanel").classList.remove("open"); $("resultsGrid").classList.remove("compact"); renderGrid(); }
+function closeSweep() {
+  state.sweepActive = false;
+  $("sweepPanel").classList.remove("open");
+  $("resultsGrid").classList.remove("compact");
+  renderGrid();
+}
 
 async function refreshSweep() {
   const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "" }));
@@ -408,13 +426,19 @@ async function refreshSweep() {
     state.suggestedTau = thr ? thr.suggested_threshold : null;
     const fitTau = thr ? thr.threshold : null;
     state.sweep = { edges: hist.edges, counts: hist.counts, total: hist.total, min: hist.min, max: hist.max, mean: hist.mean, up: (thr && thr.up_scores) || [], down: (thr && thr.down_scores) || [] };
+    // Stratified boundary batch to label next (active learning). Fall back to the
+    // current results if the backend returned none (e.g. before any labels).
+    state.sweepSample = (thr && thr.sample && thr.sample.length) ? thr.sample : _dedupHits(state.hits);
     if (state.tempTau == null) state.tempTau = state.confirmedTau != null ? state.confirmedTau : (fitTau != null ? fitTau : (state.suggestedTau != null ? state.suggestedTau : hist.mean));
+    if (state.sweepActive) renderGrid();
     drawSweep();
   } catch (e) { showToast("Sweep failed: " + e.message); }
 }
 
 function drawSweep() {
   const sw = state.sweep; if (!sw) return;
+  // Ticks track the live labels (real per-clip scores from state.marks).
+  const ms = _markScores(); sw.up = ms.up; sw.down = ms.down;
   const svg = $("sweepSvg");
   const W = 1000, H = 180, padL = 10, padR = 10, padB = 28;
   const lo = sw.edges[0], hi = sw.edges[sw.edges.length - 1], span = (hi - lo) || 1;
