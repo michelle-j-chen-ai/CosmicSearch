@@ -340,6 +340,7 @@ function renderGrid() {
     card.querySelector(".expand-toggle").onclick = (e) => e.target.nextElementSibling.classList.toggle("open");
   });
   if (!compact) grid.classList.remove("compact");
+  if (state.sweepActive) $("gridStatus").textContent = "Labeling clips near the cutoff (stratified sample) — vote to refine τ";
 }
 function renderQueryStrip(data) {
   const strip = $("queryStrip");
@@ -367,9 +368,16 @@ function vote(chunkId, dir) {
   else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, rank: h.rank, score: h.score };
   updateRail();
   renderGrid();
-  // While sweeping, reflect the new label on the chart immediately (local — the
-  // marks carry real scores), without re-fetching the whole stratified batch.
-  if (state.sweepActive && state.sweep) drawSweep();
+  // While sweeping: reflect the new label on the chart immediately (local — marks
+  // carry real scores), then (debounced) pull a FRESH stratified boundary batch +
+  // re-fit from the backend — the active-learning loop. Each fit is logged to
+  // threshold_episodes, so the feedback accumulates for the linear policy.
+  if (state.sweepActive && state.sweep) { drawSweep(); scheduleSweepRefetch(); }
+}
+let _sweepTimer = null;
+function scheduleSweepRefetch() {
+  clearTimeout(_sweepTimer);
+  _sweepTimer = setTimeout(() => { if (state.sweepActive) refreshSweep(); }, 700);
 }
 function _markScores() {
   const up = [], down = [];
