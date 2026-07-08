@@ -38,7 +38,7 @@ LOGGER = logging.getLogger("nls_search_app.nls_launcher")
 # with nls_scan/purpose/prod.yaml; overridable per-deploy via NLS_SCAN_IMAGE.
 _DEFAULT_IMAGE = (
     "us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds"
-    "@sha256:81d506fc46ff8179cae0b80d69b177b766d835cac327cd0e8cb6d435d72cbbd9"
+    "@sha256:cd1ce8debecfbc8a46e9a5fe8948bc1ff6abd3c2305eef17948188477d546f06"
 )
 _OCI_ENDPOINT = "https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com"
 _CUSTOMER_RESOURCE = "autolabeling"
