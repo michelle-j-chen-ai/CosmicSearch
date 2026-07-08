@@ -1962,6 +1962,12 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
     )
     res["deduplicated"] = deduplicated
     res.setdefault("workload_id", res.get("execution_id"))
+    # A dedup hit returns only the existing workload id; the output Lance path is
+    # deterministic (output_dir/scan_id/segments.lance -- scan_id derives from the
+    # idem key), so reconstruct it here. This keeps EVERY response (fresh or deduped)
+    # carrying lance_uri, so a blocking caller can read the same output Lance either way.
+    if not res.get("lance_uri"):
+        res["lance_uri"] = f"{output_dir}/{scan_id}/segments.lance"
     if deduplicated:
         LOGGER.info(
             "deduplicated scan launch (idem=%s) -> existing workload %s",
