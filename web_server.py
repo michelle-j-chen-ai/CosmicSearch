@@ -2133,6 +2133,73 @@ def score_distribution(req: ExportRequest, request: Request) -> dict:
     return dist
 
 
+# --- learned threshold policy: cached weights per embedding space -----------
+# Serving predicts the suggested tau with a dot product over cached weights (no
+# fit on the request path). Fitting happens in a background thread as episodes
+# accumulate, or via POST /api/refit_policy. Falls back to the heuristic when no
+# policy is fitted yet (< ~20 labeled tunes for the corpus).
+_policy_cache: dict[str, tuple[dict | None, float]] = {}
+_policy_lock = threading.Lock()
+_POLICY_TTL_S = 300.0
+_policy_episode_count = 0
+
+
+def _load_policy(uri: str) -> dict | None:
+    now = time.time()
+    with _policy_lock:
+        ent = _policy_cache.get(uri or "")
+        if ent and (now - ent[1]) < _POLICY_TTL_S:
+            return ent[0]
+    pol = db.get_threshold_policy(uri or "")
+    with _policy_lock:
+        _policy_cache[uri or ""] = (pol, now)
+    return pol
+
+
+def _suggested_tau(uri: str, stats: dict) -> float:
+    """Learned policy prediction when one is fitted for this corpus, else heuristic."""
+    pol = _load_policy(uri)
+    if pol:
+        return search_engine.predict_threshold(stats, pol)
+    return search_engine.heuristic_threshold(stats)
+
+
+def _refit_policy(uri: str) -> dict | None:
+    """Fit + persist the ridge policy for one embedding space from its episodes."""
+    eps = [e for e in db.threshold_episodes() if (e.get("embeddings_uri") or "") == (uri or "")]
+    pol = search_engine.fit_threshold_policy(eps)
+    if pol:
+        pol["embeddings_uri"] = uri or ""
+        db.upsert_threshold_policy(pol)
+        with _policy_lock:
+            _policy_cache[uri or ""] = (pol, time.time())
+    return pol
+
+
+def _maybe_refit_policy_async(uri: str) -> None:
+    """Every few logged episodes, refit in the background (off the request path)."""
+    global _policy_episode_count
+    _policy_episode_count += 1
+    if _policy_episode_count % 5 != 0:
+        return
+    threading.Thread(target=_refit_policy, args=(uri,), daemon=True).start()
+
+
+@app.post("/api/refit_policy")
+def refit_policy(request: Request) -> dict:
+    """Fit + persist the learned threshold policy for the active corpus now.
+    Returns the fit summary (or a note when there aren't enough episodes yet)."""
+    _require_ready()
+    uri = _state["active_uri"]
+    pol = _refit_policy(uri)
+    if not pol:
+        return {"fitted": False, "embeddings_uri": uri,
+                "note": "Not enough labeled episodes yet for this corpus (need ~20). Heuristic stays live."}
+    return {"fitted": True, "embeddings_uri": uri, "feature_names": pol["feature_names"],
+            "weights": pol["weights"], "n_episodes": pol["n_episodes"],
+            "mae_policy": pol["mae_policy"], "mae_heuristic": pol["mae_heuristic"]}
+
+
 @app.post("/api/threshold_search")
 def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
     """Choose a similarity cutoff for the current query from labeled 👍/👎 marks,
@@ -2205,7 +2272,9 @@ def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
     # distribution, so a fresh tag gets a sensible tau before any labeling. When
     # there's no fit yet, it also centers the boundary sampling + histogram mark.
     stats = search_engine.score_stats(scores)
-    suggested = search_engine.heuristic_threshold(stats)
+    # Suggested (label-free) tau: the learned policy for this corpus if one is fitted,
+    # otherwise the mean+3*std heuristic. Cheap dot product on the request path.
+    suggested = _suggested_tau(uri, stats)
     tau_for_sampling = tau if tau is not None else suggested
     # Next active-labeling batch: boundary-biased, excludes already-labeled rows,
     # restricted to the same filtered candidate set the search is ranking.
@@ -2243,6 +2312,8 @@ def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
                 "n_neg": fit["n_neg"],
             }
         )
+        # Refresh the learned policy in the background as episodes accumulate.
+        _maybe_refit_policy_async(uri)
 
     hist = _score_histogram(scores, tau_for_sampling)
     return {

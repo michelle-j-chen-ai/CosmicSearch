@@ -41,6 +41,11 @@ _SCAN_TABLE = f"{SCHEMA_NAME}.scan_jobs"
 # threshold policy (see scripts/fit_threshold_policy.py); append-only.
 _EPISODE_TABLE = f"{SCHEMA_NAME}.threshold_episodes"
 _BARE_EPISODE = _EPISODE_TABLE.split(".")[-1]
+# Learned threshold policy: one row per embedding space (corpus). Holds the ridge
+# weights fitted from that corpus's episodes, so serving predicts the suggested tau
+# with a cheap dot product (no fit on the request path). See search_engine.fit_threshold_policy.
+_POLICY_TABLE = f"{SCHEMA_NAME}.threshold_policy"
+_BARE_POLICY = _POLICY_TABLE.split(".")[-1]
 
 _engine: Engine | None = None
 _engine_lock = threading.Lock()
@@ -155,6 +160,15 @@ _DDL = [
         objective          TEXT,
         n_pos              INTEGER,
         n_neg              INTEGER
+    )""",
+    f"""CREATE TABLE IF NOT EXISTS {_POLICY_TABLE} (
+        embeddings_uri    TEXT PRIMARY KEY,
+        feature_names     JSONB NOT NULL,
+        weights           JSONB NOT NULL,
+        n_episodes        INTEGER NOT NULL,
+        mae_policy        DOUBLE PRECISION,
+        mae_heuristic     DOUBLE PRECISION,
+        fitted_at         TIMESTAMPTZ NOT NULL DEFAULT now()
     )""",
 ]
 
@@ -499,7 +513,7 @@ def threshold_episodes(limit: int = 10000) -> list[dict]:
             rows = conn.execute(
                 text(
                     f"SELECT features, suggested_tau, fit_tau, f1, tag, objective, "
-                    f"n_pos, n_neg FROM {_BARE_EPISODE} "
+                    f"n_pos, n_neg, embeddings_uri, model_uri FROM {_BARE_EPISODE} "
                     f"ORDER BY created_at DESC LIMIT :lim"
                 ),
                 {"lim": int(limit)},
@@ -508,6 +522,57 @@ def threshold_episodes(limit: int = 10000) -> list[dict]:
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: threshold_episodes failed (%s): %s", type(exc).__name__, exc)
         return []
+
+
+_INSERT_POLICY = text(
+    f"""INSERT INTO {_BARE_POLICY}
+        (embeddings_uri, feature_names, weights, n_episodes, mae_policy, mae_heuristic, fitted_at)
+        VALUES (:embeddings_uri, CAST(:feature_names AS JSONB), CAST(:weights AS JSONB),
+                :n_episodes, :mae_policy, :mae_heuristic, now())
+        ON CONFLICT (embeddings_uri) DO UPDATE SET
+            feature_names = EXCLUDED.feature_names, weights = EXCLUDED.weights,
+            n_episodes = EXCLUDED.n_episodes, mae_policy = EXCLUDED.mae_policy,
+            mae_heuristic = EXCLUDED.mae_heuristic, fitted_at = now()"""
+)
+
+
+def upsert_threshold_policy(record: dict) -> bool:
+    """Persist the fitted ridge policy for one embedding space. Best-effort."""
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            conn.execute(_INSERT_POLICY, {
+                "embeddings_uri": record.get("embeddings_uri") or "",
+                "feature_names": json.dumps(record.get("feature_names") or []),
+                "weights": json.dumps(record.get("weights") or []),
+                "n_episodes": int(record.get("n_episodes") or 0),
+                "mae_policy": record.get("mae_policy"),
+                "mae_heuristic": record.get("mae_heuristic"),
+            })
+        return True
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: upsert_threshold_policy failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
+def get_threshold_policy(embeddings_uri: str) -> dict | None:
+    """The fitted policy for one embedding space, or None. Best-effort."""
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            row = conn.execute(
+                text(f"SELECT feature_names, weights, n_episodes, mae_policy, mae_heuristic "
+                     f"FROM {_BARE_POLICY} WHERE embeddings_uri = :uri"),
+                {"uri": embeddings_uri or ""},
+            ).mappings().first()
+        return dict(row) if row else None
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: get_threshold_policy failed (%s): %s", type(exc).__name__, exc)
+        return None
 
 
 def get_session(session_id: int) -> dict | None:

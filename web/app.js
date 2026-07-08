@@ -623,11 +623,21 @@ async function loadSaved() {
   renderTable();
   renderExportPanel();
 }
+// A saved search is usable only against the embedding space it was built in, so
+// the table lists only rows matching the currently loaded corpus.
+function _corpusMatch(e) {
+  if (!state.embeddingsUri) return true;                 // corpus not loaded yet -> show all
+  if (e.embeddings_uri) return e.embeddings_uri === state.embeddingsUri;
+  if (state.corpus && e.vec_dim) return e.vec_dim === state.corpus.dim;  // legacy rows w/o uri
+  return false;
+}
 function renderTable() {
-  const rows = state.savedRows || [];
+  const all = state.savedRows || [];
   const q = ($("savedFilter").value || "").trim().toLowerCase();
-  $("savedCount").textContent = rows.length ? `(${rows.length})` : "";
-  const body = rows.map((e, i) => {
+  const matched = all.map((e, i) => ({ e, i })).filter(({ e }) => _corpusMatch(e));
+  const hidden = all.length - matched.length;
+  $("savedCount").textContent = matched.length ? `(${matched.length})` : "";
+  const body = matched.map(({ e, i }) => {
     const hay = (e.tag + " " + (e.query || "")).toLowerCase();
     if (q && !hay.includes(q)) return "";
     const model = e.model_label || _uriShort(e.model_uri) || "base";
@@ -643,7 +653,10 @@ function renderTable() {
       <td>${e.id != null ? `<button class="resume-link" data-id="${e.id}">resume ↗</button>` : ""}</td>
     </tr>`;
   }).join("");
-  $("tbody").innerHTML = body || `<tr><td colspan="7" style="color:var(--muted-2)">No saved searches yet — run a search and Save.</td></tr>`;
+  let html = body;
+  if (!body) html = `<tr><td colspan="7" style="color:var(--muted-2)">${all.length ? "No saved searches match this corpus / filter." : "No saved searches yet — run a search and Save."}</td></tr>`;
+  if (hidden > 0) html += `<tr><td colspan="7" style="color:var(--muted-2);font-size:12px;">${hidden} saved search${hidden === 1 ? "" : "es"} hidden — saved on a different corpus than the one loaded.</td></tr>`;
+  $("tbody").innerHTML = html;
 }
 async function resumeSession(id) {
   setPage("search"); showToast("Loading saved search…");

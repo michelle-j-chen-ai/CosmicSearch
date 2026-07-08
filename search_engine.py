@@ -1417,3 +1417,82 @@ def heuristic_threshold(stats: dict, k: float = 3.0) -> float:
     """
     tau = float(stats.get("mean", 0.0)) + k * float(stats.get("std", 0.0))
     return float(min(max(tau, 0.05), 0.9))
+
+
+# ---------------------------------------------------------------------------
+# Learned threshold policy: a ridge regression tau = b + w . features fitted from
+# the logged tuning episodes of ONE embedding space. It replaces the fixed
+# `mean + 3*std` heuristic's single knob with data-driven weights over the whole
+# score-distribution shape. Fitting is offline/background; serving is a dot product.
+# ---------------------------------------------------------------------------
+
+# Feature columns the policy regresses on (a subset of score_stats). Order defines
+# the design-matrix / weight-vector column order and must stay stable across fit+serve.
+POLICY_FEATURES = ["mean", "std", "p90", "p99", "p99_9", "top_gap"]
+
+
+def fit_threshold_policy(
+    episodes: "list[dict]", *, lam: float = 1e-2, min_episodes: int = 20,
+    val_frac: float = 0.25, seed: int = 0,
+) -> dict | None:
+    """Fit ridge ``tau = b + w . POLICY_FEATURES`` from labeled tuning episodes.
+
+    Each episode contributes a row (its ``features`` = score_stats) and target
+    (its ``fit_tau`` = the F1-optimal cut found from that tune's labels). Returns
+    ``{feature_names, weights:[bias, w...], n_episodes, mae_policy, mae_heuristic}``
+    or ``None`` when there aren't yet ``min_episodes`` usable rows (caller keeps the
+    heuristic live). ``mae_*`` are held-out mean-abs-errors vs the target tau, so a
+    caller can see whether the policy actually beats the heuristic before trusting it.
+    """
+    xs, ys = [], []
+    for ep in episodes or []:
+        feats = ep.get("features") or {}
+        tau = ep.get("fit_tau")
+        if tau is None or not all(f in feats for f in POLICY_FEATURES):
+            continue
+        xs.append([float(feats[f]) for f in POLICY_FEATURES])
+        ys.append(float(tau))
+    if len(xs) < min_episodes:
+        return None
+    x = np.asarray(xs, dtype=np.float64)
+    y = np.asarray(ys, dtype=np.float64)
+
+    def _ridge(xt, yt):
+        xb = np.hstack([np.ones((xt.shape[0], 1)), xt])
+        reg = lam * np.eye(xb.shape[1]); reg[0, 0] = 0.0  # don't penalize intercept
+        return np.linalg.solve(xb.T @ xb + reg, xb.T @ yt)
+
+    # Held-out MAE (policy vs heuristic) on a random split, for a trust signal.
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(x.shape[0])
+    cut = max(1, int(round(x.shape[0] * (1.0 - val_frac))))
+    tr, va = perm[:cut], perm[min(cut, x.shape[0] - 1):] if x.shape[0] > 1 else (perm, perm)
+    mae_policy = mae_heur = None
+    if len(va):
+        w_tr = _ridge(x[tr], y[tr])
+        pred = np.hstack([np.ones((x[va].shape[0], 1)), x[va]]) @ w_tr
+        heur = np.array([heuristic_threshold(
+            {"mean": r[POLICY_FEATURES.index("mean")], "std": r[POLICY_FEATURES.index("std")]}) for r in x[va]])
+        mae_policy = float(np.mean(np.abs(pred - y[va])))
+        mae_heur = float(np.mean(np.abs(heur - y[va])))
+
+    w = _ridge(x, y)  # final fit on all usable rows
+    return {
+        "feature_names": list(POLICY_FEATURES),
+        "weights": [float(v) for v in w],   # [bias, w1, ...]
+        "n_episodes": int(x.shape[0]),
+        "mae_policy": mae_policy,
+        "mae_heuristic": mae_heur,
+    }
+
+
+def predict_threshold(stats: dict, policy: dict) -> float:
+    """Apply a fitted policy: tau = bias + sum(w_i * feature_i), clamped like the
+    heuristic. Falls back to the heuristic if the policy is malformed."""
+    try:
+        names = policy["feature_names"]
+        w = policy["weights"]
+        tau = float(w[0]) + sum(float(w[i + 1]) * float(stats.get(n, 0.0)) for i, n in enumerate(names))
+        return float(min(max(tau, 0.05), 0.9))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return heuristic_threshold(stats)
