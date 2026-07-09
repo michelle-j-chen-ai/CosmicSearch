@@ -73,8 +73,15 @@ function applyCorpus(c) {
   $("corpusPill").innerHTML = `🗂 <b>${fmtInt(c.num_rows)} clips</b> · ${escapeHtml(c.model || "model")}`;
   if ($("embeddings-uri")) $("embeddings-uri").value = c.embeddings_uri || "";
   if ($("model-uri") && c.model_uri !== undefined) $("model-uri").value = c.model_uri || "";
-  ["sf-dateFrom", "ex-dateFrom"].forEach((id) => { const el = $(id); if (el) { el.value = c.span_lo_date; el.min = c.span_lo_date; el.max = c.span_hi_date; } });
-  ["sf-dateTo", "ex-dateTo"].forEach((id) => { const el = $(id); if (el) { el.value = c.span_hi_date; el.min = c.span_lo_date; el.max = c.span_hi_date; } });
+  // Search filters track the LOADED (in-app browse) corpus -- you're searching it, so
+  // default its date range to that corpus's span.
+  { const f = $("sf-dateFrom"); if (f) { f.value = c.span_lo_date; f.min = c.span_lo_date; f.max = c.span_hi_date; }
+    const t = $("sf-dateTo"); if (t) { t.value = c.span_hi_date; t.min = c.span_lo_date; t.max = c.span_hi_date; } }
+  // Export/offline-scan runs over the FULL main embedding space (the scan corpus, which
+  // spans far wider than the browse corpus), so its dates default to UNBOUNDED (blank =
+  // whole corpus). Don't pin them to the loaded span or the scan is silently narrowed
+  // (and don't constrain min/max, so earlier dates than the browse corpus stay pickable).
+  ["ex-dateFrom", "ex-dateTo"].forEach((id) => { const el = $(id); if (el) { el.value = ""; el.removeAttribute("min"); el.removeAttribute("max"); } });
 }
 
 async function loadDefaultCorpusWhenReady() {
