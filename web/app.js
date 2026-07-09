@@ -849,7 +849,9 @@ function renderScans() {
     const id = j.console_url ? `<a class="scan-name" href="${j.console_url}" target="_blank" rel="noopener">${escapeHtml(j.execution_id)}</a>` : `<span class="scan-name">${escapeHtml(j.execution_id)}</span>`;
     const tagList = (j.tags || []).map((t) => escapeHtml(t) + (j.thresholds && j.thresholds[t] != null ? ` @${j.thresholds[t]}` : "")).join(", ");
     const filt = _fmtScanFilters(j.filters);
-    const out = j.lance_uri ? `<div class="scan-output">${escapeHtml(j.lance_uri.split("/").slice(-2).join("/"))}<div class="full-path">${escapeHtml(j.lance_uri)}</div></div>` : "—";
+    const out = j.lance_uri
+      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span><button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button></div>`
+      : "—";
     let dx = `<span class="scan-dx none">—</span>`;
     if (j.segset_label) dx = `<span class="scan-dx">${escapeHtml(j.segset_label)}</span>`;
     else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
@@ -863,6 +865,16 @@ function renderScans() {
       <td>${dx}</td></tr>`;
   }).join("") : `<tr><td colspan="7" style="color:var(--muted-2)">No scans launched yet.</td></tr>`;
 }
+// Copy a scan's full output Lance URI (delegated so it survives re-renders).
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest(".scan-copy");
+  if (!btn) return;
+  const uri = btn.dataset.uri || "";
+  navigator.clipboard.writeText(uri).then(
+    () => showToast("Copied output path"),
+    () => showToast("Copy failed — select the path manually"),
+  );
+});
 function _fmtScanFilters(f) {
   if (!f) return "—"; const p = [];
   if (f.from_date || f.to_date) p.push(`${f.from_date || "…"}→${f.to_date || "latest"}`);
