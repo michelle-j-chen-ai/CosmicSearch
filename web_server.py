@@ -3177,6 +3177,7 @@ _HISTORY_FRAG_CSS = """<style>
 _MODEL_LABELS = {
     "v3_lr_5e5-ckpt-6549": "red dwarf",
     "rd_4g_siglip_bias7-final": "white-dwarf",
+    "maxsim-mainfull-ckpt14500": "black dwarf",
 }
 
 
