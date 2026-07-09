@@ -2043,17 +2043,43 @@ def scan_status(execution: str) -> dict:
     return status
 
 
+def _scan_status_terminal(status: str) -> bool:
+    """True iff a scan's stored status is a final phase (no more polling needed).
+    A launched scan progresses LAUNCHED -> RUNNING -> SUCCEEDED/FAILED/ABORTED; only
+    the last group is terminal (Lilypad reports failure as EXPERIMENT_FAILED)."""
+    up = (status or "").upper()
+    return any(t in up for t in ("SUCCEEDED", "FAILED", "ABORTED", "COMPLETED"))
+
+
 @app.get("/api/scans")
 def scans(limit: int = 50) -> dict:
     """Recent launched per-segment scans (newest first) for the Export tab's panel; each
     entry: execution_id, status, tags, thresholds, console_url, output lance, segment-set
     info, timestamps. Also self-heals any completed-but-unregistered segment sets (so
     reopening the tab registers a scan that finished while it was closed). Best-effort."""
+    refresh_live = nls_launcher.available()
     jobs = []
     for row in db.list_scan_jobs(limit=limit):
         seg_uuid = row.get("segset_uuid") or ""
         seg_label = row.get("segset_label") or ""
         status = row.get("status") or ""
+        execution = row.get("execution_id")
+        error = row.get("error") or ""
+        # Refresh live phase for non-terminal jobs. The stored status only advances when
+        # a client polls /api/scan_status, which the UI does only for scans it launched --
+        # a scan launched via the API (e.g. CFC) is never polled, so its row would stay
+        # stuck at LAUNCHED forever. Re-query Lilypad here so the list self-heals for any
+        # launcher. Best-effort; there are only ever a handful of in-flight scans.
+        if refresh_live and execution and not _scan_status_terminal(status):
+            try:
+                live = nls_launcher.scan_status(execution)
+                phase = (live.get("phase") or "").strip()
+                if phase and phase != status:
+                    error = live.get("error") or error
+                    db.update_scan_job(execution, phase, error)
+                    status = phase
+            except nls_launcher.LauncherUnavailable:
+                pass
         # A scan that finished while the tab was closed never had a poll to register its
         # segment set -- do it now (once) on list, best-effort.
         if row.get("register_segset") and not seg_uuid and "SUCCEEDED" in status.upper():
@@ -2064,9 +2090,9 @@ def scans(limit: int = 50) -> dict:
             seg_label = seg.get("segset_label") or seg_label
         jobs.append(
             {
-                "execution_id": row.get("execution_id"),
+                "execution_id": execution,
                 "status": status,
-                "error": row.get("error") or "",
+                "error": error,
                 "tags": row.get("tags") or [],
                 "thresholds": row.get("thresholds") or {},
                 "output_dir": row.get("output_dir") or "",
