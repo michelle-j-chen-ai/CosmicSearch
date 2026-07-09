@@ -810,7 +810,13 @@ def insert_scan_job(record: dict) -> bool:
 # launch + its record commit atomically in that same transaction.
 _SCAN_ADVISORY_LOCK = text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))")
 _SELECT_SCAN_BY_IDEM = text(
-    f"SELECT execution_id FROM {_SCAN_TABLE} WHERE idem_key = :idem"
+    f"SELECT execution_id, status FROM {_SCAN_TABLE} WHERE idem_key = :idem"
+)
+
+# Release a failed execution's idempotency key (keep the row for history) so an
+# identical relaunch can own the key instead of deduplicating to the dead workload.
+_RELEASE_SCAN_IDEM = text(
+    f"UPDATE {_SCAN_TABLE} SET idem_key = NULL WHERE idem_key = :idem"
 )
 
 
@@ -836,12 +842,37 @@ def launch_or_get(idem_key: str, launch_and_record) -> tuple[dict, bool]:
         conn.execute(_SCAN_ADVISORY_LOCK, {"k": idem_key})
         row = conn.execute(_SELECT_SCAN_BY_IDEM, {"idem": idem_key}).first()
         if row and row.execution_id:
-            return {"execution_id": row.execution_id}, True
+            # A FAILED/ABORTED execution must not satisfy dedup -- returning it hands
+            # the caller a dead workload (and a lance_uri that will never exist).
+            # Release its key (the row stays for history) and fall through to a
+            # fresh launch that takes over the key.
+            up = (row.status or "").upper()
+            if any(t in up for t in ("FAILED", "ABORTED")):
+                conn.execute(_RELEASE_SCAN_IDEM, {"idem": idem_key})
+            else:
+                return {"execution_id": row.execution_id}, True
         result, record = launch_and_record()
         params = _scan_params({**record, "idem_key": idem_key})
         if params["execution_id"]:
             conn.execute(_INSERT_SCAN, params)
         return result, False
+
+
+def release_scan_idem(idem_key: str) -> bool:
+    """Release a (dead) execution's idempotency key so an identical relaunch can own
+    it. The row keeps its history; only the dedup key is cleared. Best-effort."""
+    if not idem_key:
+        return False
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            conn.execute(_RELEASE_SCAN_IDEM, {"idem": idem_key})
+        return True
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: release_scan_idem failed (%s): %s", type(exc).__name__, exc)
+        return False
 
 
 def get_scan_job(execution_id: str) -> dict | None:

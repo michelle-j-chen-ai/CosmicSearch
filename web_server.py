@@ -1960,6 +1960,26 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
     res, deduplicated = _scan_single_flight(
         idem, lambda: db.launch_or_get(idem, _launch_and_record)
     )
+    if deduplicated:
+        # A dedup hit must point at a LIVE (or succeeded) workload. The stored status
+        # can lag (it only advances when something polls), so check the live phase:
+        # if the existing execution actually FAILED, release its key and relaunch --
+        # otherwise an identical retry of a failed scan returns the dead workload
+        # (and a lance_uri that will never exist).
+        try:
+            live = nls_launcher.scan_status(res.get("execution_id") or "")
+        except nls_launcher.LauncherUnavailable:
+            live = {}
+        if live.get("done") and (live.get("phase") or "") != "SUCCEEDED":
+            db.update_scan_job(
+                res.get("execution_id") or "", live.get("phase") or "", live.get("error") or ""
+            )
+            db.release_scan_idem(idem)
+            LOGGER.info(
+                "dedup hit on FAILED workload %s (idem=%s); relaunching fresh",
+                res.get("execution_id"), scan_id,
+            )
+            res, deduplicated = db.launch_or_get(idem, _launch_and_record)
     res["deduplicated"] = deduplicated
     res.setdefault("workload_id", res.get("execution_id"))
     # A dedup hit returns only the existing workload id; the output Lance path is
