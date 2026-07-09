@@ -13,7 +13,7 @@ enable_secrets = true
 # (apps-platform app apikey). The IAP browser path is unchanged. Only the scan
 # API is exposed through the gateway -- a key cannot reach any other endpoint.
 enable_api_gateway = true
-path_patterns = ["/api/launch_segment_scan", "/api/scan_status"]
+api_gateway_paths = ["/api/launch_segment_scan", "/api/scan_status"]
 enable_slack = false
 
 [cloudrun]
