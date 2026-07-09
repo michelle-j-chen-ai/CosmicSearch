@@ -587,7 +587,12 @@ def segment_mask_from_bitmap(corpus: Corpus, set_bitmap) -> np.ndarray:
     Requires ``corpus.has_internal_ids()``.
     """
     ids = corpus.dx_internal_id_array()
-    return np.fromiter((int(i) in set_bitmap for i in ids), dtype=bool, count=len(ids))
+    # Rows without a DORA internal id hold -1 (see dx_internal_id_array). pyroaring's
+    # membership test only accepts uint32, so a negative sentinel raises OverflowError.
+    # A -1 row is never in the set, so short-circuit it to False before the lookup.
+    return np.fromiter(
+        (i >= 0 and int(i) in set_bitmap for i in ids), dtype=bool, count=len(ids)
+    )
 
 
 # Columns a downsample dataset may key on, in priority order, mapped to the
