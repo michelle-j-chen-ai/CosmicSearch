@@ -504,19 +504,35 @@ def _lance_filter_ids(uri: str) -> tuple[str, frozenset[str]]:
     return key, ids
 
 
-# Cap on inline downsample ids passed in the workload config (gRPC ~4MB; a segment_id is
-# ~60 chars). Beyond this the dataset should be narrowed (or moved to an object the worker
-# GETs by exact key -- a future scale-up).
-_SCAN_DOWNSAMPLE_MAX = 50_000
+# Downsample ids up to this count travel inline in the workload config (gRPC-friendly;
+# a segment_id is ~60 chars). Larger sets are written to a single-column parquet next to
+# the scan output and passed BY REFERENCE (filter_ids_uri / segment_set_ids_uri) -- the
+# worker reads them in one GET, so there is NO upper bound on the downsample size.
+_SCAN_INLINE_IDS_MAX = 10_000
+
+
+def _ids_by_reference(ids: list[str], out_root: str, basename: str) -> str:
+    """Write a downsample id set as a one-column parquet under the scan's output root
+    and return its URI. Pass-by-reference keeps arbitrarily large id sets out of the
+    workload config (inline they bloat the submit payload past gRPC limits)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    buf = io.BytesIO()
+    pq.write_table(pa.table({"segment_id": pa.array(ids, type=pa.string())}), buf)
+    uri = f"{out_root.rstrip('/')}/{basename}.parquet"
+    oci_s3.put_bytes(uri, buf.getvalue(), oci_s3.s3_client(), "application/octet-stream")
+    LOGGER.info("scan downsample: wrote %d ids by reference to %s", len(ids), uri)
+    return uri
 
 
 def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
     """``(corpus_key, sorted ids)`` for the OFFLINE-SCAN downsample dataset at ``uri``.
 
-    The Lilypad worker's role has S3 GET/HEAD but NOT LIST, so it can't enumerate a dataset
-    prefix itself. The app (which has list+read -- it already powers the in-app lance filter)
-    resolves the membership here and passes the ids inline in the workload config. Uses the
-    segment_id-first priority (no dx) so the worker can match the segment_id string space."""
+    The app (which already powers the in-app lance filter) resolves the membership here;
+    the launch path ships the ids inline when small, else by parquet reference (no size
+    cap). Uses the segment_id-first priority (no dx) so the worker can match the
+    segment_id string space."""
     local_dir = _lance_filter_cache_dir(uri)
     if not local_dir.exists():
         tmp = local_dir.with_name(local_dir.name + ".tmp")
@@ -531,10 +547,6 @@ def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
     )
     if not ids:
         raise ValueError("downsample dataset has no usable segment ids")
-    if len(ids) > _SCAN_DOWNSAMPLE_MAX:
-        raise ValueError(
-            f"downsample dataset has {len(ids)} ids (> {_SCAN_DOWNSAMPLE_MAX}); narrow it"
-        )
     LOGGER.info("scan downsample %s -> %d %s ids", uri, len(ids), key)
     return key, sorted(ids)
 
@@ -1879,8 +1891,10 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
         }
         # Remember each tag's threshold so the Export table pre-fills it next time (like k).
         db.set_tag_thresholds(thresholds)
-        # Resolve the lance downsample HERE (the app has S3 list+read; the worker's role
-        # does not) and pass the segment_id set inline, so the worker never lists S3.
+        # Resolve the lance downsample HERE (the app reads the user's dataset; the
+        # worker only ever GETs by exact key). Small id sets travel inline in the
+        # workload config; larger ones are written as a parquet next to the scan
+        # output and passed by reference -- NO size cap either way.
         filter_key, filter_ids = "", []
         if req.filter_lance_uri:
             try:
@@ -1895,6 +1909,16 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 seg_set_ids = sorted(dora_client.fetch_segment_ids(req.segment_set_uuid))
             except dora_client.DoraUnavailable as exc:
                 raise HTTPException(400, f"could not resolve segment set: {exc}")
+        filter_ids_uri, seg_set_ids_uri = "", ""
+        scan_out_root = f"{output_dir}/{scan_id}"
+        if len(filter_ids) > _SCAN_INLINE_IDS_MAX:
+            filter_ids_uri, filter_ids = (
+                _ids_by_reference(filter_ids, scan_out_root, "filter_ids"), []
+            )
+        if len(seg_set_ids) > _SCAN_INLINE_IDS_MAX:
+            seg_set_ids_uri, seg_set_ids = (
+                _ids_by_reference(seg_set_ids, scan_out_root, "segment_set_ids"), []
+            )
         try:
             res = nls_launcher.launch_segment_scan(
                 search_vectors=search_vectors,
@@ -1909,7 +1933,9 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 filter_lance_uri=req.filter_lance_uri or "",
                 filter_key=filter_key,
                 filter_segment_ids=filter_ids,
+                filter_ids_uri=filter_ids_uri,
                 segment_set_ids=seg_set_ids,
+                segment_set_ids_uri=seg_set_ids_uri,
                 vehicle=req.vehicle or "",
                 drive_id=req.drive_id or "",
                 merge_intervals=bool(req.merge_intervals),

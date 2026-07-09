@@ -7,7 +7,11 @@ enable_gcs_fuse = true
 enable_postgres = true
 enable_mysql = false
 enable_secrets = true
-enable_api_gateway = false
+# API Gateway + platform-managed API keys: the programmatic entry point for
+# machine callers OUTSIDE Google (e.g. the CFC curation pipeline on neuron-oci,
+# which has no Google identity for IAP). Keys are per-app scoped and revocable
+# (apps-platform app apikey). The IAP browser path is unchanged.
+enable_api_gateway = true
 enable_slack = false
 
 [cloudrun]

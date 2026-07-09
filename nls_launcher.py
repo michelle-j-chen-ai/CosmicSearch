@@ -38,7 +38,7 @@ LOGGER = logging.getLogger("nls_search_app.nls_launcher")
 # with nls_scan/purpose/prod.yaml; overridable per-deploy via NLS_SCAN_IMAGE.
 _DEFAULT_IMAGE = (
     "us-phoenix-1.ocir.io/idskhu5vqvtl/lilypad/sds"
-    "@sha256:9a2482140375f9405d99c153c607a89af9327253906ac3aa5e3260c6770a140f"
+    "@sha256:d1f6028926ebd56541ff24d854a711187ea1cba9e10a3acb09574a9868323092"
 )
 _OCI_ENDPOINT = "https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com"
 _CUSTOMER_RESOURCE = "autolabeling"
@@ -172,7 +172,9 @@ def launch_segment_scan(
     filter_lance_uri: str = "",
     filter_key: str = "",
     filter_segment_ids: list[str] | None = None,
+    filter_ids_uri: str = "",
     segment_set_ids: list[str] | None = None,
+    segment_set_ids_uri: str = "",
     vehicle: str = "",
     drive_id: str = "",
     merge_intervals: bool = True,
@@ -215,14 +217,17 @@ def launch_segment_scan(
         "filter_lance_uri": filter_lance_uri or "",
         "vehicle": vehicle or "",
         "drive_id": drive_id or "",
-        # Pre-resolved downsample membership (the app has S3 list+read; the worker doesn't),
-        # passed inline so the worker filters output to these segments WITHOUT listing S3.
+        # Pre-resolved downsample membership: inline for small sets, else by parquet
+        # reference (filter_ids_uri / segment_set_ids_uri -- any cardinality; the
+        # worker reads them in one GET). Output is restricted to these segments.
         "filter_key": filter_key or "",
         "filter_segment_ids": list(filter_segment_ids or []),
+        "filter_ids_uri": filter_ids_uri or "",
         # DX segment-set membership (external segment_ids resolved app-side); the worker
-        # keeps clips whose segment is in this set. Separate from the lance downsample so
-        # both can apply together.
+        # keeps segments in this set. Separate from the lance downsample so both can
+        # apply together.
         "segment_set_ids": list(segment_set_ids or []),
+        "segment_set_ids_uri": segment_set_ids_uri or "",
     }
     ec["filters"] = filters
     if sid:
