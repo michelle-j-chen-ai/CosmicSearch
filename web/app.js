@@ -570,9 +570,14 @@ function updateSweepStats() {
   const sw = state.sweep, t = state.tempTau;
   $("statCapture").textContent = `${sw.up.filter((s) => s >= t).length} / ${sw.up.length} 👍`;
   $("statExclude").textContent = `${sw.down.filter((s) => s < t).length} / ${sw.down.length} 👎`;
+  // Fraction of the corpus score-density at or above τ. A percentage (not an absolute
+  // count) because the offline scan's final number diverges from any clip estimate --
+  // it dedups to segments, merges intervals, and applies downsample filters. The
+  // percentage is the honest, scan-invariant signal of how selective this τ is.
   const above = _clipsAtOrAbove(t);
-  const scale = (state.corpus && sw.total) ? state.corpus.num_rows / sw.total : 1;
-  $("statCorpus").textContent = `~${fmtInt(Math.round(above * scale))}`;
+  const pct = sw.total ? (above / sw.total) * 100 : 0;
+  const shown = pct === 0 ? "0%" : pct < 0.1 ? "<0.1%" : pct.toFixed(pct < 10 ? 1 : 0) + "%";
+  $("statCorpus").textContent = shown;
   $("tauReadout").textContent = t.toFixed(3);
 }
 function confirmThreshold() {
