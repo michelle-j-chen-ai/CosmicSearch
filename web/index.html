@@ -48,8 +48,22 @@
         <input id="searchInput" placeholder="Describe a moment — e.g. ego makes an unprotected left turn across oncoming traffic">
         <button id="searchBtn">Search</button>
       </div>
-      <div class="hero-sub"><button class="link-btn" id="clipToggle">▶ Search by video clip instead</button></div>
+      <div class="hero-sub"><button class="link-btn" id="clipToggle">▶ Search by video clip instead</button><span class="hero-sep">·</span><button class="link-btn" id="uploadToggle">▶ Search by image (drag &amp; drop)</button></div>
       <div class="empty-hint">Type a query to get a starting search vector — you'll refine it with 👍/👎 on the next screen.</div>
+
+      <!-- search by uploaded image (query-by-example against the corpus, video-to-video) -->
+      <div class="upload-panel hidden" id="uploadPanel">
+        <div class="dropzone" id="dropzone" tabindex="0">
+          <input type="file" id="uploadFile" accept="image/*" hidden>
+          <div class="dz-inner" id="dzInner">
+            <div class="dz-icon">🖼️</div>
+            <div>Drag an image here, or <span class="dz-link">click to choose</span></div>
+            <div class="dz-sub">finds corpus clips that look like it — video-to-video match (our strongest path)</div>
+          </div>
+          <img class="dz-preview hidden" id="uploadPreview" alt="upload preview">
+        </div>
+        <div class="dz-note" id="uploadNote"></div>
+      </div>
 
       <!-- search by video clip (query-by-example over the corpus) -->
       <div class="video-search-panel hidden" id="clipPanel">

@@ -110,6 +110,7 @@ function wireEvents() {
   $("searchInput").onkeydown = (e) => { if (e.key === "Enter") go(); };
   $("searchInput2").onkeydown = (e) => { if (e.key === "Enter") go(); };
   $("clipToggle").onclick = () => $("clipPanel").classList.toggle("hidden");
+  wireUploadSearch();
   $("vs-search-btn").onclick = () => runWindowSearch({ page: 0 });
 
   $("filtersChip").onclick = toggleSearchFilters;
@@ -296,6 +297,45 @@ async function runWindowSearch(startOpts) {
   }
   state.mode = "window"; state.query = state.windowReq.query;
   await _issue("/api/search_by_window", { ...state.windowReq, ...(startOpts || {}), ..._searchFilters() });
+}
+/* ===================== search by uploaded image (drag & drop) ===================== */
+function wireUploadSearch() {
+  const toggle = $("uploadToggle"), panel = $("uploadPanel"), dz = $("dropzone"), inp = $("uploadFile");
+  if (!toggle || !dz) return;
+  toggle.onclick = () => panel.classList.toggle("hidden");
+  dz.onclick = () => inp.click();
+  dz.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); inp.click(); } };
+  inp.onchange = () => { if (inp.files && inp.files[0]) handleUpload(inp.files[0]); };
+  ["dragenter", "dragover"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("dragover"); }));
+  dz.addEventListener("drop", (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) handleUpload(f);
+  });
+}
+function _uploadNote(msg, isErr) { const n = $("uploadNote"); if (n) { n.textContent = msg || ""; n.classList.toggle("err", !!isErr); } }
+async function handleUpload(file) {
+  if (!file.type || !file.type.startsWith("image/")) { _uploadNote("Please choose an image (video coming soon).", true); return; }
+  if (file.size > 50 * 1024 * 1024) { _uploadNote("Image too large (max 50MB).", true); return; }
+  // Preview thumbnail + read as base64 (strip the data-URL prefix for the API).
+  const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+  const preview = $("uploadPreview"); if (preview) { preview.src = dataUrl; preview.classList.remove("hidden"); $("dzInner").classList.add("hidden"); }
+  _uploadNote("Encoding image…");
+  try {
+    const enc = await fetch("/api/search_by_upload", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_b64: String(dataUrl).split(",", 2)[1] || "", filename: file.name, content_type: file.type }),
+    }).then((r) => r.ok ? r.json() : r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); }));
+    // The uploaded image is now just a query vector -> reuse the resume path so
+    // paging, refine, sweep, save, and offline-scan export all work unchanged.
+    state.resumeVec = enc.vector;
+    state.resumeLabel = "🖼️ " + (enc.label || "uploaded image");
+    state.query = state.resumeLabel;
+    state.mode = "resume";
+    state.marks = {};
+    _uploadNote("");
+    await runVectorSearch({ page: 0 });
+  } catch (e) { _uploadNote("Could not search by image: " + e.message, true); }
 }
 async function runVectorSearch(startOpts) {
   if (!state.resumeVec) return;

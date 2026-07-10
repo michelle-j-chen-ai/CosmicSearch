@@ -257,6 +257,57 @@ def encode_query(
     return vector.detach().cpu().numpy().astype("float32")[0]
 
 
+# Video-encode geometry -- MUST match the corpus builder (fine_tuned_embed_inference):
+# 8 frames at 448x448 through processor(videos=...) -> get_video_embeddings.visual_proj.
+_ENCODE_NUM_FRAMES = 8
+_ENCODE_RESOLUTION = 448
+
+
+def encode_video_frames(
+    frames_btchw: object, processor: object, model: object, device: str
+) -> np.ndarray:
+    """Encode a batch of video frames ``[1, T, C, H, W]`` (uint8) into the joint
+    video/text space (L2-normalized), via the SAME ``processor(videos=...)`` +
+    ``get_video_embeddings`` path that built the corpus. Returns one 768-d vector.
+    """
+    dtype = torch.float32 if device == "cpu" else torch.bfloat16
+    inputs = processor(
+        text="",
+        videos=frames_btchw,
+        resolution=_ENCODE_RESOLUTION,
+        num_video_frames=_ENCODE_NUM_FRAMES,
+    )
+    videos = inputs["videos"].to(device, dtype=dtype)
+    with torch.inference_mode():
+        output = model.get_video_embeddings(videos=videos)
+    vector = torch.nn.functional.normalize(output.visual_proj.float(), dim=-1)
+    return vector.detach().cpu().numpy().astype("float32")[0]
+
+
+def encode_image_bytes(
+    data: bytes, processor: object, model: object, device: str
+) -> np.ndarray:
+    """Encode a raw image (jpg/png/... bytes) into the corpus's video/text space.
+
+    A still is a degenerate clip: resize to 448x448 and replicate to the model's
+    fixed 8-frame input, then run the video encoder. Comparable to corpus vectors
+    (which are 8-frame windows) -- expect strong matches, slightly softer than a
+    short clip since a still has no motion. Requires Pillow.
+    """
+    import io as _io
+
+    from PIL import Image
+
+    img = Image.open(_io.BytesIO(data)).convert("RGB").resize(
+        (_ENCODE_RESOLUTION, _ENCODE_RESOLUTION)
+    )
+    arr = np.asarray(img, dtype=np.uint8)  # H, W, C
+    frame_chw = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # C, H, W
+    frames_tchw = frame_chw.unsqueeze(0).repeat(_ENCODE_NUM_FRAMES, 1, 1, 1)  # T,C,H,W
+    frames_btchw = frames_tchw.unsqueeze(0)  # 1,T,C,H,W
+    return encode_video_frames(frames_btchw, processor, model, device)
+
+
 def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
     """Download the corpus to the disk cache (once) and load it into a resident
     matrix.

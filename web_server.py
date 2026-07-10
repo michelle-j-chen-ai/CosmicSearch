@@ -13,6 +13,8 @@ Run locally:
 from __future__ import annotations
 
 import csv
+import base64
+import binascii
 import datetime as dt
 import gzip
 import hashlib
@@ -1305,6 +1307,56 @@ def search_by_vector(req: VectorSearchRequest) -> dict:
         corpus, start_unix, end_unix, allowed_mask=seg_mask
     )
     return out
+
+
+class UploadEncodeRequest(BaseModel):
+    """A user-supplied image to encode into the corpus's video/text space.
+
+    ``image_b64`` is the raw image bytes base64-encoded (a data-URL prefix is
+    tolerated). Sent as JSON (not multipart) so the service needs no
+    python-multipart dependency. Phase 1 is images only; short-clip video is a
+    planned follow-up (needs a video decoder in the serving image)."""
+
+    image_b64: str
+    filename: str = ""
+    content_type: str = ""
+
+
+@app.post("/api/search_by_upload")
+def search_by_upload(req: UploadEncodeRequest) -> dict:
+    """Encode a dragged-and-dropped image into the joint space and return its query
+    vector. The client then ranks with it via /api/search_by_vector, so paging,
+    refine, save, and offline-scan export all work on the uploaded vector unchanged
+    -- an uploaded image is just another query vector (video-to-video retrieval,
+    the corpus's own modality). Returns {vector, dim, label}."""
+    _require_ready()
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading; try again in a moment")
+    ct = (req.content_type or "").lower()
+    if ct and not ct.startswith("image/"):
+        raise HTTPException(
+            415, "phase 1 supports images only (short-clip video is coming soon)"
+        )
+    b64 = req.image_b64.split(",", 1)[-1]  # tolerate a data-URL prefix
+    try:
+        data = base64.b64decode(b64, validate=False)
+    except (ValueError, binascii.Error):
+        raise HTTPException(400, "invalid base64 image data")
+    if not data:
+        raise HTTPException(400, "empty upload")
+    if len(data) > 50 * 1024 * 1024:
+        raise HTTPException(413, "image too large (max 50MB)")
+    try:
+        vec = search_engine.encode_image_bytes(
+            data, _state["processor"], _state["model"], _state["cfg"].device
+        )
+    except ModuleNotFoundError as exc:  # Pillow absent in the serving image
+        raise HTTPException(501, f"image decoding unavailable on this deployment: {exc}")
+    except Exception as exc:  # noqa: BLE001 -- surface any decode/encode failure cleanly
+        raise HTTPException(400, f"could not encode image: {type(exc).__name__}: {exc}")
+    LOGGER.info("encoded uploaded image %r -> %d-d query vector", req.filename, len(vec))
+    return {"vector": [float(x) for x in vec], "dim": len(vec),
+            "label": (req.filename or "uploaded image")}
 
 
 @app.post("/api/search_by_window")
