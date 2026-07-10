@@ -314,28 +314,75 @@ function wireUploadSearch() {
   });
 }
 function _uploadNote(msg, isErr) { const n = $("uploadNote"); if (n) { n.textContent = msg || ""; n.classList.toggle("err", !!isErr); } }
-async function handleUpload(file) {
-  if (!file.type || !file.type.startsWith("image/")) { _uploadNote("Please choose an image (video coming soon).", true); return; }
-  if (file.size > 50 * 1024 * 1024) { _uploadNote("Image too large (max 50MB).", true); return; }
-  // Preview thumbnail + read as base64 (strip the data-URL prefix for the API).
-  const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
-  const preview = $("uploadPreview"); if (preview) { preview.src = dataUrl; preview.classList.remove("hidden"); $("dzInner").classList.add("hidden"); }
-  _uploadNote("Encoding image…");
+// Corpus clips are ~8-frame windows of a few seconds; sample an uploaded video over
+// a window near that length so the query stays in-distribution (matching is by the
+// 8 frames the model sees, not by fps -- see design notes).
+const _UPLOAD_NUM_FRAMES = 8;
+const _UPLOAD_SAMPLE_WINDOW_S = 8;   // widest span we sample 8 frames across
+const _UPLOAD_MAX_DURATION_S = 600;  // hard reject absurdly long files
+function _dataUrl(file) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); }); }
+function _seek(v, t) { return new Promise((res) => { const on = () => { v.removeEventListener("seeked", on); res(); }; v.addEventListener("seeked", on); v.currentTime = t; }); }
+async function _extractVideoFrames(file) {
+  const url = URL.createObjectURL(file);
+  const v = document.createElement("video");
+  v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = url;
   try {
+    await new Promise((res, rej) => { v.onloadedmetadata = () => res(); v.onerror = () => rej(new Error("cannot read this video")); });
+    const dur = (v.duration && isFinite(v.duration)) ? v.duration : 0;
+    if (!dur) throw new Error("unknown video duration");
+    if (dur > _UPLOAD_MAX_DURATION_S) throw new Error(`video too long (${Math.round(dur)}s > ${_UPLOAD_MAX_DURATION_S}s) — trim it first`);
+    // Sample 8 frames across a centered window capped at _UPLOAD_SAMPLE_WINDOW_S.
+    const span = Math.min(dur, _UPLOAD_SAMPLE_WINDOW_S);
+    const start = Math.max(0, (dur - span) / 2);
+    const canvas = document.createElement("canvas");
+    const frames = [];
+    for (let i = 0; i < _UPLOAD_NUM_FRAMES; i++) {
+      const t = Math.min(start + span * (i + 0.5) / _UPLOAD_NUM_FRAMES, Math.max(0, dur - 0.03));
+      await _seek(v, t);
+      if (!canvas.width) { canvas.width = v.videoWidth || 448; canvas.height = v.videoHeight || 448; }
+      canvas.getContext("2d").drawImage(v, 0, 0, canvas.width, canvas.height);
+      frames.push(canvas.toDataURL("image/jpeg", 0.85).split(",", 2)[1]);
+    }
+    return { frames, dur, span };
+  } finally { URL.revokeObjectURL(url); }
+}
+async function handleUpload(file) {
+  const isImage = (file.type || "").startsWith("image/");
+  const isVideo = (file.type || "").startsWith("video/");
+  if (!isImage && !isVideo) { _uploadNote("Please drop an image or a video.", true); return; }
+  if (file.size > 500 * 1024 * 1024) { _uploadNote("File too large (max 500MB).", true); return; }
+  const imgEl = $("uploadPreview"), vidEl = $("uploadPreviewVid");
+  imgEl.classList.add("hidden"); vidEl.classList.add("hidden");
+  try {
+    let frames_b64, noteAfter;
+    if (isImage) {
+      const dataUrl = await _dataUrl(file);
+      imgEl.src = dataUrl; imgEl.classList.remove("hidden"); $("dzInner").classList.add("hidden");
+      frames_b64 = [String(dataUrl).split(",", 2)[1] || ""];
+      _uploadNote("Encoding image…");
+      noteAfter = "";
+    } else {
+      vidEl.src = URL.createObjectURL(file); vidEl.classList.remove("hidden"); $("dzInner").classList.add("hidden");
+      _uploadNote("Reading video frames…");
+      const { frames, dur, span } = await _extractVideoFrames(file);
+      frames_b64 = frames;
+      _uploadNote(`Encoding ${frames.length} frames sampled from ${span.toFixed(1)}s${dur > span ? ` (of ${dur.toFixed(0)}s)` : ""}…`);
+      noteAfter = dur > _UPLOAD_SAMPLE_WINDOW_S ? `Sampled a ${span.toFixed(0)}s window — clips match best at ~2-4s.` : "";
+    }
     const enc = await fetch("/api/search_by_upload", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image_b64: String(dataUrl).split(",", 2)[1] || "", filename: file.name, content_type: file.type }),
+      body: JSON.stringify({ frames_b64, filename: file.name, content_type: file.type }),
     }).then((r) => r.ok ? r.json() : r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); }));
-    // The uploaded image is now just a query vector -> reuse the resume path so
+    // The uploaded example is now just a query vector -> reuse the resume path so
     // paging, refine, sweep, save, and offline-scan export all work unchanged.
     state.resumeVec = enc.vector;
-    state.resumeLabel = "🖼️ " + (enc.label || "uploaded image");
+    state.resumeLabel = (isVideo ? "🎬 " : "🖼️ ") + (enc.label || "uploaded example");
     state.query = state.resumeLabel;
     state.mode = "resume";
     state.marks = {};
-    _uploadNote("");
+    _uploadNote(noteAfter);
     await runVectorSearch({ page: 0 });
-  } catch (e) { _uploadNote("Could not search by image: " + e.message, true); }
+  } catch (e) { _uploadNote("Could not search by upload: " + e.message, true); }
 }
 async function runVectorSearch(startOpts) {
   if (!state.resumeVec) return;

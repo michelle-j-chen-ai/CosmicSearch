@@ -284,16 +284,8 @@ def encode_video_frames(
     return vector.detach().cpu().numpy().astype("float32")[0]
 
 
-def encode_image_bytes(
-    data: bytes, processor: object, model: object, device: str
-) -> np.ndarray:
-    """Encode a raw image (jpg/png/... bytes) into the corpus's video/text space.
-
-    A still is a degenerate clip: resize to 448x448 and replicate to the model's
-    fixed 8-frame input, then run the video encoder. Comparable to corpus vectors
-    (which are 8-frame windows) -- expect strong matches, slightly softer than a
-    short clip since a still has no motion. Requires Pillow.
-    """
+def _frame_from_bytes(data: bytes):
+    """One image's bytes -> a 448x448 uint8 C,H,W tensor. Requires Pillow."""
     import io as _io
 
     from PIL import Image
@@ -302,10 +294,35 @@ def encode_image_bytes(
         (_ENCODE_RESOLUTION, _ENCODE_RESOLUTION)
     )
     arr = np.asarray(img, dtype=np.uint8)  # H, W, C
-    frame_chw = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # C, H, W
-    frames_tchw = frame_chw.unsqueeze(0).repeat(_ENCODE_NUM_FRAMES, 1, 1, 1)  # T,C,H,W
-    frames_btchw = frames_tchw.unsqueeze(0)  # 1,T,C,H,W
-    return encode_video_frames(frames_btchw, processor, model, device)
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # C, H, W
+
+
+def encode_frames_list(
+    frames_bytes: list, processor: object, model: object, device: str
+) -> np.ndarray:
+    """Encode a list of frame images (each raw bytes) into the corpus's video/text
+    space. Resamples the frames to the model's fixed 8-frame input (evenly spaced;
+    a single frame -> replicated). Used by both image drag-drop (1 frame) and video
+    drag-drop (the browser extracts ~8 frames from a capped window). Requires Pillow.
+    """
+    imgs = [_frame_from_bytes(b) for b in frames_bytes if b]
+    if not imgs:
+        raise ValueError("no decodable frames")
+    n = len(imgs)
+    if n == 1:
+        idx = [0] * _ENCODE_NUM_FRAMES
+    else:  # evenly-spaced indices across whatever the client sent
+        idx = [round(i * (n - 1) / (_ENCODE_NUM_FRAMES - 1)) for i in range(_ENCODE_NUM_FRAMES)]
+    frames_tchw = torch.stack([imgs[j] for j in idx])  # T, C, H, W
+    return encode_video_frames(frames_tchw.unsqueeze(0), processor, model, device)
+
+
+def encode_image_bytes(
+    data: bytes, processor: object, model: object, device: str
+) -> np.ndarray:
+    """Encode a single still image (degenerate 1-frame clip). Thin wrapper over
+    ``encode_frames_list``; kept for callers that pass one image."""
+    return encode_frames_list([data], processor, model, device)
 
 
 def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:

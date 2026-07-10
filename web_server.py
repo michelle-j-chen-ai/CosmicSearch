@@ -1309,54 +1309,65 @@ def search_by_vector(req: VectorSearchRequest) -> dict:
     return out
 
 
+# Cap on how many frames a client may send per upload (video sends ~8; the encoder
+# resamples to the model's fixed 8 either way). Bounds the request + decode work.
+_UPLOAD_MAX_FRAMES = 16
+_UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg is tiny)
+
+
 class UploadEncodeRequest(BaseModel):
-    """A user-supplied image to encode into the corpus's video/text space.
+    """A user-supplied image OR video (decoded to frames) to encode into the corpus's
+    video/text space. The client sends base64 frames (data-URL prefix tolerated) as
+    JSON -- no python-multipart dependency, and for video only the extracted frames
+    travel, never the whole file. Provide ``frames_b64`` (image: 1 frame; video: the
+    browser-extracted frames from a duration-capped window) or the legacy single
+    ``image_b64``."""
 
-    ``image_b64`` is the raw image bytes base64-encoded (a data-URL prefix is
-    tolerated). Sent as JSON (not multipart) so the service needs no
-    python-multipart dependency. Phase 1 is images only; short-clip video is a
-    planned follow-up (needs a video decoder in the serving image)."""
-
-    image_b64: str
+    frames_b64: list[str] = []
+    image_b64: str = ""  # legacy single-image convenience
     filename: str = ""
     content_type: str = ""
 
 
 @app.post("/api/search_by_upload")
 def search_by_upload(req: UploadEncodeRequest) -> dict:
-    """Encode a dragged-and-dropped image into the joint space and return its query
-    vector. The client then ranks with it via /api/search_by_vector, so paging,
-    refine, save, and offline-scan export all work on the uploaded vector unchanged
-    -- an uploaded image is just another query vector (video-to-video retrieval,
-    the corpus's own modality). Returns {vector, dim, label}."""
+    """Encode a dragged-and-dropped image or short video into the joint space and
+    return its query vector. The client then ranks with it via /api/search_by_vector,
+    so paging, refine, save, and offline-scan export all work on the uploaded vector
+    unchanged -- an uploaded example is just another query vector (video-to-video
+    retrieval, the corpus's own modality). Returns {vector, dim, label, n_frames}."""
     _require_ready()
     if not _state.get("model_ready"):
         raise HTTPException(503, "model still loading; try again in a moment")
-    ct = (req.content_type or "").lower()
-    if ct and not ct.startswith("image/"):
-        raise HTTPException(
-            415, "phase 1 supports images only (short-clip video is coming soon)"
-        )
-    b64 = req.image_b64.split(",", 1)[-1]  # tolerate a data-URL prefix
+    raw = list(req.frames_b64) if req.frames_b64 else ([req.image_b64] if req.image_b64 else [])
+    if not raw:
+        raise HTTPException(400, "no frames provided")
+    if len(raw) > _UPLOAD_MAX_FRAMES:
+        raise HTTPException(413, f"too many frames ({len(raw)} > {_UPLOAD_MAX_FRAMES})")
+    frames: list[bytes] = []
+    for f in raw:
+        b64 = f.split(",", 1)[-1]  # tolerate a data-URL prefix
+        try:
+            data = base64.b64decode(b64, validate=False)
+        except (ValueError, binascii.Error):
+            raise HTTPException(400, "invalid base64 frame data")
+        if not data:
+            raise HTTPException(400, "empty frame")
+        if len(data) > _UPLOAD_MAX_FRAME_BYTES:
+            raise HTTPException(413, "a frame is too large (max 8MB each)")
+        frames.append(data)
     try:
-        data = base64.b64decode(b64, validate=False)
-    except (ValueError, binascii.Error):
-        raise HTTPException(400, "invalid base64 image data")
-    if not data:
-        raise HTTPException(400, "empty upload")
-    if len(data) > 50 * 1024 * 1024:
-        raise HTTPException(413, "image too large (max 50MB)")
-    try:
-        vec = search_engine.encode_image_bytes(
-            data, _state["processor"], _state["model"], _state["cfg"].device
+        vec = search_engine.encode_frames_list(
+            frames, _state["processor"], _state["model"], _state["cfg"].device
         )
     except ModuleNotFoundError as exc:  # Pillow absent in the serving image
         raise HTTPException(501, f"image decoding unavailable on this deployment: {exc}")
     except Exception as exc:  # noqa: BLE001 -- surface any decode/encode failure cleanly
-        raise HTTPException(400, f"could not encode image: {type(exc).__name__}: {exc}")
-    LOGGER.info("encoded uploaded image %r -> %d-d query vector", req.filename, len(vec))
+        raise HTTPException(400, f"could not encode upload: {type(exc).__name__}: {exc}")
+    LOGGER.info("encoded upload %r (%d frames) -> %d-d query vector",
+                req.filename, len(frames), len(vec))
     return {"vector": [float(x) for x in vec], "dim": len(vec),
-            "label": (req.filename or "uploaded image")}
+            "label": (req.filename or "uploaded example"), "n_frames": len(frames)}
 
 
 @app.post("/api/search_by_window")
