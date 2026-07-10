@@ -1651,6 +1651,11 @@ class SaveVectorRequest(BaseModel):
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
+    # The 👍/👎 marks labeled during this search, persisted so Resume restores the exact
+    # feedback state (each: {chunk_id, segment_id, index, rank, score}). Empty preserves
+    # any previously-saved marks (the DB upsert only overwrites when non-empty).
+    thumbs_up: list[dict] = []
+    thumbs_down: list[dict] = []
     # Export defaults remembered with the vector: top-k and the per-tag cosine threshold
     # (0 = top-k). The Export table pre-fills these for the tag.
     k: int = 0
@@ -1723,6 +1728,9 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
             "filter_lance_uri": req.filter_lance_uri,
             "vehicle": req.vehicle,
             "drive_id": req.drive_id,
+            # The labeled 👍/👎 marks, so Resume restores the feedback state.
+            "thumbs_up": req.thumbs_up,
+            "thumbs_down": req.thumbs_down,
             "search_vector": [float(x) for x in vec],
             "parquet_uri": "",
         },

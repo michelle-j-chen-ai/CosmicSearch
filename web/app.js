@@ -620,11 +620,18 @@ async function finalSave() {
   const tau = state.confirmedTau != null ? state.confirmedTau : (state.suggestedTau != null ? state.suggestedTau : 0);
   const btn = $("finalSaveBtn"); btn.disabled = true; setNote("saveNote", "Saving…");
   try {
+    // Persist the 👍/👎 marks with the saved search so Resume can restore them
+    // (session-restore reads these back into state.marks). Shape matches the resume
+    // reader: {chunk_id, segment_id, index, rank, score} per mark.
+    const _mark = (chunk_id, m) => ({ chunk_id, segment_id: m.segment_id, index: m.index, rank: m.rank, score: m.score });
+    const thumbs_up = Object.entries(state.marks).filter(([, m]) => m.mark === "up").map(([c, m]) => _mark(c, m));
+    const thumbs_down = Object.entries(state.marks).filter(([, m]) => m.mark === "down").map(([c, m]) => _mark(c, m));
     const r = await fetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       tag, query: state.query, k: 50, threshold: tau,
       from_date: $("sf-dateFrom").value || null, to_date: $("sf-dateTo").value || null,
       segment_set_uuid: state.searchSegUuid, segment_set_name: state.searchSegName,
       filter_lance_uri: _splitList($("sf-lance").value), vehicle: _splitList($("sf-vehicle").value), drive_id: _splitList($("sf-drive").value),
+      thumbs_up, thumbs_down,
     }) });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
     await r.json();
