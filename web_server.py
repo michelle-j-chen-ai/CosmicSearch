@@ -30,6 +30,18 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
+# Cap CPU threads BEFORE numpy/torch/BLAS import. On Cloud Run the container sees the
+# HOST core count (dozens), so OpenMP/MKL/OpenBLAS and torch would each spawn far more
+# threads than the allocated vCPUs -> catastrophic oversubscription thrash (observed:
+# a single image encode took 60-97s and a corpus scoring 250s). Pin every thread pool
+# to the allocated vCPU count (NLS_NUM_THREADS, default 8 = the -full/base cpu limit).
+# setdefault so an explicit deploy env still wins; must run before the first numpy/torch
+# import (search_engine, below) for the BLAS backends to honor it.
+_NLS_THREADS = os.environ.get("NLS_NUM_THREADS", "8")
+for _tv in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_tv, _NLS_THREADS)
+
 import analytics
 import botocore.exceptions
 import db

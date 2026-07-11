@@ -26,6 +26,14 @@ import oci_s3
 import torch
 from transformers import AutoModel, AutoProcessor
 
+# Pin torch's intra-op thread pool to the allocated vCPUs (mirrors the BLAS env caps set
+# in web_server before import). Without this torch defaults to the HOST core count on
+# Cloud Run and oversubscribes the 8 allocated vCPUs -- the ViT video-encode forward
+# thrashes (a single image encode was taking ~60-97s).
+_torch_threads = int(os.environ.get("NLS_NUM_THREADS", "8"))
+if _torch_threads > 0:
+    torch.set_num_threads(_torch_threads)
+
 import numpy as np
 from config import (
     BASE_MODEL_REVISION,
