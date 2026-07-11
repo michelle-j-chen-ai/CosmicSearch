@@ -103,6 +103,13 @@ def _load_engine() -> None:
     here and warm the model/corpus on a daemon thread; endpoints return 503 until
     ``_state["ready"]``.
     """
+    import torch as _torch  # local: confirm the thread pin took effect (logged once)
+    LOGGER.info(
+        "thread config: torch=%d OMP=%s MKL=%s (NLS_NUM_THREADS=%s) -- capped to "
+        "allocated vCPUs to avoid Cloud Run oversubscription",
+        _torch.get_num_threads(), os.environ.get("OMP_NUM_THREADS"),
+        os.environ.get("MKL_NUM_THREADS"), os.environ.get("NLS_NUM_THREADS", "8"),
+    )
     cfg = AppConfig.from_env()
     _state["cfg"] = cfg
     _state["corpora"] = {}  # embeddings_uri -> Corpus (resident cache)
