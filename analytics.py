@@ -19,11 +19,13 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
 _VISITS_SUBDIR = "visits"
+_SEARCHES_SUBDIR = "searches"
 
 
 def analytics_dir() -> Path:
@@ -63,14 +65,46 @@ def record_visit(user: str, session_id: str, ts_unix: float) -> None:
 
 def load_visits() -> list[dict]:
     """Load all persisted visit records (newest first). Empty if none/unreadable."""
-    d = analytics_dir() / _VISITS_SUBDIR
+    return _load(_VISITS_SUBDIR, "ts_unix")
+
+
+def record_search(user: str, query: str, ts_unix: float, num_results: int | None = None) -> None:
+    """Record one text search: a structured log line + a durable per-search JSON file.
+
+    Unlike visits, this DOES store the query text -- surfacing what people search for is
+    the whole point. Best-effort; persistence failures are logged and swallowed.
+    """
+    rec = {
+        "user": user,
+        "query": query,
+        "ts_unix": float(ts_unix),
+        "num_results": None if num_results is None else int(num_results),
+    }
+    LOGGER.info("NLS_SEARCH %s", json.dumps(rec))
+    try:
+        d = analytics_dir() / _SEARCHES_SUBDIR
+        d.mkdir(parents=True, exist_ok=True)
+        # One file per search (random suffix -> no collision on identical/simultaneous
+        # searches, no cross-instance write contention).
+        (d / f"{int(ts_unix * 1000)}_{uuid.uuid4().hex[:8]}.json").write_text(json.dumps(rec))
+    except OSError as exc:
+        LOGGER.warning("could not persist search record: %s", exc)
+
+
+def load_searches() -> list[dict]:
+    """Load all persisted search records (newest first). Empty if none/unreadable."""
+    return _load(_SEARCHES_SUBDIR, "ts_unix")
+
+
+def _load(subdir: str, sort_key: str) -> list[dict]:
+    d = analytics_dir() / subdir
     if not d.is_dir():
         return []
-    visits: list[dict] = []
+    out: list[dict] = []
     for f in d.glob("*.json"):
         try:
-            visits.append(json.loads(f.read_text()))
+            out.append(json.loads(f.read_text()))
         except (OSError, ValueError):
             continue
-    visits.sort(key=lambda r: r.get("ts_unix", 0), reverse=True)
-    return visits
+    out.sort(key=lambda r: r.get(sort_key, 0), reverse=True)
+    return out

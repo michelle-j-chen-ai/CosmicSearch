@@ -1131,7 +1131,7 @@ def _window(corpus, scores, order, page, page_size, start_rank, start_score, t0,
 
 
 @app.post("/api/search")
-def search(req: SearchRequest) -> dict:
+def search(req: SearchRequest, request: Request) -> dict:
     _require_ready()
     if not req.query.strip():
         raise HTTPException(400, "empty query")
@@ -1167,6 +1167,10 @@ def search(req: SearchRequest) -> dict:
     out["funnel"] = search_engine.filter_funnel(
         corpus, start_unix, end_unix, allowed_mask=seg_mask
     )
+    # Track what people search (real IAP users only, like visits). Best-effort.
+    user = _current_user(request)
+    if user and user != "local":
+        analytics.record_search(user, req.query.strip(), time.time(), out.get("total"))
     return out
 
 
@@ -3477,6 +3481,7 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     exports = db.recent_exports(limit)
     seg_sets = db.segment_sets_used()
     visits = analytics.load_visits()  # platform usage (one record per page visit)
+    searches = analytics.load_searches()  # one record per text search (query kept)
 
     def _esc(v) -> str:
         return html.escape("" if v is None else str(v))
@@ -3506,6 +3511,36 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
             for u in unique_users
         )
         or "<tr><td colspan=2 class=empty>—</td></tr>"
+    )
+
+    # ---- Searches (what people search for) ----
+    total_searches = len(searches)
+    query_counts: dict[str, int] = {}
+    query_last: dict[str, float] = {}
+    for s in searches:
+        q = (s.get("query") or "").strip()
+        if not q:
+            continue
+        query_counts[q] = query_counts.get(q, 0) + 1
+        query_last[q] = max(query_last.get(q, 0.0), float(s.get("ts_unix") or 0))
+    top_queries = sorted(query_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    top_query_rows = (
+        "".join(
+            f"<tr><td class=tag>{_esc(q)}</td><td class=num>{fmtint(n)}</td>"
+            f"<td>{_fmt_unix(query_last.get(q))}</td></tr>"
+            for q, n in top_queries[:40]
+        )
+        or "<tr><td colspan=3 class=empty>No searches recorded yet.</td></tr>"
+    )
+    recent_search_rows = (
+        "".join(
+            f"<tr><td>{_fmt_unix(s.get('ts_unix'))}</td>"
+            f"<td>{_esc(s.get('user'))}</td>"
+            f"<td class=tag>{_esc(s.get('query'))}</td>"
+            f"<td class=num>{'' if s.get('num_results') is None else fmtint(s.get('num_results'))}</td></tr>"
+            for s in searches[:40]
+        )
+        or "<tr><td colspan=4 class=empty>No searches recorded yet.</td></tr>"
     )
 
     seg_rows = (
@@ -3598,6 +3633,7 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
   <div class=cards>
     <div class=card><div class=n>{fmtint(total_visits)}</div><div class=l>total visits</div></div>
     <div class=card><div class=n>{fmtint(len(unique_users))}</div><div class=l>unique users</div></div>
+    <div class=card><div class=n>{fmtint(total_searches)}</div><div class=l>searches ({fmtint(len(query_counts))} unique)</div></div>
     <div class=card><div class=n>{fmtint(len(exports))}</div><div class=l>exports</div></div>
     <div class=card><div class=n>{fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078;</div><div class=l>threshold feedback labels</div></div>
   </div>
@@ -3608,6 +3644,17 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
   <div class=half>
     <h2>Recent visits</h2>
     <table><thead><tr><th>When (UTC)</th><th>User</th></tr></thead><tbody>{visit_rows}</tbody></table>
+  </div>
+
+  <h2>Top searches ({fmtint(len(query_counts))} unique queries, {fmtint(total_searches)} total)</h2>
+  <p class=sub>What people search for (every text search by a signed-in user; query text is recorded).</p>
+  <div class=half>
+    <h2>Most searched</h2>
+    <table><thead><tr><th>Query</th><th>Count</th><th>Last (UTC)</th></tr></thead><tbody>{top_query_rows}</tbody></table>
+  </div>
+  <div class=half>
+    <h2>Recent searches</h2>
+    <table><thead><tr><th>When (UTC)</th><th>User</th><th>Query</th><th>Results</th></tr></thead><tbody>{recent_search_rows}</tbody></table>
   </div>
 
   <h2>Segment sets used in exports ({len(seg_sets)})</h2>
