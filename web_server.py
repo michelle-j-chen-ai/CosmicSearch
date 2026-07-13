@@ -578,12 +578,14 @@ def _read_scan_manifest(lance_uri: str) -> dict | None:
     if not lance_uri.endswith("/segments.lance"):
         return None
     manifest_uri = lance_uri[: -len("/segments.lance")] + "/manifest.json"
+    # Reuse the app's long-lived OCI client; building a fresh boto3 client per call is
+    # expensive and this runs on the polled /api/scans path.
+    client = _state.get("s3") or oci_s3.s3_client(fast_fail=True)
     try:
-        client = oci_s3.s3_client(fast_fail=True)
         bucket, key = oci_s3.parse_s3_uri(manifest_uri)
         body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
         return json.loads(body)
-    except (botocore.exceptions.ClientError, ValueError, OSError) as exc:
+    except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError, ValueError, OSError) as exc:
         LOGGER.info("scan manifest unavailable (%s): %s", manifest_uri, exc)
         return None
 
@@ -604,17 +606,21 @@ def _scan_counts_from_manifest(manifest: dict) -> dict:
 
 def _scan_counts(execution_id: str, status: str, lance_uri: str, cached) -> dict | None:
     """Result counts for a scan row: return the cached copy, else (once the scan has
-    SUCCEEDED) read+cache them from the manifest. Best-effort; None until available."""
-    if cached:
-        return cached
+    SUCCEEDED) read them from the manifest ONCE and cache the result.
+
+    Caching is the point: this runs on the polled /api/scans path, so a manifest must be
+    read at most once per scan. A missing/unreadable manifest is cached as an empty {}
+    sentinel so we never re-hit OCI for it on subsequent polls (an old scan's manifest
+    won't appear later). ``cached is not None`` distinguishes "already checked, nothing"
+    ({}) from "never checked" (None)."""
+    if cached is not None:
+        return cached or None
     if "SUCCEEDED" not in (status or "").upper() or not lance_uri:
         return None
     manifest = _read_scan_manifest(lance_uri)
-    if not manifest:
-        return None
-    counts = _scan_counts_from_manifest(manifest)
+    counts = _scan_counts_from_manifest(manifest) if manifest else {}
     db.set_scan_counts(execution_id, counts)
-    return counts
+    return counts or None
 
 
 def _dx_bitmap_from_segment_ids(corpus, seg_ids):

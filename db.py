@@ -958,8 +958,11 @@ def update_scan_job(execution_id: str, status: str, error: str = "") -> bool:
 
 
 def set_scan_counts(execution_id: str, counts: dict) -> bool:
-    """Cache a completed scan's manifest result counts on its row. Best-effort."""
-    if not execution_id or not counts:
+    """Cache a completed scan's manifest result counts on its row. Best-effort.
+
+    An empty ``counts`` ({}) is a valid negative sentinel ("manifest checked, nothing to
+    show") and IS persisted, so the polled scans list stops re-reading OCI for it."""
+    if not execution_id or counts is None:
         return False
     try:
         if not _schema_ready:
