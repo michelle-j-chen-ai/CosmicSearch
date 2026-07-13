@@ -880,9 +880,22 @@ function renderScans() {
       <td class="scan-tags">${(j.tags || []).length} tag(s): ${tagList}</td>
       <td class="scan-filters">${escapeHtml(filt)}</td>
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
+      <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}</td>
       <td>${out}</td>
       <td>${dx}</td></tr>`;
-  }).join("") : `<tr><td colspan="7" style="color:var(--muted-2)">No scans launched yet.</td></tr>`;
+  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No scans launched yet.</td></tr>`;
+}
+// Result counts (total segments + per-tag breakdown), mirroring the Data Explorer view.
+function _fmtScanCounts(c, status) {
+  if (!c) return /SUCCEEDED|COMPLETED/.test((status || "").toUpperCase()) ? `<span class="scan-dx none">…</span>` : `<span class="scan-dx none">—</span>`;
+  const total = c.num_segments != null ? c.num_segments.toLocaleString() : "?";
+  const unit = c.per_tag_is_segments ? "segments" : "intervals";
+  const perTag = c.per_tag || {};
+  const rows = Object.keys(perTag).sort((a, b) => (perTag[b] || 0) - (perTag[a] || 0))
+    .map((t) => `<div class="ct-row"><span class="ct-tag">${escapeHtml(t)}</span><span class="ct-n">${(perTag[t] || 0).toLocaleString()}</span></div>`).join("");
+  const clips = c.num_clips_scanned != null ? ` <span class="ct-sub">of ${c.num_clips_scanned.toLocaleString()} clips</span>` : "";
+  return `<div class="scan-counts-box"><div class="ct-total"><b>${total}</b> segments${clips}</div>`
+    + (rows ? `<div class="ct-list" title="${unit} per tag">${rows}</div>` : "") + `</div>`;
 }
 // Copy a scan's full output Lance URI (delegated so it survives re-renders).
 document.addEventListener("click", (e) => {
