@@ -512,9 +512,9 @@ def threshold_episodes(limit: int = 10000) -> list[dict]:
             conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
             rows = conn.execute(
                 text(
-                    f"SELECT features, suggested_tau, fit_tau, f1, tag, objective, "
-                    f"n_pos, n_neg, embeddings_uri, model_uri FROM {_BARE_EPISODE} "
-                    f"ORDER BY created_at DESC LIMIT :lim"
+                    f"SELECT created_at, features, suggested_tau, fit_tau, f1, tag, "
+                    f"objective, n_pos, n_neg, embeddings_uri, model_uri "
+                    f"FROM {_BARE_EPISODE} ORDER BY created_at DESC LIMIT :lim"
                 ),
                 {"lim": int(limit)},
             ).mappings().all()
