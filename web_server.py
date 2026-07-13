@@ -3506,9 +3506,31 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
         or "<tr><td colspan=8 class=empty>No exports recorded yet — hit Download on a search to create one.</td></tr>"
     )
 
+    # ---- Threshold-tuning feedback (👍/👎) ----
+    # Every threshold-sweep fit logs an episode with the running 👍/👎 tally; this is
+    # the durable record of the labeling done in the refine+threshold steps. (Marks
+    # also ride along on saved searches -- shown per-row in "Recent exports" above.)
+    episodes = db.threshold_episodes(limit=2000)
+    fb_total_up = sum(int(e.get("n_pos") or 0) for e in episodes)
+    fb_total_down = sum(int(e.get("n_neg") or 0) for e in episodes)
+    fb_tags = sorted({e.get("tag") for e in episodes if e.get("tag")})
+    fb_rows = (
+        "".join(
+            f"<tr><td>{_fmt_ts(e.get('created_at'))}</td>"
+            f"<td class=tag>{_esc(e.get('tag'))}</td>"
+            f"<td class=num>{_esc(e.get('n_pos'))}&#128077;</td>"
+            f"<td class=num>{_esc(e.get('n_neg'))}&#128078;</td>"
+            f"<td class=num>{('' if e.get('fit_tau') is None else format(float(e['fit_tau']), '.3f'))}</td>"
+            f"<td class=num>{('' if e.get('f1') is None else format(float(e['f1']), '.2f'))}</td></tr>"
+            for e in episodes[:40]
+        )
+        or "<tr><td colspan=6 class=empty>No threshold-tuning feedback recorded yet — "
+        "label 👍/👎 during a threshold sweep to create the first.</td></tr>"
+    )
+
     unavailable = (
         ""
-        if (exports or seg_sets)
+        if (exports or seg_sets or episodes)
         else "<p class=warn>exp-db returned no rows (it may be empty, or unreachable — "
         "saves are best-effort). Run a search and Download to create the first row.</p>"
     )
@@ -3528,6 +3550,7 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     <div class=card><div class=n>{fmtint(total_visits)}</div><div class=l>total visits</div></div>
     <div class=card><div class=n>{fmtint(len(unique_users))}</div><div class=l>unique users</div></div>
     <div class=card><div class=n>{fmtint(len(exports))}</div><div class=l>exports</div></div>
+    <div class=card><div class=n>{fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078;</div><div class=l>threshold feedback labels</div></div>
   </div>
   <div class=half>
     <h2>Users ({len(unique_users)})</h2>
@@ -3549,6 +3572,14 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     <thead><tr><th>When (UTC)</th><th>User</th><th>Query</th><th>Tag</th><th>k</th>
       <th>Results</th><th>Segment set</th><th>Search vector &amp; marks</th></tr></thead>
     <tbody>{export_rows}</tbody>
+  </table>
+
+  <h2>Threshold-tuning feedback ({fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078; over {len(fb_tags)} tags)</h2>
+  <p class=sub>Each 👍/👎 you label during the refine + threshold-sweep steps is recorded here
+     (from <span class=mono>{_esc(db.SCHEMA_NAME)}.threshold_episodes</span>).</p>
+  <table>
+    <thead><tr><th>When (UTC)</th><th>Tag</th><th>👍</th><th>👎</th><th>fit τ</th><th>F1</th></tr></thead>
+    <tbody>{fb_rows}</tbody>
   </table>
 </body></html>"""
     return HTMLResponse(body)
