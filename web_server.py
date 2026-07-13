@@ -572,6 +572,53 @@ def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
     return key, sorted(ids)
 
 
+def _read_scan_manifest(lance_uri: str) -> dict | None:
+    """The result manifest.json a completed scan writes next to its Lance output;
+    None if absent/unreadable. Best-effort (the scan may still be running, or an old
+    image may not have written one)."""
+    lance_uri = (lance_uri or "").rstrip("/")
+    if not lance_uri.endswith("/segments.lance"):
+        return None
+    manifest_uri = lance_uri[: -len("/segments.lance")] + "/manifest.json"
+    try:
+        client = oci_s3.s3_client(fast_fail=True)
+        bucket, key = oci_s3.parse_s3_uri(manifest_uri)
+        body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        return json.loads(body)
+    except (botocore.exceptions.ClientError, ValueError, OSError) as exc:
+        LOGGER.info("scan manifest unavailable (%s): %s", manifest_uri, exc)
+        return None
+
+
+def _scan_counts_from_manifest(manifest: dict) -> dict:
+    """Compact result counts for the Recent-scans panel: total segments/clips and the
+    per-tag breakdown. Prefers distinct-segment counts (Data-Explorer semantics); older
+    manifests only carry interval counts, so fall back to those and flag which it is."""
+    per_tag_segments = manifest.get("segments_per_tag") or {}
+    per_tag = per_tag_segments or manifest.get("intervals_per_tag") or {}
+    return {
+        "num_segments": manifest.get("num_segments"),
+        "num_clips_scanned": manifest.get("num_clips_scanned"),
+        "per_tag": per_tag,
+        "per_tag_is_segments": bool(per_tag_segments),
+    }
+
+
+def _scan_counts(execution_id: str, status: str, lance_uri: str, cached) -> dict | None:
+    """Result counts for a scan row: return the cached copy, else (once the scan has
+    SUCCEEDED) read+cache them from the manifest. Best-effort; None until available."""
+    if cached:
+        return cached
+    if "SUCCEEDED" not in (status or "").upper() or not lance_uri:
+        return None
+    manifest = _read_scan_manifest(lance_uri)
+    if not manifest:
+        return None
+    counts = _scan_counts_from_manifest(manifest)
+    db.set_scan_counts(execution_id, counts)
+    return counts
+
+
 def _dx_bitmap_from_segment_ids(corpus, seg_ids):
     """Roaring bitmap of the ``dx_internal_id``s of corpus rows whose ``segment_id``
     is in ``seg_ids`` -- i.e. convert a segment-id downsample set to the dx-internal
@@ -2224,6 +2271,7 @@ def scans(limit: int = 50) -> dict:
             )
             seg_uuid = seg.get("segset_uuid") or seg_uuid
             seg_label = seg.get("segset_label") or seg_label
+        counts = _scan_counts(execution, status, row.get("lance_uri") or "", row.get("counts"))
         jobs.append(
             {
                 "execution_id": execution,
@@ -2231,6 +2279,7 @@ def scans(limit: int = 50) -> dict:
                 "error": error,
                 "tags": row.get("tags") or [],
                 "thresholds": row.get("thresholds") or {},
+                "counts": counts,
                 "output_dir": row.get("output_dir") or "",
                 "lance_uri": row.get("lance_uri") or "",
                 "console_url": row.get("console_url") or "",

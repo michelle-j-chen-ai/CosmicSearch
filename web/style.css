@@ -174,6 +174,15 @@ tr.new-row{animation:flashnew 2s ease;}
 .scan-copy:hover{color:var(--fg, #fff); border-color:var(--accent, #c8ff4d);}
 .scan-dx{font-family:var(--mono); font-size:11px; color:var(--muted);}
 .scan-dx.none{color:var(--muted-2); font-style:italic;}
+.scan-counts{min-width:150px;}
+.scan-counts-box{display:flex; flex-direction:column; gap:4px;}
+.ct-total{font-size:12px; color:var(--text);}
+.ct-total b{color:var(--accent); font-size:13px;}
+.ct-sub,.scan-counts-box .ct-sub{color:var(--muted-2); font-size:10.5px;}
+.ct-list{display:flex; flex-direction:column; gap:1px; max-height:120px; overflow-y:auto;}
+.ct-row{display:flex; justify-content:space-between; gap:10px; font-size:11px; line-height:1.5;}
+.ct-tag{font-family:var(--mono); color:var(--muted); word-break:break-word;}
+.ct-n{font-family:var(--mono); color:var(--text); flex:0 0 auto;}
 
 /* ===== SINGLE EXPORT PANEL ===== */
 .export-panel{background:var(--surface); border:1.5px solid var(--border-soft); border-radius:12px; padding:20px 22px;}

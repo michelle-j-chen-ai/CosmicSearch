@@ -139,6 +139,10 @@ _DDL = [
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS idem_key TEXT",
     f"CREATE UNIQUE INDEX IF NOT EXISTS scan_jobs_idem_idx ON {_SCAN_TABLE} (idem_key) "
     f"WHERE idem_key IS NOT NULL",
+    # Result counts read back from the scan's manifest.json once it succeeds
+    # ({num_segments, num_clips_scanned, segments_per_tag, intervals_per_tag}); cached
+    # here so the Recent-scans panel need not re-read the manifest on every list.
+    f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS counts JSONB",
     # Threshold-tuning episodes: (score-distribution features, suggested tau, fitted
     # tau, metrics) captured each time a labeled fit is produced. Append-only training
     # data for a future learned threshold policy; no unique key (many tunes per tag).
@@ -762,10 +766,17 @@ _LIST_SCANS = text(
                register_segset, segset_name, segset_uuid, segset_label,
                tags::text       AS tags_json,
                thresholds::text AS thresholds_json,
-               filters::text    AS filters_json
+               filters::text    AS filters_json,
+               counts::text     AS counts_json
         FROM {_SCAN_TABLE}
         ORDER BY created_at DESC
         LIMIT :limit"""
+)
+
+# Cache a completed scan's manifest result counts on its row (best-effort, once).
+_SET_SCAN_COUNTS = text(
+    f"""UPDATE {_SCAN_TABLE} SET counts = CAST(:counts AS JSONB), updated_at = now()
+        WHERE execution_id = :execution_id"""
 )
 
 
@@ -946,6 +957,25 @@ def update_scan_job(execution_id: str, status: str, error: str = "") -> bool:
         return False
 
 
+def set_scan_counts(execution_id: str, counts: dict) -> bool:
+    """Cache a completed scan's manifest result counts on its row. Best-effort."""
+    if not execution_id or not counts:
+        return False
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            conn.execute(
+                _SET_SCAN_COUNTS,
+                {"execution_id": execution_id, "counts": json.dumps(counts)},
+            )
+        return True
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: set_scan_counts failed (%s): %s", type(exc).__name__, exc)
+        return False
+
+
 def list_scan_jobs(limit: int = 50) -> list[dict]:
     """Recent launched scans (newest first); [] if exp-db is unreachable. Each row
     parses tags (list) and thresholds ({tag: float}) from their JSON columns."""
@@ -970,6 +1000,10 @@ def list_scan_jobs(limit: int = 50) -> list[dict]:
                 d["filters"] = json.loads(d.pop("filters_json") or "{}")
             except ValueError:
                 d["filters"] = {}
+            try:
+                d["counts"] = json.loads(d.pop("counts_json") or "null")
+            except ValueError:
+                d["counts"] = None
             out.append(d)
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: list_scan_jobs failed (%s): %s", type(exc).__name__, exc)
