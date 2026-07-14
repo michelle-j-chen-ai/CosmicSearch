@@ -262,8 +262,12 @@ def _status_name(info) -> str:
     return str(raw)
 
 
-def scan_status(workload_id: str) -> dict:
+def scan_status(workload_id: str, timeout: float = 8.0) -> dict:
     """Phase of a launched scan workload, in the UI's {done, phase, error} shape.
+
+    ``timeout`` bounds the Lilypad gRPC call (seconds) so an unresponsive backend or a
+    stuck workload fails fast instead of blocking the caller -- essential when this is
+    called in a loop over many jobs on a request path.
 
     Lilypad status (e.g. EXPERIMENT_RUNNING / EXPERIMENT_COMPLETED / EXPERIMENT_FAILED)
     maps to: done iff terminal; phase=SUCCEEDED on success (the UI checks that), else
@@ -275,7 +279,7 @@ def scan_status(workload_id: str) -> dict:
 
     try:
         req = lilypad_service_pb2.GetWorkloadRequest(user_facing_id=workload_id)
-        info = _lilypad_stub().GetWorkload(req).workload
+        info = _lilypad_stub().GetWorkload(req, timeout=timeout).workload
     except Exception as exc:  # noqa: BLE001
         raise LauncherUnavailable(f"lilypad status failed: {exc}") from exc
     status = _status_name(info).upper()

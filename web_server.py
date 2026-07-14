@@ -2268,6 +2268,10 @@ def scans(limit: int = 50, live: bool = False) -> dict:
     # can never make this endpoint slow: read a few, cache them, let the rest fill in over
     # later polls. In the default (non-live) path we never touch OCI at all.
     manifest_reads_left = 8 if live else 0
+    # Bound live Lilypad status re-queries per request too: each GetWorkload can take up
+    # to its timeout for a stuck/unresponsive workload, so cap how many run per call to
+    # stay well under the client's timeout; the rest refresh on subsequent Reloads.
+    live_refresh_left = 5
     jobs = []
     for row in db.list_scan_jobs(limit=limit):
         seg_uuid = row.get("segset_uuid") or ""
@@ -2278,14 +2282,15 @@ def scans(limit: int = 50, live: bool = False) -> dict:
         # Refresh live phase for non-terminal jobs. The stored status only advances when
         # a client polls /api/scan_status, which the UI does only for scans it launched --
         # a scan launched via the API (e.g. CFC) is never polled, so its row would stay
-        # stuck at LAUNCHED forever. Re-query Lilypad here so the list self-heals for any
-        # launcher. Best-effort; there are only ever a handful of in-flight scans.
-        if refresh_live and execution and not _scan_status_terminal(status):
+        # stuck at LAUNCHED forever. Re-query Lilypad here (bounded, short timeout) so the
+        # list self-heals without ever blocking the request on a stuck workload.
+        if refresh_live and live_refresh_left > 0 and execution and not _scan_status_terminal(status):
+            live_refresh_left -= 1
             try:
-                live = nls_launcher.scan_status(execution)
-                phase = (live.get("phase") or "").strip()
+                live_status = nls_launcher.scan_status(execution, timeout=4.0)
+                phase = (live_status.get("phase") or "").strip()
                 if phase and phase != status:
-                    error = live.get("error") or error
+                    error = live_status.get("error") or error
                     db.update_scan_job(execution, phase, error)
                     status = phase
             except nls_launcher.LauncherUnavailable:
