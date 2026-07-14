@@ -139,7 +139,7 @@ function wireEvents() {
   $("newSearchBtn").onclick = () => setPage("search");
   $("savedFilter").oninput = renderTable;
   $("modelFilter").onchange = renderTable;
-  $("scansReload").onclick = loadScanJobs;
+  $("scansReload").onclick = () => loadScanJobs(true);
   $("tbody").onclick = (e) => {
     const b = e.target.closest("button.resume-link");
     if (b && b.dataset.id) resumeSession(b.dataset.id);
@@ -949,22 +949,28 @@ async function pollScan(execId, url) {
 
 /* ===================== recent scans ===================== */
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
-async function loadScanJobs() {
+async function loadScanJobs(live) {
   if (!state.offlineScan) return;
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
     body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
   }
+  // Client-side timeout so a slow/hung response can never leave the panel stuck on
+  // "Loading…" -- it surfaces an error instead. The default (non-live) list is a pure DB
+  // read server-side; live=1 also re-queries Lilypad for in-flight jobs (used by Reload).
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
   try {
-    const r = await fetch("/api/scans?limit=100");
+    const r = await fetch("/api/scans?limit=100" + (live ? "&live=1" : ""), { signal: ctrl.signal });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const d = await r.json();
     state.scanJobs = d.jobs || [];
   } catch (e) {
     console.error("loadScanJobs failed", e);
-    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(e.message)}</td></tr>`;
+    const msg = e.name === "AbortError" ? "timed out" : e.message;
+    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(msg)}</td></tr>`;
     return;
-  }
+  } finally { clearTimeout(timer); }
   renderScans();
 }
 function renderScans() {

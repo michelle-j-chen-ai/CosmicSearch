@@ -2252,16 +2252,22 @@ def _scan_status_terminal(status: str) -> bool:
 
 
 @app.get("/api/scans")
-def scans(limit: int = 50) -> dict:
+def scans(limit: int = 50, live: bool = False) -> dict:
     """Recent launched per-segment scans (newest first) for the Export tab's panel; each
     entry: execution_id, status, tags, thresholds, console_url, output lance, segment-set
-    info, timestamps. Also self-heals any completed-but-unregistered segment sets (so
-    reopening the tab registers a scan that finished while it was closed). Best-effort."""
-    refresh_live = nls_launcher.available()
-    # Bound OCI manifest reads per request so a burst of uncached scans can never make
-    # this polled endpoint slow: read a few per call, cache them, let the rest fill in
-    # over subsequent polls (each read caches a result, so this converges in a few polls).
-    manifest_reads_left = 8
+    info, timestamps.
+
+    By default this is a PURE DB read -- no synchronous Lilypad/DORA/OCI calls -- so the
+    polled panel can never hang on an unresponsive external service (status + counts come
+    straight from the stored row). Pass ``live=1`` to also re-query Lilypad for in-flight
+    jobs, self-heal pending segment-set registrations, and back-fill result counts from
+    each scan's manifest (bounded per call). The per-scan /api/scan_status poll keeps
+    active scans fresh regardless, so the default list stays fast."""
+    refresh_live = live and nls_launcher.available()
+    # Bound OCI manifest reads per request (live mode only) so a burst of uncached scans
+    # can never make this endpoint slow: read a few, cache them, let the rest fill in over
+    # later polls. In the default (non-live) path we never touch OCI at all.
+    manifest_reads_left = 8 if live else 0
     jobs = []
     for row in db.list_scan_jobs(limit=limit):
         seg_uuid = row.get("segset_uuid") or ""
@@ -2285,8 +2291,8 @@ def scans(limit: int = 50) -> dict:
             except nls_launcher.LauncherUnavailable:
                 pass
         # A scan that finished while the tab was closed never had a poll to register its
-        # segment set -- do it now (once) on list, best-effort.
-        if row.get("register_segset") and not seg_uuid and "SUCCEEDED" in status.upper():
+        # segment set -- do it now (once) on list, best-effort. Live mode only (DORA call).
+        if live and row.get("register_segset") and not seg_uuid and "SUCCEEDED" in status.upper():
             seg = _maybe_register_scan_segset(
                 row.get("execution_id"), done=True, phase="SUCCEEDED"
             )
