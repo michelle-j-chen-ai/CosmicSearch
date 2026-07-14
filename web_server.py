@@ -530,6 +530,10 @@ def _lance_filter_ids(uri: str) -> tuple[str, frozenset[str]]:
 # the scan output and passed BY REFERENCE (filter_ids_uri / segment_set_ids_uri) -- the
 # worker reads them in one GET, so there is NO upper bound on the downsample size.
 _SCAN_INLINE_IDS_MAX = 10_000
+# Upper bound on how many segments a scan may auto-register as a DORA segment set. Beyond
+# this the set is corpus-sized (a symptom of too-low a threshold) and unusable, and the
+# DORA CreateDataSet call would hang -- so we skip + annotate instead of registering.
+_SEGSET_MAX_SEGMENTS = 300_000
 
 
 def _ids_by_reference(ids: list[str], out_root: str, basename: str) -> str:
@@ -2192,6 +2196,15 @@ def _maybe_register_scan_segset(execution: str, *, done: bool, phase: str) -> di
     name = job.get("segset_name") or f"nls-scan-{execution}"
     if not lance_uri:
         return {}
+    # Cheap pre-check: the manifest already knows the segment count, so a corpus-sized
+    # result is skipped WITHOUT reading its (multi-million-row) lance at all.
+    manifest = _read_scan_manifest(lance_uri) or {}
+    n_manifest = manifest.get("num_segments")
+    if isinstance(n_manifest, int) and n_manifest > _SEGSET_MAX_SEGMENTS:
+        note = f"not registered: {n_manifest:,} segments exceeds {_SEGSET_MAX_SEGMENTS:,} cap (raise the tag's threshold)"
+        db.set_scan_segset(execution, "", note)
+        LOGGER.warning("scan segset: %s -> %s", execution, note)
+        return {"segset_label": note}
     try:
         import lance
 
@@ -2207,6 +2220,15 @@ def _maybe_register_scan_segset(execution: str, *, done: bool, phase: str) -> di
     if not seg_ids:
         db.set_scan_segset(execution, "", "no qualifying segments")
         return {"segset_label": "no qualifying segments"}
+    # Guardrail: a corpus-sized result (e.g. a tag whose threshold is far too low) would
+    # try to push millions of ids into DORA CreateDataSet -- which hangs and, since the
+    # refresher is single-flight, jams every other pending registration behind it. Such a
+    # set is unusable anyway; skip it, record why, and stop it re-attempting on every poll.
+    if len(seg_ids) > _SEGSET_MAX_SEGMENTS:
+        note = f"not registered: {len(seg_ids):,} segments exceeds {_SEGSET_MAX_SEGMENTS:,} cap (raise the tag's threshold)"
+        db.set_scan_segset(execution, "", note)
+        LOGGER.warning("scan segset: %s -> %s", execution, note)
+        return {"segset_label": note}
     label, err = _create_export_segment_set(
         seg_ids,
         name,
@@ -2272,7 +2294,15 @@ def _row_needs_refresh(row: dict) -> bool:
         return False
     if row.get("counts") is None and row.get("lance_uri"):
         return True
-    return bool(row.get("register_segset")) and not (row.get("segset_uuid") or "")
+    # Segment-set registration is settled once it has an outcome -- a uuid (registered) OR
+    # a recorded label (skipped as too large / no qualifying segments). Only a row with
+    # neither still needs a registration attempt; this stops a skipped set from re-reading
+    # its (huge) lance on every poll.
+    return (
+        bool(row.get("register_segset"))
+        and not (row.get("segset_uuid") or "")
+        and not (row.get("segset_label") or "")
+    )
 
 
 def _kick_scan_refresh(rows: list[dict], force: bool = False) -> bool:
