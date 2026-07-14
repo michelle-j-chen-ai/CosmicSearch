@@ -572,6 +572,9 @@ def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
     return key, sorted(ids)
 
 
+_SCAN_MANIFEST_S3 = None  # cached fast_fail OCI client for manifest reads
+
+
 def _read_scan_manifest(lance_uri: str) -> dict | None:
     """The result manifest.json a completed scan writes next to its Lance output;
     None if absent/unreadable. Best-effort (the scan may still be running, or an old
@@ -580,9 +583,13 @@ def _read_scan_manifest(lance_uri: str) -> dict | None:
     if not lance_uri.endswith("/segments.lance"):
         return None
     manifest_uri = lance_uri[: -len("/segments.lance")] + "/manifest.json"
-    # Reuse the app's long-lived OCI client; building a fresh boto3 client per call is
-    # expensive and this runs on the polled /api/scans path.
-    client = _state.get("s3") or oci_s3.s3_client(fast_fail=True)
+    # MUST use the fast_fail client (2 attempts, short timeouts): a missing/unreadable
+    # manifest has to fail in seconds, not retry for minutes on the polled /api/scans
+    # path. Cache it module-level so the first poll doesn't rebuild it per scan.
+    global _SCAN_MANIFEST_S3
+    if _SCAN_MANIFEST_S3 is None:
+        _SCAN_MANIFEST_S3 = oci_s3.s3_client(fast_fail=True)
+    client = _SCAN_MANIFEST_S3
     try:
         bucket, key = oci_s3.parse_s3_uri(manifest_uri)
         body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
@@ -2251,6 +2258,10 @@ def scans(limit: int = 50) -> dict:
     info, timestamps. Also self-heals any completed-but-unregistered segment sets (so
     reopening the tab registers a scan that finished while it was closed). Best-effort."""
     refresh_live = nls_launcher.available()
+    # Bound OCI manifest reads per request so a burst of uncached scans can never make
+    # this polled endpoint slow: read a few per call, cache them, let the rest fill in
+    # over subsequent polls (each read caches a result, so this converges in a few polls).
+    manifest_reads_left = 8
     jobs = []
     for row in db.list_scan_jobs(limit=limit):
         seg_uuid = row.get("segset_uuid") or ""
@@ -2281,7 +2292,19 @@ def scans(limit: int = 50) -> dict:
             )
             seg_uuid = seg.get("segset_uuid") or seg_uuid
             seg_label = seg.get("segset_label") or seg_label
-        counts = _scan_counts(execution, status, row.get("lance_uri") or "", row.get("counts"))
+        # Only read a manifest if uncached AND we still have read-budget this call;
+        # otherwise defer to a later poll (returns None now, fills in shortly).
+        needs_read = (
+            row.get("counts") is None
+            and "SUCCEEDED" in status.upper()
+            and bool(row.get("lance_uri"))
+        )
+        if needs_read and manifest_reads_left <= 0:
+            counts = None
+        else:
+            counts = _scan_counts(execution, status, row.get("lance_uri") or "", row.get("counts"))
+            if needs_read:
+                manifest_reads_left -= 1
         jobs.append(
             {
                 "execution_id": execution,
