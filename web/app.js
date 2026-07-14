@@ -164,7 +164,13 @@ function setPage(which) {
   $("navSaved").classList.toggle("active", which === "saved");
   $("page-search").classList.toggle("active", which === "search");
   $("page-saved").classList.toggle("active", which === "saved");
-  if (which === "saved") { renderTable(); renderExportPanel(); if (state.offlineScan) loadScanJobs(); }
+  if (which === "saved") {
+    // Each render is isolated so a failure in one never blocks the others -- in
+    // particular, a render error must not prevent the Recent scans list from loading.
+    try { renderTable(); } catch (e) { console.error("renderTable failed", e); }
+    try { renderExportPanel(); } catch (e) { console.error("renderExportPanel failed", e); }
+    if (state.offlineScan) loadScanJobs();
+  }
 }
 
 async function loadCorpus() {
@@ -945,8 +951,20 @@ async function pollScan(execId, url) {
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
 async function loadScanJobs() {
   if (!state.offlineScan) return;
-  try { const d = await fetch("/api/scans").then((r) => r.json()); state.scanJobs = d.jobs || []; }
-  catch (e) { return; }
+  const body = $("scansBody");
+  if (body && !(state.scanJobs && state.scanJobs.length)) {
+    body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
+  }
+  try {
+    const r = await fetch("/api/scans?limit=100");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    state.scanJobs = d.jobs || [];
+  } catch (e) {
+    console.error("loadScanJobs failed", e);
+    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(e.message)}</td></tr>`;
+    return;
+  }
   renderScans();
 }
 function renderScans() {
