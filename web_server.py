@@ -2296,30 +2296,49 @@ def _kick_scan_refresh(rows: list[dict], force: bool = False) -> bool:
 
 def _refresh_scan_rows(rows: list[dict]) -> None:
     """Background worker: bring each stale scan row up to live truth and persist it.
-    Every external call is bounded (Lilypad gRPC timeout) or inherently finite; failures
-    are logged and skipped so one bad row never blocks the rest."""
+
+    Three passes, fast-to-slow, so the quick wins land first: (1) ALL statuses (bounded
+    gRPC, ~seconds total) -- the panel's repoll picks these up in real time; (2) result
+    counts (one bounded OCI manifest read per scan, cached); (3) pending segment-set
+    registrations LAST (each reads the scan's whole output lance -- minutes per row) so
+    they can never delay a status update. Failures are logged and skipped so one bad row
+    never blocks the rest."""
     launcher_up = nls_launcher.available()
+    rows = [r for r in rows if r.get("execution_id")]
     try:
+        # Pass 1: statuses (fast, bounded).
+        n_status = 0
         for row in rows:
-            execution = row.get("execution_id")
-            if not execution:
-                continue
             status = row.get("status") or ""
-            if launcher_up and not _scan_status_terminal(status):
-                try:
-                    live = nls_launcher.scan_status(execution, timeout=8.0)
-                    phase = (live.get("phase") or "").strip()
-                    if phase and phase != status:
-                        db.update_scan_job(execution, phase, live.get("error") or "")
-                        status = phase
-                except nls_launcher.LauncherUnavailable as exc:
-                    LOGGER.info("scan refresh: %s status unavailable: %s", execution, exc)
-            if "SUCCEEDED" not in status.upper():
+            if not launcher_up or _scan_status_terminal(status):
                 continue
-            if row.get("counts") is None and row.get("lance_uri"):
-                _scan_counts(execution, status, row["lance_uri"], None)
-            if row.get("register_segset") and not (row.get("segset_uuid") or ""):
-                _maybe_register_scan_segset(execution, done=True, phase="SUCCEEDED")
+            try:
+                live = nls_launcher.scan_status(row["execution_id"], timeout=8.0)
+                phase = (live.get("phase") or "").strip()
+                if phase and phase != status:
+                    db.update_scan_job(row["execution_id"], phase, live.get("error") or "")
+                    row["status"] = phase
+                    n_status += 1
+            except nls_launcher.LauncherUnavailable as exc:
+                LOGGER.info("scan refresh: %s status unavailable: %s", row["execution_id"], exc)
+        LOGGER.info("scan refresh: %d/%d statuses advanced", n_status, len(rows))
+        # Pass 2: result counts (bounded manifest read, cached incl. negative sentinel).
+        for row in rows:
+            if (
+                "SUCCEEDED" in (row.get("status") or "").upper()
+                and row.get("counts") is None
+                and row.get("lance_uri")
+            ):
+                _scan_counts(row["execution_id"], row["status"], row["lance_uri"], None)
+        # Pass 3: pending segment-set registrations (slow; strictly last).
+        for row in rows:
+            if (
+                "SUCCEEDED" in (row.get("status") or "").upper()
+                and row.get("register_segset")
+                and not (row.get("segset_uuid") or "")
+            ):
+                LOGGER.info("scan refresh: registering segment set for %s", row["execution_id"])
+                _maybe_register_scan_segset(row["execution_id"], done=True, phase="SUCCEEDED")
     finally:
         with _SCAN_REFRESH_LOCK:
             _SCAN_REFRESH["running"] = False
