@@ -923,11 +923,22 @@ async function launchScan() {
   const tags = rows.map((e) => e.tag);
   const defThr = 0.3;
   const thresholds = {}; rows.forEach((e) => { thresholds[e.tag] = e.threshold > 0 ? e.threshold : defThr; });
+  // Top-K offline scan: only when a segment set / lance downsample scopes the scan (the
+  // worker ranks within that set). Otherwise Top-K is meaningless offline -- guide the user.
+  const topk = state.cutoffMode === "topk";
+  const hasScope = !!(state.exportSegUuid || ($("ex-lance") && ($("ex-lance").value || "").trim()));
+  if (topk && !hasScope) {
+    const jsg = $("jobStatus"); jsg.classList.add("show");
+    jsg.innerHTML = `<span style="color:var(--neg)">Top-K needs a segment set (or lance downsample) to rank within — pick one under Filters, or switch Cutoff to Threshold.</span>`;
+    return;
+  }
+  const topK = topk ? (parseInt($("kInput").value, 10) || 50) : null;
   const btn = $("exportBtn"); btn.disabled = true; btn.textContent = "⏳ Job queued…";
   const js = $("jobStatus"); js.classList.add("show"); js.innerHTML = `<span>launching per-segment scan over ${tags.length} tag(s)…</span>`;
   try {
     const r = await fetch("/api/launch_segment_scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       tags, thresholds, default_threshold: defThr, create_segment_set: $("segsetInput").checked, merge_intervals: state.sampleMode === "interval", ..._exportFilters(),
+      ...(topK ? { top_k: topK } : {}),
     }) });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
     const { execution_id, url } = await r.json();

@@ -178,6 +178,7 @@ def launch_segment_scan(
     vehicle: str = "",
     drive_id: str = "",
     merge_intervals: bool = True,
+    top_k: int | None = None,
     name: str = "nls-segment-scan",
 ) -> dict:
     """Per-segment multi-tag scan: {tag: [768 floats]} -> per-segment Lance table.
@@ -205,6 +206,11 @@ def launch_segment_scan(
         "merge_intervals": bool(merge_intervals),
         "search_vectors": {t: [float(x) for x in v] for t, v in search_vectors.items()},
     }
+    # Top-K retrieval (only when set): the worker returns the K highest-scoring segments
+    # per tag, scoped to the downsample/segment set. Omitted otherwise so a threshold scan
+    # config is unchanged (and an old worker image that predates the feature is unaffected).
+    if top_k:
+        ec["top_k"] = int(top_k)
     # Carry the full active filter set into the workflow inputs so the launched scan
     # includes the same filters the search used. The worker enforces date today and reads
     # the rest by name; passing them as runtime config needs no image rebuild and makes the

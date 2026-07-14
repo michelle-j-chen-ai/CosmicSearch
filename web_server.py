@@ -1839,6 +1839,11 @@ class SegmentScanRequest(BaseModel):
     # above-threshold clips into variable-length spans per segment; False emits one best
     # (highest-scoring) clip per segment (no interval merge).
     merge_intervals: bool = True
+    # Top-K retrieval: when set, return the K highest-scoring distinct segments per tag
+    # (ranked by best-clip score) instead of everything above a threshold. Requires a
+    # downsample/segment-set scope (the worker resolves it to member chunks and ranks
+    # within it); rejected otherwise. null => ordinary threshold scan.
+    top_k: int | None = None
 
 
 @app.post("/api/save_vector")
@@ -1919,6 +1924,7 @@ def _scan_idem_key(
             "drive_id": req.drive_id or "",
             "merge_intervals": bool(req.merge_intervals),
             "register_segset": bool(req.create_segment_set),
+            "top_k": int(req.top_k) if req.top_k else 0,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1983,6 +1989,12 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
             tags.append(t)
     if not tags:
         raise HTTPException(400, "provide at least one non-empty tag")
+    # Top-K is only tractable/meaningful scoped to a segment set or lance downsample (the
+    # worker resolves that scope to member chunks and ranks within it). Reject otherwise.
+    if req.top_k is not None and req.top_k <= 0:
+        raise HTTPException(400, "top_k must be a positive integer")
+    if req.top_k and not (req.segment_set_uuid or req.filter_lance_uri):
+        raise HTTPException(400, "top_k requires a segment set or lance downsample scope")
     if not _offline_scan_enabled():
         raise HTTPException(
             403,
@@ -2097,6 +2109,7 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 vehicle=req.vehicle or "",
                 drive_id=req.drive_id or "",
                 merge_intervals=bool(req.merge_intervals),
+                top_k=req.top_k,
             )
         except nls_launcher.LauncherUnavailable as exc:
             raise HTTPException(502, f"could not launch segment scan: {exc}")
