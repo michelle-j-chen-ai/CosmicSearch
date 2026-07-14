@@ -2251,93 +2251,117 @@ def _scan_status_terminal(status: str) -> bool:
     return any(t in up for t in ("SUCCEEDED", "FAILED", "ABORTED", "COMPLETED"))
 
 
+# Single-flight background refresher for the scans list. All the slow external work --
+# Lilypad status for in-flight jobs, manifest-count back-fill (OCI), and pending DORA
+# segment-set registration (reads the whole output lance; can take minutes per row) --
+# runs HERE, off the request path, and persists its results to the scan_jobs rows. The
+# GET endpoint is then always a pure DB read that just kicks this and reports whether a
+# refresh is in flight, so the panel converges to live truth without ever blocking.
+_SCAN_REFRESH_LOCK = threading.Lock()
+_SCAN_REFRESH = {"running": False, "last": 0.0}
+_SCAN_REFRESH_MIN_INTERVAL_S = 15.0
+
+
+def _row_needs_refresh(row: dict) -> bool:
+    """True if a scan row has anything a background refresh could advance: a non-final
+    status, missing result counts, or a pending segment-set registration."""
+    status = (row.get("status") or "").upper()
+    if not _scan_status_terminal(status):
+        return True
+    if "SUCCEEDED" not in status:
+        return False
+    if row.get("counts") is None and row.get("lance_uri"):
+        return True
+    return bool(row.get("register_segset")) and not (row.get("segset_uuid") or "")
+
+
+def _kick_scan_refresh(rows: list[dict], force: bool = False) -> bool:
+    """Start the background refresh for ``rows`` unless one is already running (or ran
+    very recently, unless forced). Returns True iff a refresh is now in flight."""
+    stale = [r for r in rows if _row_needs_refresh(r)]
+    if not stale:
+        return False
+    now = time.time()
+    with _SCAN_REFRESH_LOCK:
+        if _SCAN_REFRESH["running"]:
+            return True
+        if not force and now - _SCAN_REFRESH["last"] < _SCAN_REFRESH_MIN_INTERVAL_S:
+            return False
+        _SCAN_REFRESH["running"] = True
+    threading.Thread(
+        target=_refresh_scan_rows, args=(stale,), daemon=True, name="scan-refresh"
+    ).start()
+    return True
+
+
+def _refresh_scan_rows(rows: list[dict]) -> None:
+    """Background worker: bring each stale scan row up to live truth and persist it.
+    Every external call is bounded (Lilypad gRPC timeout) or inherently finite; failures
+    are logged and skipped so one bad row never blocks the rest."""
+    launcher_up = nls_launcher.available()
+    try:
+        for row in rows:
+            execution = row.get("execution_id")
+            if not execution:
+                continue
+            status = row.get("status") or ""
+            if launcher_up and not _scan_status_terminal(status):
+                try:
+                    live = nls_launcher.scan_status(execution, timeout=8.0)
+                    phase = (live.get("phase") or "").strip()
+                    if phase and phase != status:
+                        db.update_scan_job(execution, phase, live.get("error") or "")
+                        status = phase
+                except nls_launcher.LauncherUnavailable as exc:
+                    LOGGER.info("scan refresh: %s status unavailable: %s", execution, exc)
+            if "SUCCEEDED" not in status.upper():
+                continue
+            if row.get("counts") is None and row.get("lance_uri"):
+                _scan_counts(execution, status, row["lance_uri"], None)
+            if row.get("register_segset") and not (row.get("segset_uuid") or ""):
+                _maybe_register_scan_segset(execution, done=True, phase="SUCCEEDED")
+    finally:
+        with _SCAN_REFRESH_LOCK:
+            _SCAN_REFRESH["running"] = False
+            _SCAN_REFRESH["last"] = time.time()
+
+
 @app.get("/api/scans")
 def scans(limit: int = 50, live: bool = False) -> dict:
     """Recent launched per-segment scans (newest first) for the Export tab's panel; each
-    entry: execution_id, status, tags, thresholds, console_url, output lance, segment-set
-    info, timestamps.
+    entry: execution_id, status, tags, thresholds, counts, console_url, output lance,
+    segment-set info, timestamps.
 
-    By default this is a PURE DB read -- no synchronous Lilypad/DORA/OCI calls -- so the
-    polled panel can never hang on an unresponsive external service (status + counts come
-    straight from the stored row). Pass ``live=1`` to also re-query Lilypad for in-flight
-    jobs, self-heal pending segment-set registrations, and back-fill result counts from
-    each scan's manifest (bounded per call). The per-scan /api/scan_status poll keeps
-    active scans fresh regardless, so the default list stays fast."""
-    refresh_live = live and nls_launcher.available()
-    # Bound OCI manifest reads per request (live mode only) so a burst of uncached scans
-    # can never make this endpoint slow: read a few, cache them, let the rest fill in over
-    # later polls. In the default (non-live) path we never touch OCI at all.
-    manifest_reads_left = 8 if live else 0
-    # Bound live Lilypad status re-queries per request too: each GetWorkload can take up
-    # to its timeout for a stuck/unresponsive workload, so cap how many run per call to
-    # stay well under the client's timeout; the rest refresh on subsequent Reloads.
-    live_refresh_left = 5
-    jobs = []
-    for row in db.list_scan_jobs(limit=limit):
-        seg_uuid = row.get("segset_uuid") or ""
-        seg_label = row.get("segset_label") or ""
-        status = row.get("status") or ""
-        execution = row.get("execution_id")
-        error = row.get("error") or ""
-        # Refresh live phase for non-terminal jobs. The stored status only advances when
-        # a client polls /api/scan_status, which the UI does only for scans it launched --
-        # a scan launched via the API (e.g. CFC) is never polled, so its row would stay
-        # stuck at LAUNCHED forever. Re-query Lilypad here (bounded, short timeout) so the
-        # list self-heals without ever blocking the request on a stuck workload.
-        if refresh_live and live_refresh_left > 0 and execution and not _scan_status_terminal(status):
-            live_refresh_left -= 1
-            try:
-                live_status = nls_launcher.scan_status(execution, timeout=4.0)
-                phase = (live_status.get("phase") or "").strip()
-                if phase and phase != status:
-                    error = live_status.get("error") or error
-                    db.update_scan_job(execution, phase, error)
-                    status = phase
-            except nls_launcher.LauncherUnavailable:
-                pass
-        # A scan that finished while the tab was closed never had a poll to register its
-        # segment set -- do it now (once) on list, best-effort. Live mode only (DORA call).
-        if live and row.get("register_segset") and not seg_uuid and "SUCCEEDED" in status.upper():
-            seg = _maybe_register_scan_segset(
-                row.get("execution_id"), done=True, phase="SUCCEEDED"
-            )
-            seg_uuid = seg.get("segset_uuid") or seg_uuid
-            seg_label = seg.get("segset_label") or seg_label
-        # Only read a manifest if uncached AND we still have read-budget this call;
-        # otherwise defer to a later poll (returns None now, fills in shortly).
-        needs_read = (
-            row.get("counts") is None
-            and "SUCCEEDED" in status.upper()
-            and bool(row.get("lance_uri"))
-        )
-        if needs_read and manifest_reads_left <= 0:
-            counts = None
-        else:
-            counts = _scan_counts(execution, status, row.get("lance_uri") or "", row.get("counts"))
-            if needs_read:
-                manifest_reads_left -= 1
-        jobs.append(
-            {
-                "execution_id": execution,
-                "status": status,
-                "error": error,
-                "tags": row.get("tags") or [],
-                "thresholds": row.get("thresholds") or {},
-                "counts": counts,
-                "output_dir": row.get("output_dir") or "",
-                "lance_uri": row.get("lance_uri") or "",
-                "console_url": row.get("console_url") or "",
-                "register_segset": bool(row.get("register_segset")),
-                "segset_uuid": seg_uuid,
-                "segset_label": seg_label,
-                # The filter set the scan was launched with (date/segment-set/lance/vehicle/
-                # drive), so the Recent scans panel can show exactly what scope it ran over.
-                "filters": row.get("filters") or {},
-                "created_at": _fmt_ts(row.get("created_at")),
-                "updated_at": _fmt_ts(row.get("updated_at")),
-            }
-        )
-    return {"jobs": jobs}
+    Always a PURE DB read -- the response never blocks on Lilypad/DORA/OCI. Stale rows
+    (in-flight status, missing counts, pending segment-set) are refreshed by a throttled
+    single-flight background worker that this endpoint kicks; ``refreshing`` in the
+    response tells the client to re-poll shortly to pick up the refreshed rows.
+    ``live=1`` (the panel's Reload button) forces the kick past the throttle."""
+    rows = db.list_scan_jobs(limit=limit)
+    refreshing = _kick_scan_refresh(rows, force=bool(live))
+    jobs = [
+        {
+            "execution_id": row.get("execution_id"),
+            "status": row.get("status") or "",
+            "error": row.get("error") or "",
+            "tags": row.get("tags") or [],
+            "thresholds": row.get("thresholds") or {},
+            "counts": row.get("counts") or None,
+            "output_dir": row.get("output_dir") or "",
+            "lance_uri": row.get("lance_uri") or "",
+            "console_url": row.get("console_url") or "",
+            "register_segset": bool(row.get("register_segset")),
+            "segset_uuid": row.get("segset_uuid") or "",
+            "segset_label": row.get("segset_label") or "",
+            # The filter set the scan was launched with (date/segment-set/lance/vehicle/
+            # drive), so the Recent scans panel can show exactly what scope it ran over.
+            "filters": row.get("filters") or {},
+            "created_at": _fmt_ts(row.get("created_at")),
+            "updated_at": _fmt_ts(row.get("updated_at")),
+        }
+        for row in rows
+    ]
+    return {"jobs": jobs, "refreshing": refreshing}
 
 
 @app.get("/api/export_file")

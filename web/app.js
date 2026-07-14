@@ -949,22 +949,26 @@ async function pollScan(execId, url) {
 
 /* ===================== recent scans ===================== */
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
+let _scansRepollTimer = null;
 async function loadScanJobs(live) {
   if (!state.offlineScan) return;
+  clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
     body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
   }
-  // Client-side timeout so a slow/hung response can never leave the panel stuck on
-  // "Loading…" -- it surfaces an error instead. The default (non-live) list is a pure DB
-  // read server-side; live=1 also re-queries Lilypad for in-flight jobs (used by Reload).
+  // The list is a pure DB read server-side (never blocks on Lilypad/DORA/OCI); live=1
+  // (Reload) forces the server's background refresher to kick. The timeout is a belt --
+  // if anything is ever slow, the panel shows an error instead of an endless spinner.
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 30000);
+  const timer = setTimeout(() => ctrl.abort(), 20000);
+  let refreshing = false;
   try {
     const r = await fetch("/api/scans?limit=100" + (live ? "&live=1" : ""), { signal: ctrl.signal });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const d = await r.json();
     state.scanJobs = d.jobs || [];
+    refreshing = !!d.refreshing;
   } catch (e) {
     console.error("loadScanJobs failed", e);
     const msg = e.name === "AbortError" ? "timed out" : e.message;
@@ -972,6 +976,12 @@ async function loadScanJobs(live) {
     return;
   } finally { clearTimeout(timer); }
   renderScans();
+  // Converge to live truth: while the server is refreshing rows in the background (or
+  // jobs are still in flight), re-poll the cheap list until everything is settled.
+  const active = (state.scanJobs || []).some((j) => !/SUCCEEDED|COMPLETED|FAILED|ABORTED/.test((j.status || "").toUpperCase()));
+  if ((refreshing || active) && $("page-saved").classList.contains("active")) {
+    _scansRepollTimer = setTimeout(() => loadScanJobs(false), 7000);
+  }
 }
 function renderScans() {
   const jobs = state.scanJobs || [];
