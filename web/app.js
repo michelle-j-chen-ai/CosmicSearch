@@ -998,7 +998,12 @@ function renderScans() {
   const jobs = state.scanJobs || [];
   $("scansBody").innerHTML = jobs.length ? jobs.map((j) => {
     const id = j.console_url ? `<a class="scan-name" href="${j.console_url}" target="_blank" rel="noopener">${escapeHtml(j.execution_id)}</a>` : `<span class="scan-name">${escapeHtml(j.execution_id)}</span>`;
-    const tagList = (j.tags || []).map((t) => escapeHtml(t) + (j.thresholds && j.thresholds[t] != null ? ` @${j.thresholds[t]}` : "")).join(", ");
+    const topK = j.filters && j.filters.top_k;
+    // Top-K mode ranks within the scope and IGNORES the per-tag thresholds, so don't
+    // print "@tau" for those scans -- show a top-K=N badge instead (else it reads as a
+    // threshold scan). Threshold scans keep the per-tag "@tau" suffix.
+    const tagList = (j.tags || []).map((t) => escapeHtml(t) + (!topK && j.thresholds && j.thresholds[t] != null ? ` @${j.thresholds[t]}` : "")).join(", ");
+    const modeBadge = topK ? `<span class="scan-mode-topk" title="Top-K ranking within the downsampled scope (per-tag thresholds ignored)">top-K=${topK}</span> ` : "";
     const filt = _fmtScanFilters(j.filters);
     const out = j.lance_uri
       ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span><button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button></div>`
@@ -1009,7 +1014,7 @@ function renderScans() {
     return `<tr>
       <td class="scan-time">${escapeHtml(j.created_at || "")}</td>
       <td>${id}</td>
-      <td class="scan-tags">${(j.tags || []).length} tag(s): ${tagList}</td>
+      <td class="scan-tags">${(j.tags || []).length} tag(s): ${modeBadge}${tagList}</td>
       <td class="scan-filters">${escapeHtml(filt)}</td>
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
       <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}</td>

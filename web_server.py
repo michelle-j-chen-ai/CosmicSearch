@@ -2144,6 +2144,10 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 "vehicle": req.vehicle or "",
                 "drive_id": req.drive_id or "",
                 "merge_intervals": bool(req.merge_intervals),
+                # Top-K vs threshold mode, so Recent scans can show which ranking the
+                # scan actually ran (the per-tag thresholds are recorded either way, but
+                # in Top-K mode the worker ignores them and ranks within the scope).
+                "top_k": int(req.top_k) if req.top_k else None,
             },
         }
         res["tags"] = tags
