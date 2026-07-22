@@ -42,6 +42,7 @@ const state = {
   savedRows: [], selected: new Set(),
   scanJobs: [],
   cutoffMode: "threshold",
+  perTagK: {},               // tag -> top-K, for per-search K in a multi-tag Top-K export
   sampleMode: "interval",
 };
 let _issueSeq = 0;
@@ -837,10 +838,45 @@ function renderCutoffField() {
   const box = $("cutoffField");
   if (state.cutoffMode === "threshold") {
     box.innerHTML = `<span style="font-size:11.5px;color:var(--muted-2);">Exports each selected search at its own saved τ (capped at k).</span>`;
+    return;
+  }
+  const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
+  if (rows.length > 1) {
+    // Per-search Top-K: one K input per selected tag (backend takes a per-query k).
+    const items = rows.map((e) => {
+      const k = state.perTagK[e.tag] != null ? state.perTagK[e.tag] : (e.k || 50);
+      return `<div class="pertag-k-row"><span class="pertag-k-tag" title="${escapeHtml(e.tag)}">${escapeHtml(e.tag)}</span>`
+        + `<input class="pertag-k-input" data-tag="${escapeHtml(e.tag)}" value="${escapeHtml(String(k))}" inputmode="numeric"></div>`;
+    }).join("");
+    box.innerHTML = `<div class="pertag-k-head"><label>K per search</label>`
+      + `<span class="pertag-k-all">set all <input id="kAllInput" placeholder="K" inputmode="numeric"></span></div>`
+      + `<div class="pertag-k-list">${items}</div>`;
+    box.querySelectorAll(".pertag-k-input").forEach((inp) => {
+      inp.oninput = () => { state.perTagK[inp.dataset.tag] = inp.value; };
+    });
+    const all = $("kAllInput");
+    if (all) all.oninput = () => {
+      box.querySelectorAll(".pertag-k-input").forEach((inp) => {
+        inp.value = all.value; state.perTagK[inp.dataset.tag] = all.value;
+      });
+    };
   } else {
     box.innerHTML = `<label>K =</label><input id="kInput" value="50"><span id="kConversion" style="font-size:11.5px;color:var(--muted-2);font-family:var(--mono);"></span>`;
     $("kInput").oninput = updateKConversion; updateKConversion();
   }
+}
+// Top-K for one selected saved-search row. With >1 tag selected the per-tag
+// input wins (default = the tag's saved k, matching what the input shows);
+// with a single tag it's the global K input. Falls back to 50.
+function kForRow(e) {
+  if (state.selected.size > 1) {
+    const per = parseInt(state.perTagK[e.tag], 10);
+    if (Number.isFinite(per) && per > 0) return per;
+    const saved = parseInt(e.k, 10);
+    return Number.isFinite(saved) && saved > 0 ? saved : 50;
+  }
+  const g = parseInt(($("kInput") || {}).value, 10);
+  return Number.isFinite(g) && g > 0 ? g : 50;
 }
 function updateKConversion() {
   const k = parseInt($("kInput").value, 10) || 0;
@@ -901,8 +937,9 @@ function doExport() {
 async function downloadCsv() {
   const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
   const topk = state.cutoffMode === "topk";
-  const kGlobal = parseInt(($("kInput") || {}).value, 10) || 50;
-  const queries = rows.map((e) => ({ query: e.query || e.tag, k: topk ? kGlobal : (e.k || 50), threshold: topk ? 0 : (e.threshold || 0) }));
+  // Top-K uses a per-search K (kForRow: the tag's own input when >1 selected,
+  // else the single global K); threshold mode keeps each tag's saved k cap.
+  const queries = rows.map((e) => ({ query: e.query || e.tag, k: topk ? kForRow(e) : (e.k || 50), threshold: topk ? 0 : (e.threshold || 0) }));
   const btn = $("exportBtn"); btn.disabled = true; $("exportNote").textContent = `Exporting ${queries.length} tag(s) from the loaded corpus…`;
   try {
     const resp = await fetch("/api/export_config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
