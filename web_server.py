@@ -371,21 +371,35 @@ def _segment_ids(uuid: str) -> frozenset[str] | None:
     return None
 
 
-def _scored_order(query, start_unix, end_unix, allowed_mask, corpus, uri, seg_sig):
+def _scored_order(
+    query, start_unix, end_unix, allowed_mask, corpus, uri, seg_sig, subset_ok=False
+):
     """Encode + score + rank, memoizing the last (uri, query, filters) for paging.
 
     ``allowed_mask`` is the cached corpus-aligned boolean mask for the segment
     set (or None); ``seg_sig`` keys the cache (the uuid + whether the filter was
     actually applied).
+
+    ``subset_ok`` lets a small-downsample caller score ONLY the allowed rows
+    (the rest are ``-inf``). It is safe only for callers that read ``scores``
+    exclusively through the returned ``order`` (search paging, export); callers
+    that read scores at arbitrary indices (threshold/analyze, which index the
+    labeled 👍/👎 marks) must leave it False. A subset-scored memo entry is never
+    reused for a full-scores caller (and vice-versa is fine -- full serves both).
     """
     sig = (uri, query, start_unix, end_unix, seg_sig)
     cache = _state.get("last")
-    if cache and cache["sig"] == sig:
+    if cache and cache["sig"] == sig and (subset_ok or cache.get("subset") is None):
         return cache["scores"], cache["order"]
     vec = search_engine.encode_query(
         query, _state["processor"], _state["model"], _state["cfg"].device
     )
-    scores = search_engine.score_corpus(vec, corpus)
+    subset_idx = None
+    if subset_ok and allowed_mask is not None:
+        n_allowed = int(np.count_nonzero(allowed_mask))
+        if 0 < n_allowed <= search_engine.SUBSET_SCORE_MAX:
+            subset_idx = np.nonzero(allowed_mask)[0]
+    scores = search_engine.score_corpus(vec, corpus, subset_idx=subset_idx)
     order = search_engine.ranked_order(
         scores,
         corpus,
@@ -394,7 +408,13 @@ def _scored_order(query, start_unix, end_unix, allowed_mask, corpus, uri, seg_si
         allowed_mask=allowed_mask,
     )
     # Keep the encoded vector too, so export can persist it without re-encoding.
-    _state["last"] = {"sig": sig, "scores": scores, "order": order, "vec": vec}
+    _state["last"] = {
+        "sig": sig,
+        "scores": scores,
+        "order": order,
+        "vec": vec,
+        "subset": subset_idx,
+    }
     return scores, order
 
 
@@ -1163,7 +1183,8 @@ def search(req: SearchRequest, request: Request) -> dict:
         _combined_mask(uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id)
     )
     scores, order = _scored_order(
-        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
+        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig,
+        subset_ok=True,
     )
     out = _window(
         corpus,
@@ -2795,7 +2816,8 @@ def export(req: ExportRequest, request: Request) -> Response:
         uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
     )
     scores, order = _scored_order(
-        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
+        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig,
+        subset_ok=True,
     )
     if req.interval:
         return _export_intervals(req, request, corpus, uri, scores, order)

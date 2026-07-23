@@ -601,12 +601,36 @@ def rank_top_k(query_vector: np.ndarray, corpus: Corpus, top_k: int) -> list[Ran
     return [_hit(corpus, scores, int(i), rank) for rank, i in enumerate(top, start=1)]
 
 
-def score_corpus(query_vector: np.ndarray, corpus: Corpus) -> np.ndarray:
-    """Cosine similarity of the query against every corpus row (1-D, fp-matrix dtype)."""
+# When a downsample restricts the search to at most this many rows, score ONLY
+# those rows (gather + small matmul) instead of multiplying the query against all
+# ~10^7 corpus rows. The gathered submatrix is a transient copy, so the cap bounds
+# that temporary (dim * dtype * cap bytes; ~1.5GB dense fp16, ~256MB int8 at 1e6).
+SUBSET_SCORE_MAX = 1_000_000
+
+
+def score_corpus(
+    query_vector: np.ndarray,
+    corpus: Corpus,
+    subset_idx: np.ndarray | None = None,
+) -> np.ndarray:
+    """Cosine similarity of the query against corpus rows (1-D, fp-matrix dtype).
+
+    When ``subset_idx`` is given, only those rows are scored and every other row
+    is ``-inf`` (so it is never ranked). This turns a downsample search into a
+    matmul over the selected rows rather than the whole corpus. Callers must only
+    read the returned scores at in-subset positions (i.e. through the ``order``
+    that ``ranked_order`` produces under the same mask); the sentinel ``-inf`` is
+    filtered by ``np.isfinite`` guards elsewhere.
+    """
     if hasattr(corpus, "gpu_score"):
         # int8 PCA backend: project + dequant-fold + blocked int8 matmul.
-        return corpus.gpu_score(query_vector)
-    return corpus.matrix @ query_vector.astype(corpus.matrix.dtype)
+        return corpus.gpu_score(query_vector, subset_idx=subset_idx)
+    q = query_vector.astype(corpus.matrix.dtype)
+    if subset_idx is None:
+        return corpus.matrix @ q
+    scores = np.full(corpus.matrix.shape[0], -np.inf, dtype=corpus.matrix.dtype)
+    scores[subset_idx] = corpus.matrix[subset_idx] @ q
+    return scores
 
 
 def segment_mask(

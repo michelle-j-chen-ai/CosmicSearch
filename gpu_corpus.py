@@ -303,7 +303,9 @@ class GpuCorpus:
         return np.empty(0, dtype=np.int64)
 
     # --- GPU scoring ---------------------------------------------------------
-    def gpu_score(self, query_vector: np.ndarray) -> np.ndarray:
+    def gpu_score(
+        self, query_vector: np.ndarray, subset_idx: np.ndarray | None = None
+    ) -> np.ndarray:
         """Exact cosine of a 768-d query against every row (1-D fp32 numpy).
 
         Project the query into PCA space, fold the per-dim dequant scale into it
@@ -311,6 +313,10 @@ class GpuCorpus:
         blocked int8->fp16 matmul. The full score vector is returned (the app's
         threshold paging and exports need every row's score), but the heavy sort
         is done on-GPU by `gpu_argsort`.
+
+        When ``subset_idx`` is given, only those rows are scored (the int8 rows
+        are gathered first) and every other row is ``-inf``, so a downsample
+        search costs a matmul over the selected rows instead of all ~10^7.
         """
         t0 = time.time()
         n = self.num_rows
@@ -319,11 +325,18 @@ class GpuCorpus:
             # then a numba-fused int8 dot (reads the int8 corpus once).
             qp = self.pca @ np.ascontiguousarray(query_vector, dtype=np.float32)
             w = (qp * (self.scale / 127.0)).astype("float32")
-            scores = np.empty(n, dtype="float32")
-            _cpu_score_kernel()(self.corpus_int8, w, scores)
+            if subset_idx is None:
+                scores = np.empty(n, dtype="float32")
+                _cpu_score_kernel()(self.corpus_int8, w, scores)
+            else:
+                sub = np.ascontiguousarray(self.corpus_int8[subset_idx])
+                sub_scores = np.empty(sub.shape[0], dtype="float32")
+                _cpu_score_kernel()(sub, w, sub_scores)
+                scores = np.full(n, -np.inf, dtype="float32")
+                scores[subset_idx] = sub_scores
             LOGGER.info(
                 "cpu scored %d rows (int8 PCA-%d) in %.0fms",
-                n,
+                n if subset_idx is None else len(subset_idx),
                 self.pca_dim,
                 (time.time() - t0) * 1000,
             )
@@ -333,15 +346,29 @@ class GpuCorpus:
         )
         qp = self.pca.to(torch.float32) @ q  # (D,) project: P (D,768) @ q (768,)
         w = (qp * (self.scale / 127.0)).to(torch.float16)  # fold dequant scale
-        out = torch.empty(n, dtype=torch.float32, device=self.device)
-        for s in range(0, n, _SCORE_BLOCK_ROWS):
-            e = min(s + _SCORE_BLOCK_ROWS, n)
-            blk = self.corpus_int8[s:e].to(torch.float16)  # transient fp16 tile
-            out[s:e] = (blk @ w).to(torch.float32)
+        out = torch.full((n,), float("-inf"), dtype=torch.float32, device=self.device)
+        if subset_idx is None:
+            rows = range(0, n, _SCORE_BLOCK_ROWS)
+            for s in rows:
+                e = min(s + _SCORE_BLOCK_ROWS, n)
+                blk = self.corpus_int8[s:e].to(torch.float16)  # transient fp16 tile
+                out[s:e] = (blk @ w).to(torch.float32)
+        else:
+            sel = torch.from_numpy(
+                np.ascontiguousarray(subset_idx, dtype=np.int64)
+            ).to(self.device)
+            gathered = self.corpus_int8.index_select(0, sel)  # (len_subset, D) int8
+            m = gathered.shape[0]
+            sub_out = torch.empty(m, dtype=torch.float32, device=self.device)
+            for s in range(0, m, _SCORE_BLOCK_ROWS):
+                e = min(s + _SCORE_BLOCK_ROWS, m)
+                blk = gathered[s:e].to(torch.float16)
+                sub_out[s:e] = (blk @ w).to(torch.float32)
+            out.index_copy_(0, sel, sub_out)
         scores = out.detach().cpu().numpy()
         LOGGER.info(
             "gpu scored %d rows (int8 PCA-%d) in %.0fms",
-            n,
+            n if subset_idx is None else len(subset_idx),
             self.pca_dim,
             (time.time() - t0) * 1000,
         )
