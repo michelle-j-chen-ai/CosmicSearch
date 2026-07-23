@@ -129,7 +129,7 @@
         <div class="filters-grid">
           <div class="field"><label>Date from</label><input type="date" id="sf-dateFrom"></div>
           <div class="field"><label>Date to</label><input type="date" id="sf-dateTo"></div>
-          <div class="field"><label>Vehicle ID</label><input id="sf-vehicle" placeholder="e.g. truck-808, truck-810"></div>
+          <div class="field"><label>Vehicle ID</label><input id="sf-vehicle" list="veh-list" placeholder="pick or type a vehicle id"><div class="hint" id="sf-vehicle-hint"></div></div>
           <div class="field"><label>Drive ID (run_uuid)</label><input id="sf-drive" placeholder="e.g. 019eb27f-…"></div>
           <div class="field"><label>Data Explorer segment set</label>
             <div class="combo" id="sf-dxset-combo">
@@ -228,7 +228,7 @@
       <div class="filters-grid">
         <div class="field"><label>Date from</label><input type="date" id="ex-dateFrom"><div class="hint">blank = full corpus</div></div>
         <div class="field"><label>Date to</label><input type="date" id="ex-dateTo"><div class="hint">blank = full corpus</div></div>
-        <div class="field"><label>Vehicle ID</label><input id="ex-vehicle" placeholder="e.g. truck-808, truck-810"></div>
+        <div class="field"><label>Vehicle ID</label><input id="ex-vehicle" list="veh-list" placeholder="pick or type a vehicle id"><div class="hint" id="ex-vehicle-hint"></div></div>
         <div class="field"><label>Drive ID (run_uuid)</label><input id="ex-drive" placeholder="e.g. 019eb27f-…"></div>
         <div class="field"><label>Data Explorer segment set (superset)</label>
           <div class="combo" id="ex-dxset-combo">
@@ -323,6 +323,9 @@
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- Vehicle-id suggestions, populated from the active corpus (applyCorpus). -->
+<datalist id="veh-list"></datalist>
 
 <script src="/static/app.js"></script>
 </body>

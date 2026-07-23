@@ -1059,6 +1059,22 @@ class CurateExportRequest(BaseModel):
 
 
 # --- API --------------------------------------------------------------------
+# Distinct non-empty vehicle ids per corpus, for the Vehicle-ID filter's
+# typeahead. Computed once per uri (O(corpus) over the vehicle column) and cached;
+# empty list means the corpus carries no vehicle metadata (filter is inert).
+_VEHICLES_CACHE: dict[str, list[str]] = {}
+
+
+def _corpus_vehicles(uri: str, corpus) -> list[str]:
+    cached = _VEHICLES_CACHE.get(uri)
+    if cached is not None:
+        return cached
+    arr = corpus.vehicle_array()
+    vals = sorted({v for v in (arr.tolist() if arr is not None else []) if v})
+    _VEHICLES_CACHE[uri] = vals
+    return vals
+
+
 @app.get("/api/corpus")
 def corpus_info(uri: str | None = None) -> dict:
     """Info for a corpus; if `uri` is given, load + activate it (switch corpus)."""
@@ -1082,6 +1098,8 @@ def corpus_info(uri: str | None = None) -> dict:
         .date()
         .isoformat(),
         "has_segment_id": bool((c.segment_id_array() != "").any()),
+        "vehicles": _corpus_vehicles(_state["active_uri"], c),
+        "has_vehicle": len(_corpus_vehicles(_state["active_uri"], c)) > 0,
         "embeddings_uri": _state["active_uri"],
         # The ACTIVE (possibly runtime-swapped) encoder, not just the configured
         # default -- so the pill reflects /api/model switches. Friendly name

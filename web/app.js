@@ -82,6 +82,26 @@ function applyCorpus(c) {
   // whole corpus). Don't pin them to the loaded span or the scan is silently narrowed
   // (and don't constrain min/max, so earlier dates than the browse corpus stay pickable).
   ["ex-dateFrom", "ex-dateTo"].forEach((id) => { const el = $(id); if (el) { el.value = ""; el.removeAttribute("min"); el.removeAttribute("max"); } });
+  _applyVehicleFacet(c);
+}
+
+// Populate the vehicle-id typeahead from the active corpus and reflect whether the
+// vehicle filter can work at all. A corpus with no vehicle column silently ignored
+// the filter before (returning the whole corpus); now the input says so.
+function _applyVehicleFacet(c) {
+  const vals = (c && c.vehicles) || [];
+  const list = $("veh-list");
+  if (list) list.innerHTML = vals.map((v) => `<option value="${escapeHtml(v)}"></option>`).join("");
+  const has = !!(c && c.has_vehicle);
+  // Search queries the LOADED corpus, so gate sf-vehicle on its vehicle metadata.
+  const sf = $("sf-vehicle");
+  if (sf) { sf.disabled = !has; if (!has) sf.value = ""; sf.placeholder = has ? "pick or type a vehicle id" : "no vehicle metadata in this corpus"; }
+  const sfh = $("sf-vehicle-hint");
+  if (sfh) sfh.textContent = has ? `${vals.length} vehicle${vals.length === 1 ? "" : "s"} in this corpus` : "vehicle filter unavailable on this corpus";
+  // Export/offline-scan may run over a different (wider) corpus, so don't disable
+  // ex-vehicle -- just inform about the loaded corpus.
+  const exh = $("ex-vehicle-hint");
+  if (exh) exh.textContent = has ? `${vals.length} vehicles in the loaded corpus` : "loaded corpus has no vehicle metadata";
 }
 
 async function loadDefaultCorpusWhenReady() {
