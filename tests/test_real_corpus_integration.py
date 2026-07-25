@@ -5,7 +5,9 @@ Runs by default as part of `python -m pytest tests/`.  The fixture
 committed directly to this repo -- a 50,000-row random sample (fixed seed 42,
 numpy.random.default_rng) drawn from the full ~902,827-row real NLS corpus.
 It carries the same column layout and PCA / quant-scale metadata as the full
-dataset, so `threshold_search` exercises the identical code path.
+dataset, so `threshold_search` exercises the identical code path. Its storage
+version is one step below what `lance_writer` writes today, so this test also
+covers reading a dataset built before that bump.
 
 Scope: this fixture has no `pca_projection_fp32.npy`, so its `vector_fp` is
 the int8 dequantized back to fp32 (see `lance_writer.py`'s module docstring),
@@ -69,8 +71,8 @@ def real_dataset() -> lance.LanceDataset:
         "check that the repository was checked out completely"
     )
     ds = lance.dataset(str(_FIXTURE_DIR))
-    assert lance_writer.is_v21_dataset(ds), (
-        f"{_FIXTURE_DIR} is not a Lance 2.1 dataset -- fixture may be corrupt"
+    assert lance_writer.is_exact_threshold_dataset(ds), (
+        f"{_FIXTURE_DIR} is not an exact-threshold dataset -- fixture may be corrupt"
     )
     assert ds.count_rows() == _EXPECTED_ROW_COUNT, (
         f"{_FIXTURE_DIR} has {ds.count_rows()} rows, expected {_EXPECTED_ROW_COUNT}"

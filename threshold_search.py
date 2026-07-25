@@ -1,4 +1,4 @@
-"""Single-node, provably-complete cosine-threshold scan over a Lance 2.1 dataset.
+"""Single-node, provably-complete cosine-threshold scan over a Lance dataset.
 
 The threshold-retrieval workload needs ALL rows with score >= tau, not an
 approximate top-k (see `eps_bound.py`). This module wires the two accepted
@@ -232,8 +232,8 @@ def threshold_search(
     """Every row of `dataset` with re-rank score >= `tau`.
 
     `query` is a unit-norm vector in the original (pre-PCA) model space, same
-    convention as `gpu_corpus.GpuCorpus.gpu_score`. `dataset` must be a Lance
-    2.1 exact-threshold dataset (see `lance_writer.build_dataset`).
+    convention as `gpu_corpus.GpuCorpus.gpu_score`. `dataset` must be an
+    exact-threshold dataset (see `lance_writer.build_dataset`).
 
     Zero false negatives (against `vector_fp`; see `eps_bound.py`'s module
     docstring for what that guarantees against the true pre-quantization
@@ -248,18 +248,18 @@ def threshold_search(
     should use `ThresholdCorpus` instead, which decodes once and reuses the
     resident matrix across queries.
     """
-    if not lance_writer.is_v21_dataset(dataset):
+    if not lance_writer.is_exact_threshold_dataset(dataset):
         raise ValueError(
-            "threshold_search requires a Lance 2.1 exact-threshold dataset "
-            "(embedding_i8 + vector_fp columns, data_storage_version == '2.1', "
-            "PCA schema metadata present)"
+            "threshold_search requires an exact-threshold Lance dataset "
+            "(embedding_i8 + vector_fp columns, data_storage_version >= "
+            f"'{lance_writer.MIN_DATA_STORAGE_VERSION}', PCA schema metadata present)"
         )
     resident = _load_resident_corpus(dataset)
     return _search_resident(query, tau, dataset, resident)
 
 
 class ThresholdCorpus:
-    """Duck-type corpus wrapper around a Lance 2.1 exact-threshold dataset.
+    """Duck-type corpus wrapper around an exact-threshold Lance dataset.
 
     Decodes and holds `embedding_i8` resident in memory once, at
     construction -- repeated `.threshold_search()` calls scan that in-memory
@@ -276,11 +276,11 @@ class ThresholdCorpus:
     """
 
     def __init__(self, dataset: lance.LanceDataset) -> None:
-        if not lance_writer.is_v21_dataset(dataset):
+        if not lance_writer.is_exact_threshold_dataset(dataset):
             raise ValueError(
-                "ThresholdCorpus requires a Lance 2.1 exact-threshold dataset "
-                "(embedding_i8 + vector_fp columns, data_storage_version == "
-                "'2.1', PCA schema metadata present)"
+                "ThresholdCorpus requires an exact-threshold Lance dataset "
+                "(embedding_i8 + vector_fp columns, data_storage_version >= "
+                f"'{lance_writer.MIN_DATA_STORAGE_VERSION}', PCA schema metadata present)"
             )
         self._dataset = dataset
         self._resident = _load_resident_corpus(dataset)

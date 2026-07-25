@@ -34,7 +34,7 @@ worker holds its shard of the int8 PCA-256 screen column RESIDENT in RAM
 bandwidth with the existing numba int8 kernel, keeping everything
 >= tau - eps (hard Cauchy-Schwarz quantization bound). Survivor bands are
 re-ranked exactly against the fp32-256 column via Lance take() (1 IOP/row
-in format 2.1) from local NVMe cache or object store. An aggregator unions
+from format 2.1 on) from local NVMe cache or object store. An aggregator unions
 per-worker results (threshold union — no top-k merge) and verifies fragment
 coverage is complete before declaring the result exact. Warm per-query
 latency ~1-3s at any corpus size that keeps per-shard <= RAM; growth is
@@ -221,9 +221,11 @@ selectivity in isolation.
 
 One dataset (replaces the rank=NNNNN/ sharded lancedb tables):
 
-- Write with data_storage_version="2.1" (verify ds.data_storage_version at
-  runtime; pylance 4.x also exposes 2.2/2.3/"stable"). Both vector columns
-  are fixed-width >=128B/value => full-zip encoding => 1-IOP take().
+- Write with data_storage_version="2.2"; readers accept anything >= 2.1,
+  the version where fixed-width >=128B/value first gets full-zip encoding
+  => 1-IOP take(). Never write "stable": it resolves to the running pylance's
+  default, which is 2.0 on pylance 4.x and 2.1 on 9.x, so it can silently
+  produce a pre-full-zip dataset. Verify ds.data_storage_version at runtime.
 - Defaults max_rows_per_file=1,048,576 -> ~954 fragments @1B (fine;
   enable_v2_manifest_paths default on). compact_files(target_rows_per_
   fragment=1M) after appends; skips already-large fragments.
@@ -321,7 +323,7 @@ Day-1 gate passes, no cross-region blocker, and focused effort.
 - **Day 1 — Pipeline core + benchmark gate.** Write the Ray/Lilypad rewrite
   job (findings §5, lance-ray) that reads the per-rank lancedb shards,
   applies the existing build_gpu_corpus SVD+int8 math, and emits a 100M
-  slice as one sorted 2.1 dataset with FSL columns. On that slice measure
+  slice as one sorted 2.2 dataset with FSL columns. On that slice measure
   the open evidence gaps (§8): resident-shard scan GB/s (16 vs 32 vCPU),
   cold hydration from object store (LANCE_IO_THREADS 64->256 sweep), take()
   latency for the ~10k-row eps band (local NVMe vs object store), and a

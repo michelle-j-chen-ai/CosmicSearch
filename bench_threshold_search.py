@@ -15,10 +15,10 @@ Pipeline (subcommands):
             -> per-dim symmetric int8 quant (exact gpu_corpus convention)
             -> artifact {pca_components, quant_scales, corpus_int8, metadata,
                          pca_projection_fp32}
-            -> lance_writer.build_dataset -> v2.1 .lance (local)
+            -> lance_writer.build_dataset -> exact-threshold .lance (local)
             -> oci_s3.upload_directory -> s3://.../sample.lance
 
-  bench   v2.1 .lance on S3 (or --dataset-local a local path)
+  bench   exact-threshold .lance on S3 (or --dataset-local a local path)
             -> ThresholdCorpus(ds)              [COLD hydration: resident int8, timed]
             -> threshold_search(q, tau) x R     [WARM per-query: timed, min/p50/p95]
             -> oracle = vector_fp @ q_pca over all rows >= tau
@@ -223,11 +223,11 @@ def run_benchmark(
 ) -> BenchResult:
     """Time cold hydration + warm queries and prove zero false negatives.
 
-    Takes an already-open Lance 2.1 dataset (local or S3-backed) so this is
+    Takes an already-open exact-threshold dataset (local or S3-backed) so this is
     unit-testable without any S3 dependency.
     """
-    if not lance_writer.is_v21_dataset(ds):
-        raise ValueError("run_benchmark requires a Lance 2.1 exact-threshold dataset")
+    if not lance_writer.is_exact_threshold_dataset(ds):
+        raise ValueError("run_benchmark requires an exact-threshold Lance dataset")
 
     pca, scale = lance_writer.read_pca_metadata(ds)
     query = _in_subspace_query(pca, seed)
@@ -362,7 +362,7 @@ def cmd_build(args: argparse.Namespace) -> int:
             sample_rows=args.sample_rows, seed=args.seed,
         )
         local_lance = tmp_path / "out.lance"
-        print("building Lance 2.1 dataset ...")
+        print("building exact-threshold Lance dataset ...")
         lance_writer.build_dataset(artifact_dir, str(local_lance))
         oci_s3, client = _s3()
         print(f"uploading dataset -> {args.out_uri} ...")
@@ -432,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build", help="fp32 embeddings on S3 -> v2.1 .lance on S3")
+    b = sub.add_parser("build", help="fp32 embeddings on S3 -> exact-threshold .lance on S3")
     b.add_argument("--embeddings-uri", required=True,
                    help="s3://.../embeddings.npy (metadata.parquet expected alongside)")
     b.add_argument("--out-uri", required=True, help="s3://.../<name>.lance destination prefix")
@@ -441,10 +441,10 @@ def main(argv: list[str] | None = None) -> int:
     b.add_argument("--seed", type=int, default=_DEFAULT_SEED)
     b.set_defaults(func=cmd_build)
 
-    n = sub.add_parser("bench", help="benchmark + prove zero-FN on a v2.1 .lance dataset")
+    n = sub.add_parser("bench", help="benchmark + prove zero-FN on an exact-threshold dataset")
     src = n.add_mutually_exclusive_group(required=True)
     src.add_argument("--dataset-uri", help="s3://.../<name>.lance (lance-native S3 read)")
-    src.add_argument("--dataset-local", help="local path to a v2.1 .lance dataset")
+    src.add_argument("--dataset-local", help="local path to an exact-threshold .lance dataset")
     _add_bench_args(n)
     n.set_defaults(func=cmd_bench)
 

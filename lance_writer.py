@@ -1,4 +1,4 @@
-"""Lance 2.1 dataset writer for the exact-threshold corpus layout.
+"""Lance dataset writer for the exact-threshold corpus layout.
 
 Converts an existing `gpu_corpus`-style int8 PCA artifact (`pca_components.npy`
 + `quant_scales.npy` + `corpus_int8.npy` + `metadata.parquet`, see gpu_corpus.py
@@ -25,9 +25,8 @@ only when a real `pca_projection_fp32.npy` is supplied. See `eps_bound.py`'s
 module docstring for the precise scope of what the bound covers.
 
 Both vector columns are >=128 bytes/value (256 * 4 = 1024B, 256 * 1 = 256B),
-so under `data_storage_version="2.1"` they get Lance's full-zip encoding,
-which makes a `take()` a single IOP per row -- the property the re-rank path
-depends on.
+so from storage version 2.1 on they get Lance's full-zip encoding, which makes
+a `take()` a single IOP per row -- the property the re-rank path depends on.
 
 Rows are written physically sorted by (chunk_start_unix, vehicle) so that
 Lance's per-fragment min/max stats let date/vehicle prefilters skip whole
@@ -58,7 +57,13 @@ METADATA_FILE = "metadata.parquet"
 # dequant(int8) -- see module docstring.
 PRE_QUANT_FP32_FILE = "pca_projection_fp32.npy"
 
-DATA_STORAGE_VERSION = "2.1"
+# Storage version new datasets are written with. Never write "stable": it
+# resolves to the running pylance's default, which is 2.0 on pylance 4.x and
+# 2.1 on 9.x, and a 2.0 dataset loses the full-zip encoding the re-rank path
+# needs. Readers accept anything at or above MIN_DATA_STORAGE_VERSION, the
+# version where fixed-width values >=128B first became full-zip.
+DATA_STORAGE_VERSION = "2.2"
+MIN_DATA_STORAGE_VERSION = "2.1"
 EMBEDDING_I8_COLUMN = "embedding_i8"
 VECTOR_FP_COLUMN = "vector_fp"
 
@@ -213,7 +218,7 @@ def build_dataset(
     target_rows_per_fragment: int = _DEFAULT_TARGET_ROWS_PER_FRAGMENT,
     max_rows_per_file: int = _DEFAULT_MAX_ROWS_PER_FILE,
 ) -> lance.LanceDataset:
-    """Build the Lance 2.1 dataset at `out_uri` from artifacts in `artifact_dir`.
+    """Build the Lance dataset at `out_uri` from artifacts in `artifact_dir`.
 
     Writes, compacts to `target_rows_per_fragment`-row fragments, and creates
     the BTREE(chunk_start_unix) / BTREE(segment_id) / BITMAP(vehicle) scalar
@@ -252,17 +257,25 @@ def build_dataset(
     return lance.dataset(out_uri)
 
 
-def is_v21_dataset(ds: lance.LanceDataset) -> bool:
-    """True if `ds` is an exact-threshold Lance 2.1 dataset (vs legacy .lance).
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """A `data_storage_version` string as a comparable (major, minor) tuple."""
+    return tuple(int(part) for part in version.split("."))
 
-    Also requires the PCA schema metadata `read_pca_metadata` needs, so a
-    caller that gates on this before calling `read_pca_metadata` never hits
-    an unexpected missing-metadata error.
+
+def is_exact_threshold_dataset(ds: lance.LanceDataset) -> bool:
+    """True if `ds` is an exact-threshold dataset (vs a legacy .lance corpus).
+
+    Accepts any storage version at or above `MIN_DATA_STORAGE_VERSION` rather
+    than only the one `build_dataset` currently writes, so a dataset written
+    (or rewritten) at a later format still reads. Also requires the PCA schema
+    metadata `read_pca_metadata` needs, so a caller that gates on this before
+    calling `read_pca_metadata` never hits an unexpected missing-metadata error.
     """
     names = set(ds.schema.names)
     meta = ds.schema.metadata or {}
     return (
-        ds.data_storage_version == DATA_STORAGE_VERSION
+        _version_tuple(ds.data_storage_version)
+        >= _version_tuple(MIN_DATA_STORAGE_VERSION)
         and EMBEDDING_I8_COLUMN in names
         and VECTOR_FP_COLUMN in names
         and META_KEY_PCA_COMPONENTS in meta

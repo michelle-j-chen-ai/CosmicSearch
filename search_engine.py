@@ -345,10 +345,10 @@ def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
 
     Always returns a `Corpus`-compatible object (resident matrix or
     `gpu_score`/`.matrix`), which `rank_top_k`/`score_corpus` and every
-    existing caller (web_server.py, app.py) depend on. A Lance 2.1
-    exact-threshold dataset (embedding_i8 + vector_fp) has no resident 768-d
-    matrix and cannot satisfy that contract -- use `load_threshold_corpus` for
-    those instead of routing them through here.
+    existing caller (web_server.py, app.py) depend on. An exact-threshold
+    Lance dataset (embedding_i8 + vector_fp) has no resident 768-d matrix and
+    cannot satisfy that contract -- use `load_threshold_corpus` for those
+    instead of routing them through here.
     """
     local_dir = local_cache.ensure_corpus_local(embeddings_uri, oci_s3.s3_client())
     import gpu_corpus
@@ -365,9 +365,9 @@ def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
         import lance_writer
 
         ds = lance.dataset(str(local_dir))
-        if lance_writer.is_v21_dataset(ds):
+        if lance_writer.is_exact_threshold_dataset(ds):
             raise ValueError(
-                f"{embeddings_uri!r} is a Lance 2.1 exact-threshold dataset "
+                f"{embeddings_uri!r} is an exact-threshold Lance dataset "
                 "(embedding_i8 + vector_fp columns); it has no resident matrix "
                 "for rank_top_k/score_corpus. Use "
                 "search_engine.load_threshold_corpus() for threshold retrieval "
@@ -380,7 +380,7 @@ def load_corpus(embeddings_uri: str, matrix_dtype: str) -> Corpus:
 def load_threshold_corpus(embeddings_uri: str) -> "threshold_search.ThresholdCorpus":
     """Download (if needed) and open `embeddings_uri` for threshold retrieval.
 
-    Separate from `load_corpus`: a Lance 2.1 exact-threshold dataset has no
+    Separate from `load_corpus`: an exact-threshold Lance dataset has no
     resident 768-d matrix, so it cannot satisfy the `Corpus` contract
     `rank_top_k`/`score_corpus` need (see `load_corpus`'s docstring). Callers
     doing threshold retrieval (all rows with score >= tau) use this entry
@@ -393,8 +393,8 @@ def load_threshold_corpus(embeddings_uri: str) -> "threshold_search.ThresholdCor
     import threshold_search
 
     ds = lance.dataset(str(local_dir))
-    if not lance_writer.is_v21_dataset(ds):
-        raise ValueError(f"{embeddings_uri!r} is not a Lance 2.1 exact-threshold dataset")
+    if not lance_writer.is_exact_threshold_dataset(ds):
+        raise ValueError(f"{embeddings_uri!r} is not an exact-threshold Lance dataset")
     return threshold_search.ThresholdCorpus(ds)
 
 

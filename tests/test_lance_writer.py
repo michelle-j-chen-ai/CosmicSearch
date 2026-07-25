@@ -50,12 +50,12 @@ def _write_synthetic_artifacts(tmp_dir: Path, n: int, seed: int = 0) -> Path:
     return artifact_dir
 
 
-def test_data_storage_version_is_2_1() -> None:
+def test_data_storage_version_is_2_2() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         artifact_dir = _write_synthetic_artifacts(tmp_path, n=500)
         ds = lance_writer.build_dataset(artifact_dir, str(tmp_path / "out.lance"))
-        assert ds.data_storage_version == "2.1", ds.data_storage_version
+        assert ds.data_storage_version == "2.2", ds.data_storage_version
 
 
 def test_vector_columns_are_fixed_size_list_of_correct_width() -> None:
@@ -176,9 +176,9 @@ def test_builder_runs_from_synthetic_artifacts_with_no_real_corpus() -> None:
         out_uri = str(tmp_path / "out.lance")
         ds = lance_writer.build_dataset(artifact_dir, out_uri)
         assert ds.count_rows() == 64
-        assert lance_writer.is_v21_dataset(ds)
+        assert lance_writer.is_exact_threshold_dataset(ds)
         reopened = lance.dataset(out_uri)
-        assert lance_writer.is_v21_dataset(reopened)
+        assert lance_writer.is_exact_threshold_dataset(reopened)
 
 
 def test_pca_metadata_roundtrips_through_schema() -> None:
@@ -252,11 +252,63 @@ def test_vector_fp_uses_pre_quant_fp32_when_provided() -> None:
         np.testing.assert_array_equal(vector_fp, true_fp32[expected_order])
 
 
-def test_is_v21_dataset_false_without_pca_metadata() -> None:
+def _write_threshold_dataset_at_version(out_uri: str, version: str, n: int = 20) -> lance.LanceDataset:
+    """A complete exact-threshold dataset (columns + PCA metadata) at `version`."""
+    table = pa.table(
+        {
+            "run_uuid": ["r"] * n,
+            "chunk_start_unix": np.arange(n, dtype="int64"),
+            "chunk_end_unix": np.arange(n, dtype="int64"),
+            "segment_id": [f"s{i}" for i in range(n)],
+            "vehicle": ["v"] * n,
+            lance_writer.EMBEDDING_I8_COLUMN: pa.FixedSizeListArray.from_arrays(
+                pa.array(np.zeros(n * _D, dtype="int8")), _D
+            ),
+            lance_writer.VECTOR_FP_COLUMN: pa.FixedSizeListArray.from_arrays(
+                pa.array(np.zeros(n * _D, dtype="float32")), _D
+            ),
+        }
+    )
+    table = table.replace_schema_metadata(
+        {
+            lance_writer.META_KEY_PCA_COMPONENTS: lance_writer._encode_array(
+                np.zeros((_D, _MODEL_DIM), dtype="float32")
+            ),
+            lance_writer.META_KEY_QUANT_SCALES: lance_writer._encode_array(
+                np.ones(_D, dtype="float32")
+            ),
+        }
+    )
+    lance.write_dataset(table, out_uri, mode="create", data_storage_version=version)
+    return lance.dataset(out_uri)
+
+
+def test_is_exact_threshold_dataset_accepts_older_full_zip_version() -> None:
+    # Datasets written before the writer moved to DATA_STORAGE_VERSION must
+    # still read: everything from MIN_DATA_STORAGE_VERSION up has the full-zip
+    # encoding the take() re-rank depends on.
+    assert lance_writer.MIN_DATA_STORAGE_VERSION != lance_writer.DATA_STORAGE_VERSION
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _write_threshold_dataset_at_version(
+            str(Path(tmp) / "old.lance"), lance_writer.MIN_DATA_STORAGE_VERSION
+        )
+        assert lance_writer.is_exact_threshold_dataset(ds)
+
+
+def test_is_exact_threshold_dataset_rejects_pre_full_zip_version() -> None:
+    # 2.0 stores these columns without full-zip, so a take() is no longer one
+    # IOP per row -- the re-rank cost model does not hold and the dataset must
+    # be refused even though its columns and metadata are correct.
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = _write_threshold_dataset_at_version(str(Path(tmp) / "v20.lance"), "2.0")
+        assert not lance_writer.is_exact_threshold_dataset(ds)
+
+
+def test_is_exact_threshold_dataset_false_without_pca_metadata() -> None:
     # A dataset with the right columns/version but stripped/absent PCA schema
     # metadata must NOT look like a valid exact-threshold dataset -- otherwise
     # read_pca_metadata raises an opaque KeyError deep inside a caller that
-    # trusted is_v21_dataset's True as a green light.
+    # trusted is_exact_threshold_dataset's True as a green light.
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         n = 20
@@ -280,9 +332,9 @@ def test_is_v21_dataset_false_without_pca_metadata() -> None:
             table, out_uri, mode="create", data_storage_version=lance_writer.DATA_STORAGE_VERSION
         )
         ds = lance.dataset(out_uri)
-        assert not lance_writer.is_v21_dataset(ds), (
+        assert not lance_writer.is_exact_threshold_dataset(ds), (
             "dataset has the right columns/version but no PCA schema metadata "
-            "-- is_v21_dataset must not report it as valid"
+            "-- is_exact_threshold_dataset must not report it as valid"
         )
         import pytest
 

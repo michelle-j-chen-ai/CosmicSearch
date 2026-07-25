@@ -202,7 +202,7 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 ## Exact threshold-search PoC benchmark
 
 `bench_threshold_search.py` is a standalone harness that proves the exact
-cosine-threshold primitive (`threshold_search` over a Lance 2.1 dataset) meets
+cosine-threshold primitive (`threshold_search` over an exact-threshold Lance dataset) meets
 its goal on a real sample corpus: **return every row with cosine >= tau (zero
 false negatives), in a measured time**. It needs no model/torch and no pytest;
 run it in any container/VM that has the OCI S3-compat credentials `oci_s3`
@@ -215,7 +215,7 @@ Stage a sample dataset from the fp32 corpus on S3, then benchmark it:
 
 ```bash
 # 1) fp32 embeddings.npy on S3 -> sampled, SVD 768->256 + int8 quant ->
-#    v2.1 .lance (with a genuine fp32 re-rank column) -> uploaded to S3
+#    exact-threshold .lance (with a genuine fp32 re-rank column) -> uploaded to S3
 python bench_threshold_search.py build \
     --embeddings-uri s3://bucket/prefix/embeddings.npy \
     --sample-rows 1000000 \

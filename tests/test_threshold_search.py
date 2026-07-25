@@ -446,7 +446,7 @@ def test_scan_order_pinned_survives_many_fragments() -> None:
 
         query = _query(seed=151)
         oracle = _brute_force_oracle(ds, query, tau=_tau_candidates(ds, query)[1])
-        # threshold_search itself requires PCA schema metadata + is_v21_dataset,
+        # threshold_search itself requires PCA schema metadata + the format gate,
         # both of which build_table/write_dataset already produced; only
         # create_scalar_index / compact_files were skipped, which threshold_search
         # does not depend on.

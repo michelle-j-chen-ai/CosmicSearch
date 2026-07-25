@@ -103,7 +103,7 @@ def _patch_ensure_corpus_local(local_dir: Path):
     return _Restorer()
 
 
-def test_load_threshold_corpus_opens_v21_dataset() -> None:
+def test_load_threshold_corpus_opens_exact_threshold_dataset() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         artifact_dir = _write_synthetic_artifacts(tmp_path, n=5_000, seed=0)
@@ -144,7 +144,7 @@ def test_load_threshold_corpus_opens_v21_dataset() -> None:
             assert h.segment_id, "ThresholdHit should carry resolvable metadata"
 
 
-def test_load_corpus_raises_on_v21_dataset() -> None:
+def test_load_corpus_raises_on_exact_threshold_dataset() -> None:
     """load_corpus (the shared Corpus-returning entrypoint) must refuse a v2.1
     exact-threshold dataset with a clear error rather than silently handing
     web_server.py/app.py an object that breaks on their first .matrix/
@@ -189,8 +189,8 @@ def test_load_corpus_does_not_false_trigger_on_legacy_lance_dataset() -> None:
         out_dir = tmp_path / "legacy.lance"
         lance.write_dataset(table, str(out_dir), mode="create")
         ds = lance.dataset(str(out_dir))
-        assert not lance_writer.is_v21_dataset(ds), (
-            "fixture bug: legacy dataset should not look like a 2.1 dataset"
+        assert not lance_writer.is_exact_threshold_dataset(ds), (
+            "fixture bug: legacy dataset should not look like an exact-threshold dataset"
         )
 
         restorer = _patch_ensure_corpus_local(out_dir)
