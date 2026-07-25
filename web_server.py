@@ -1192,7 +1192,7 @@ def search(req: SearchRequest, request: Request) -> dict:
 
 
 @app.post("/api/refine")
-def refine(req: RefineRequest) -> dict:
+def refine(req: RefineRequest, request: Request) -> dict:
     """Re-rank by a Rocchio direction from the 👍/👎 marks, keeping the filters."""
     _require_ready()
     t0 = time.time()
@@ -1205,6 +1205,14 @@ def refine(req: RefineRequest) -> dict:
     negatives = [m.index for m in req.marks if m.mark == "down" and m.index is not None]
     if not positives:
         raise HTTPException(400, "refine needs at least one 👍 mark")
+
+    # Capture every mark in the feedback ledger (per-segment, on use) so the true
+    # count is recorded even if the user never Downloads.
+    db.record_marks(
+        [{"chunk_id": m.chunk_id, "segment_id": m.segment_id, "mark": m.mark} for m in req.marks],
+        query=req.query, user_email=_current_user(request), source="refine",
+        embeddings_uri=uri, model_uri=_state["cfg"].model_artifact_uri,
+    )
 
     text_vec = None
     if req.text_weight > 0 and req.query.strip():
@@ -2675,6 +2683,14 @@ def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
         # Refresh the learned policy in the background as episodes accumulate.
         _maybe_refit_policy_async(uri)
 
+    # Capture the per-segment marks in the feedback ledger (distinct, on use) --
+    # separate from the aggregate episode above, which only stores counts.
+    db.record_marks(
+        [{"chunk_id": m.chunk_id, "segment_id": m.segment_id, "mark": m.mark} for m in req.marks],
+        query=req.query, user_email=_current_user(request), source="threshold",
+        embeddings_uri=uri, model_uri=_state["cfg"].model_artifact_uri,
+    )
+
     hist = _score_histogram(scores, tau_for_sampling)
     return {
         "threshold": tau,
@@ -2790,6 +2806,15 @@ def export(req: ExportRequest, request: Request) -> Response:
         corpus = _get_corpus(uri)
     except _CORPUS_ERRORS as exc:
         raise HTTPException(400, f"could not load corpus: {exc}")
+
+    # Capture the per-segment marks in the feedback ledger (covers both the CSV
+    # and interval export paths); the export_log row below also keeps a snapshot.
+    db.record_marks(
+        [{"chunk_id": m.chunk_id, "segment_id": m.segment_id, "mark": m.mark} for m in req.marks],
+        query=req.query, user_email=_current_user(request), source="export",
+        embeddings_uri=uri, model_uri=_state["cfg"].model_artifact_uri,
+    )
+
     start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
     seg_mask, _pending, _sc, _lc, _lk, _le, seg_sig = _combined_mask(
         uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
@@ -3725,8 +3750,14 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     # the durable record of the labeling done in the refine+threshold steps. (Marks
     # also ride along on saved searches -- shown per-row in "Recent exports" above.)
     episodes = db.threshold_episodes(limit=2000)
-    fb_total_up = sum(int(e.get("n_pos") or 0) for e in episodes)
-    fb_total_down = sum(int(e.get("n_neg") or 0) for e in episodes)
+    # Distinct human judgments (one per query+segment+user). NOT sum(n_pos) over
+    # episodes: each episode logs a session's *running* tally, so summing them
+    # re-counts the same thumbs ~17x (that was the inflated 22k/13k). The ledger
+    # (feedback_marks) is one row per judgment, so its counts are the true totals.
+    fb = db.feedback_totals()
+    fb_total_up = fb["up"]
+    fb_total_down = fb["down"]
+    fb_queries = fb["queries"]
     fb_tags = sorted({e.get("tag") for e in episodes if e.get("tag")})
     fb_rows = (
         "".join(
@@ -3765,7 +3796,7 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     <div class=card><div class=n>{fmtint(len(unique_users))}</div><div class=l>unique users</div></div>
     <div class=card><div class=n>{fmtint(total_searches)}</div><div class=l>searches ({fmtint(len(query_counts))} unique)</div></div>
     <div class=card><div class=n>{fmtint(len(exports))}</div><div class=l>exports</div></div>
-    <div class=card><div class=n>{fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078;</div><div class=l>threshold feedback labels</div></div>
+    <div class=card><div class=n>{fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078;</div><div class=l>distinct feedback labels</div></div>
   </div>
   <div class=half>
     <h2>Users ({len(unique_users)})</h2>
@@ -3800,7 +3831,7 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     <tbody>{export_rows}</tbody>
   </table>
 
-  <h2>Threshold-tuning feedback ({fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078; over {len(fb_tags)} tags)</h2>
+  <h2>Feedback labels ({fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078; distinct, over {fmtint(fb_queries)} queries)</h2>
   <p class=sub>Each 👍/👎 you label during the refine + threshold-sweep steps is recorded here
      (from <span class=mono>{_esc(db.SCHEMA_NAME)}.threshold_episodes</span>).</p>
   <table>

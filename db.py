@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from typing import Any
 
@@ -46,6 +47,19 @@ _BARE_EPISODE = _EPISODE_TABLE.split(".")[-1]
 # with a cheap dot product (no fit on the request path). See search_engine.fit_threshold_policy.
 _POLICY_TABLE = f"{SCHEMA_NAME}.threshold_policy"
 _BARE_POLICY = _POLICY_TABLE.split(".")[-1]
+# One row per DISTINCT human relevance judgment: (query, segment, user) -> 👍/👎.
+# This is the honest feedback ledger. It is written the moment a mark is USED
+# (refine / threshold-sweep / export), not only on Download, and re-marking the
+# same (query, segment) upserts in place -- so a COUNT here is the true number of
+# thumbs, unlike SUM(threshold_episodes.n_pos) which re-adds a running tally per
+# fit and massively overcounts.
+_MARKS_TABLE = f"{SCHEMA_NAME}.feedback_marks"
+_BARE_MARKS = _MARKS_TABLE.split(".")[-1]
+
+
+def normalize_query(q: str | None) -> str:
+    """Collapse whitespace + casefold, for stable per-query grouping/dedup."""
+    return re.sub(r"\s+", " ", (q or "").strip()).casefold()
 
 _engine: Engine | None = None
 _engine_lock = threading.Lock()
@@ -105,6 +119,45 @@ _DDL = [
         WHERE e.id = d.id AND d.rn > 1""",
     f"""CREATE UNIQUE INDEX IF NOT EXISTS export_log_tag_uidx
         ON {_TABLE} (tag) WHERE tag IS NOT NULL AND tag <> ''""",
+    # Feedback ledger: one row per distinct (query, segment, user) judgment.
+    f"""CREATE TABLE IF NOT EXISTS {_MARKS_TABLE} (
+        id                BIGSERIAL PRIMARY KEY,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        user_email        TEXT NOT NULL DEFAULT '',
+        query             TEXT NOT NULL,
+        query_key         TEXT NOT NULL,
+        segment_id        TEXT NOT NULL,
+        chunk_id          TEXT,
+        label             BOOLEAN NOT NULL,
+        source            TEXT,
+        embeddings_uri    TEXT,
+        model_uri         TEXT
+    )""",
+    # A judgment is unique per (query, segment, user); re-marking upserts in place
+    # so the ledger never double-counts the same thumb.
+    f"""CREATE UNIQUE INDEX IF NOT EXISTS feedback_marks_uidx
+        ON {_MARKS_TABLE} (query_key, segment_id, user_email)""",
+    # One-time (idempotent) backfill from the historical export_log thumbs, so the
+    # ledger reflects prior downloaded feedback immediately. ON CONFLICT DO NOTHING
+    # keeps any live mark authoritative over the backfilled copy.
+    f"""INSERT INTO {_MARKS_TABLE}
+            (user_email, query, query_key, segment_id, chunk_id, label, source,
+             embeddings_uri, model_uri, created_at)
+        SELECT COALESCE(el.user_email, ''),
+               el.query,
+               lower(btrim(regexp_replace(el.query, '\\s+', ' ', 'g'))),
+               COALESCE(NULLIF(m->>'segment_id', ''), m->>'chunk_id'),
+               m->>'chunk_id',
+               (t.lab = 'up'),
+               'export_backfill',
+               el.embeddings_uri, el.model_uri, el.created_at
+        FROM {_TABLE} el
+        CROSS JOIN LATERAL (VALUES ('up', el.thumbs_up), ('down', el.thumbs_down)) AS t(lab, arr)
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(t.arr, '[]'::jsonb)) AS m
+        WHERE el.query IS NOT NULL AND btrim(el.query) <> ''
+          AND COALESCE(NULLIF(m->>'segment_id', ''), m->>'chunk_id') IS NOT NULL
+        ON CONFLICT (query_key, segment_id, user_email) DO NOTHING""",
     # Launched per-segment scans, keyed by Lilypad workload id. thresholds is the
     # per-tag cosine cutoff map ({tag: float}); status is the last-polled phase.
     f"""CREATE TABLE IF NOT EXISTS {_SCAN_TABLE} (
@@ -333,6 +386,22 @@ _INSERT_EPISODE = text(
         RETURNING id"""
 )
 
+# Upsert one relevance judgment. Re-marking the same (query, segment, user)
+# updates the label + timestamp in place rather than adding a row, so the ledger
+# stays one-row-per-judgment.
+_INSERT_MARK = text(
+    f"""INSERT INTO {_MARKS_TABLE}
+        (user_email, query, query_key, segment_id, chunk_id, label, source,
+         embeddings_uri, model_uri)
+        VALUES (:user_email, :query, :query_key, :segment_id, :chunk_id, :label,
+                :source, :embeddings_uri, :model_uri)
+        ON CONFLICT (query_key, segment_id, user_email) DO UPDATE SET
+            label = EXCLUDED.label,
+            chunk_id = EXCLUDED.chunk_id,
+            source = EXCLUDED.source,
+            updated_at = now()"""
+)
+
 
 def insert_threshold_episode(record: dict) -> bool:
     """Append one threshold-tuning episode (features + fitted tau + metrics).
@@ -368,6 +437,86 @@ def insert_threshold_episode(record: dict) -> bool:
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: insert_threshold_episode failed (%s): %s", type(exc).__name__, exc)
         return False
+
+
+def record_marks(
+    marks: list[dict],
+    *,
+    query: str,
+    user_email: str | None,
+    source: str,
+    embeddings_uri: str | None = None,
+    model_uri: str | None = None,
+) -> int:
+    """Upsert one feedback-ledger row per mark (👍/👎). Best-effort.
+
+    ``marks`` is a list of dicts with ``chunk_id``, ``segment_id`` (may be empty),
+    and ``mark`` ("up"/"down"). Called wherever marks are used (refine, threshold
+    sweep, export) so every judgment is captured with its segment id the moment
+    it happens -- not only on Download. Returns the number of rows written.
+    """
+    qkey = normalize_query(query)
+    if not qkey:
+        return 0
+    rows = []
+    for m in marks:
+        mk = (m.get("mark") or "").lower()
+        if mk not in ("up", "down"):
+            continue
+        seg = (m.get("segment_id") or "").strip() or (m.get("chunk_id") or "").strip()
+        if not seg:
+            continue
+        rows.append({
+            "user_email": (user_email or "").strip(),
+            "query": (query or "").strip(),
+            "query_key": qkey,
+            "segment_id": seg,
+            "chunk_id": (m.get("chunk_id") or "").strip() or None,
+            "label": mk == "up",
+            "source": source,
+            "embeddings_uri": embeddings_uri,
+            "model_uri": model_uri,
+        })
+    if not rows:
+        return 0
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            conn.execute(_INSERT_MARK, rows)
+        logger.info("DB: recorded %d feedback marks (source=%s, query=%r)", len(rows), source, query)
+        return len(rows)
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: record_marks failed (%s): %s", type(exc).__name__, exc)
+        return 0
+
+
+def feedback_totals() -> dict:
+    """Distinct human feedback counts from the ledger -- the HONEST totals.
+
+    Counts one row per (query, segment, user) judgment. This is what the
+    analytics page should show, NOT ``SUM(threshold_episodes.n_pos)`` (which
+    re-adds each fit's running tally and overcounts ~17x). Best-effort; returns
+    zeros when exp-db is unreachable."""
+    try:
+        if not _schema_ready:
+            init_schema()
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            row = conn.execute(text(
+                f"""SELECT
+                    count(*) FILTER (WHERE label)            AS up,
+                    count(*) FILTER (WHERE NOT label)        AS down,
+                    count(DISTINCT segment_id)               AS segments,
+                    count(DISTINCT query_key)                AS queries
+                FROM {_MARKS_TABLE}"""
+            )).mappings().one()
+        return {"up": int(row["up"]), "down": int(row["down"]),
+                "segments": int(row["segments"]), "queries": int(row["queries"])}
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: feedback_totals failed (%s): %s", type(exc).__name__, exc)
+        return {"up": 0, "down": 0, "segments": 0, "queries": 0}
 
 
 # Read side -- backs the /analytics view. The search_vector column is large
