@@ -108,7 +108,7 @@ def classify(
     (unlike, e.g., squared L2 distance, whose terms are all non-negative).
     Stopping early on a partial sum can both overshoot and undershoot the
     final full-dimension score, so it cannot be used to prove membership or
-    exclusion -- see `eps_bound_test.py`'s non-monotonicity regression guard.
+    exclusion -- see `tests/test_eps_bound.py`'s non-monotonicity regression guard.
     """
     scores = np.asarray(scores, dtype=np.float64)
     above = scores >= tau + eps

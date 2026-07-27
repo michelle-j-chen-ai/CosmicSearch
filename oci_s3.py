@@ -138,27 +138,6 @@ def download_s3_prefix(prefix_uri: str, destination: Path, client: object) -> No
             client.download_file(bucket, key, str(local_path))
 
 
-def upload_directory(local_dir: Path, prefix_uri: str, client: object) -> int:
-    """Upload every file under `local_dir` to the S3 `prefix_uri`, recursively.
-
-    Symmetric to `download_s3_prefix`: preserves the directory layout under the
-    prefix (a Lance dataset is a directory of files, so this uploads the whole
-    `.lance` tree). Returns the number of objects uploaded.
-    """
-    local_dir = Path(local_dir)
-    bucket, key_prefix = parse_s3_uri(prefix_uri.rstrip("/") + "/")
-    uploaded = 0
-    for path in sorted(local_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(local_dir).as_posix()
-        key = f"{key_prefix}{relative}"
-        LOGGER.info("uploading %s -> s3://%s/%s", path, bucket, key)
-        client.upload_file(str(path), bucket, key)
-        uploaded += 1
-    return uploaded
-
-
 def object_exists(uri: str, client: object) -> bool:
     """True if a single S3 object exists (used to detect the fast npy format)."""
     bucket, key = parse_s3_uri(uri)

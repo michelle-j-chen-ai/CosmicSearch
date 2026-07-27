@@ -199,45 +199,57 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
   handles ~25 queries/s/core. Raise `max_instances` for more concurrent users;
   the model is stateless across requests.
 
-## Exact threshold-search PoC benchmark
+## Exact threshold-search benchmark
 
-`bench_threshold_search.py` is a standalone harness that proves the exact
-cosine-threshold primitive (`threshold_search` over an exact-threshold Lance dataset) meets
-its goal on a real sample corpus: **return every row with cosine >= tau (zero
-false negatives), in a measured time**. It needs no model/torch and no pytest;
-run it in any container/VM that has the OCI S3-compat credentials `oci_s3`
-reads from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_ENDPOINT_URL_S3`, `AWS_REGION`). The `build` step also needs
-`scikit-learn` (`pip install scikit-learn`; deliberately not a default
-dependency, so the app image stays light).
+`bench_threshold_search.py` compares the two ways to answer a
+cosine-threshold query over the same corpus: the resident fp32 matrix with a
+numpy gemv (what `rank_top_k` does today) against `threshold_search` over an
+exact-threshold Lance dataset (only the int8 PCA column resident, boundary
+rows re-ranked from `vector_fp` via `take()`).
 
-Stage a sample dataset from the fp32 corpus on S3, then benchmark it:
+It is fully standalone -- synthetic corpus generated locally, no model, no
+credentials, no network -- and exits non-zero if the two paths disagree on
+the match set, so the exactness guarantee is checked on every run.
 
 ```bash
-# 1) fp32 embeddings.npy on S3 -> sampled, SVD 768->256 + int8 quant ->
-#    exact-threshold .lance (with a genuine fp32 re-rank column) -> uploaded to S3
-python bench_threshold_search.py build \
-    --embeddings-uri s3://bucket/prefix/embeddings.npy \
-    --sample-rows 1000000 \
-    --out-uri s3://bucket/prefix/nls_sample.lance
+python bench_threshold_search.py                          # 100k synthetic rows
+python bench_threshold_search.py --rows 1000000
+python bench_threshold_search.py --tau-percentile 99.0    # broader match set
+python bench_threshold_search.py --source fixture         # real rows, offline
 
-# 2) open it (lance reads fragments straight from S3), time it, prove zero-FN
-python bench_threshold_search.py bench \
-    --dataset-uri s3://bucket/prefix/nls_sample.lance \
-    --repeats 10 --json result.json
+# the full production corpus, reading only the leading --rows rows
+AWS_PROFILE=oci.phx python bench_threshold_search.py --rows 200000 --source \
+    s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/embeddings/v3_lr_5e5-ckpt-6549_npy/embeddings.npy
 ```
 
-`bench` reports **cold hydration** (resident int8 loaded once, as a pod would),
-**warm per-query** latency (min/p50/p95 — the number the <10s goal is about),
-int8 screen GB/s, match/band counts, and an **exactness verdict**: it scores
-every row against the dataset's fp32 re-rank column as an independent oracle
-and asserts `threshold_search` drops none of the rows with score >= tau. The
-process **exits non-zero if any false negative is found**, so a cloud trigger
-can gate on it directly. Because the sampled dataset stores the SVD's true
-pre-quantization projection as `vector_fp` (not a dequantized-int8 copy), the
-oracle is genuinely independent of the int8 screen, so the check actually
-exercises the eps quantization bound rather than a tautology.
+Three corpus sources, and only the last one touches the network:
 
-`all` runs both halves in one process against the just-built local dataset
-(skips the S3 round-trip for the bench half); `bench --dataset-local <path>`
-benchmarks an already-downloaded dataset.
+- **synthetic** (default) is the only source that scales far enough for the
+  latency comparison to mean anything. Rows are shaped to match a real corpus
+  rather than drawn flat: unit-norm, inside a 256-d subspace (the production
+  corpus's top 256 of 768 components hold 1.00000 of its energy), with
+  per-dimension energy decaying so the top 64 hold ~0.98 of it, as measured on
+  `v3_lr_5e5-ckpt-6549`. That shaping matters because eps is sized from the
+  per-dim quantization scales, which a uniform-energy corpus flattens.
+- **fixture** is a committed 10,000-row seeded sample of that real corpus
+  (`tests/fixtures/real_corpus_sample.npz`, ~10MB), giving a genuine score
+  distribution with no credentials and no download. It is stored as the
+  PCA-256 projection plus a basis derived from all 902,827 rows, which
+  reconstructs the 768-d rows to ~2e-4 in score at a third of the bytes;
+  regenerate it with `tools/make_real_fixture.py`. Its timings are
+  overhead-dominated at 10k rows -- use it for distribution fidelity, not for
+  perf.
+- **a path or `s3://` URI** benchmarks the production corpus itself, deriving
+  the PCA basis from the rows it reads and mapping the artifact's `chunk_id`
+  to the `segment_id` the writer indexes.
+
+Reading the output: at any corpus that fits in RAM the brute force wins on
+per-query latency, which is expected -- the Lance path trades per-query work
+for residency. The columns that matter are `resident` (what the process must
+hold to answer a query at all: ~12x less for the Lance path) and how each
+scales with `--rows`. At 100M the fp32 matrix is ~307GB and the in-memory
+column has no answer at all.
+
+`--tau-percentile` matters as much as `--rows`, because every returned row
+costs a `take()`: a broad threshold benchmarks the re-rank path, a tight one
+(the curation workload this exists for) benchmarks the screen.
