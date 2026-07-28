@@ -11,8 +11,8 @@ RUN pip install --upgrade pip && \
       --index-url https://download.pytorch.org/whl/cpu \
       torch==2.8.0 torchvision==0.23.0
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 # lilypad_py (the Lilypad submit client, nls_launcher.py) lives on the AUTHENTICATED Applied
 # (ursa) index, not public PyPI, and its declared deps include ray/wandb/oci (heavy, unused
 # by the submit path). So it is VENDORED and installed WITHOUT deps -- the light
