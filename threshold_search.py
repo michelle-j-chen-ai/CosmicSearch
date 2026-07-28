@@ -28,8 +28,8 @@ pieces together against a real `lance_writer.build_dataset` output:
 
 `ThresholdCorpus` decodes and holds `embedding_i8` resident in memory once, at
 construction, so repeated `.threshold_search()` calls scan an in-memory array
-rather than re-reading the column from the dataset on every query (the
-`design.md` "resident int8 shard" architecture, at single-node scope). The
+rather than re-reading the column from the dataset on every query (resident
+int8 screen, out-of-core `vector_fp` refine — single-node scope). The
 module-level `threshold_search()` function is the standalone entry point used
 by tests and one-off callers; it decodes fresh on every call and does not
 cache anything across calls.
@@ -45,10 +45,10 @@ row positions no longer address the dataset the way `Dataset.take()` expects
 (see `_load_resident_corpus`'s docstring on why `scan_in_order=True` on an
 UNfiltered scan is what makes positional indexing safe); resolving a
 filtered scan's rows back to `take()`-addressable positions needs either
-Lance's stable row ids (design.md explicitly avoids them -- "experimental")
-or its internal, unstable `_take_rows` row-address API. Implement this only
-by adopting one of those two mechanisms deliberately, not by passing
-`filter=` to the `embedding_i8` scan below.
+Lance's stable row ids (still experimental) or its internal, unstable
+`_take_rows` row-address API. Implement this only by adopting one of those
+two mechanisms deliberately, not by passing `filter=` to the `embedding_i8`
+scan below.
 """
 
 from __future__ import annotations
@@ -150,11 +150,11 @@ def _load_resident_corpus(dataset: lance.LanceDataset) -> _ResidentCorpus:
     addresses rows by position in the dataset's canonical (fragment,
     in-fragment) order, and callers resolve `take()` indices from *positions
     in this scan's output*. Without pinning in-order scanning, a
-    multi-fragment out-of-order scan (`scan_in_order=False`, which
-    `design.md`'s Scan tuning section recommends for throughput) can return
-    rows in a different order than `take()` addresses them, silently
-    mismatching every screened index against the wrong row's `vector_fp` --
-    see `tests/test_threshold_search.py`'s multi-fragment regression test.
+    multi-fragment out-of-order scan (`scan_in_order=False`, often tempting
+    for throughput) can return rows in a different order than `take()`
+    addresses them, silently mismatching every screened index against the
+    wrong row's `vector_fp` -- see `tests/test_threshold_search.py`'s
+    multi-fragment regression test.
     """
     pca, scale = lance_writer.read_pca_metadata(dataset)
     i8_table = dataset.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True)
@@ -192,8 +192,8 @@ def _search_resident(
     # Exact re-rank via take() on vector_fp -- 1 IOP/row, never a full column
     # read. ABOVE and BAND are each typically a tiny fraction of the corpus
     # for a selective query, so this is bounded by the match count, not
-    # corpus size (a broad/low-tau query can still make this large -- see
-    # design.md's latency budget, which this module does not attempt to cap).
+    # corpus size (a broad/low-tau query can still make this large; this
+    # module does not attempt to cap refine cost).
     def _exact_scores(idx: np.ndarray) -> np.ndarray:
         if idx.size == 0:
             return np.empty(0, dtype=np.float64)
