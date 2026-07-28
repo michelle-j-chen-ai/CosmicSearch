@@ -47,6 +47,11 @@ _NUM_CPU_NODES = 16
 
 _SEGMENT_FN = "tools.offboard.common.auto_labeling.vlm.nls_scan.nls_segment_scan.run"
 
+# Lilypad model identifier (mandatory: the backend rejects launches without one).
+# Format: <category>.<mode>.<model_id>.<variant>.<version>. This CPU workload scores
+# query embeddings against the precomputed VLM (Cosmos-Embed) corpus -> vlm_embedding.
+_MODEL_IDENTIFIER = "vlm_embedding.inference.cosmos_embed1_448p.nls_segment_scan.v1"
+
 
 class LauncherUnavailable(RuntimeError):
     """Raised when a Lilypad launch cannot be made (SDK absent / no creds / no egress)."""
@@ -103,6 +108,7 @@ def _workload_cfg(
 ) -> dict:
     return {
         "name": name,
+        "model_identifier": _MODEL_IDENTIFIER,
         "workload_variant_config": {
             "workload_type": "generic",
             "entrypoint_fn": entrypoint_fn,
