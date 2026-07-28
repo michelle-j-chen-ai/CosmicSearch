@@ -4,7 +4,7 @@
 # int8 corpus in L4 VRAM (24GB) and score on-GPU -- sidestepping the 32GiB CPU
 # RAM ceiling that OOM-kills the CPU build on the 47.8M-row corpus.
 # Deploy target: Cloud Run GPU in a GPU region (us-central1) with NLS_DEVICE=cuda.
-FROM python:3.10-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 

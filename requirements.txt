@@ -1,6 +1,11 @@
 # ---------------------------------------------------------------------------
 # FULLY PINNED to the versions installed in the deployed image
-# (captured via `pip freeze` inside the built vlm-nls-search image, 2026-07-28).
+# (captured via `pip freeze` inside the built vlm-nls-search image, 2026-07-28),
+# with targeted bumps for the Lance vector-search stack:
+#   lancedb 0.30.2 -> 0.34.0, pylance 4.0.0 -> 9.0.0,
+#   lance-namespace{,-urllib3-client} 0.9.0 -> 0.8.6 (pylance 9 requires <0.9).
+# pyarrow 24 and numpy 2.2.6 already satisfy the new clients and stay put
+# (numpy cannot float past numba 0.66's <2.5 ceiling).
 # torch==2.8.0 / torchvision==0.23.0 are installed separately in the Dockerfile
 # from the CPU wheel index, and lilypad_py is vendored (--no-deps), so neither
 # appears below. Regenerate after any dependency change to keep builds reproducible.
@@ -12,8 +17,8 @@ streamlit==1.60.0
 transformers==4.51.3
 einops==0.8.2
 numpy==2.2.6
-lancedb==0.30.2
-pylance==4.0.0
+lancedb==0.34.0
+pylance==9.0.0
 pyarrow==24.0.0
 # Roaring-bitmap decode for the fast segment-set downsample: a DORA dataset's
 # membership comes back as one serialized roaring bitmap (DescribeDataSet
@@ -102,8 +107,8 @@ itsdangerous==2.2.0
 jmespath==1.1.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-lance-namespace==0.9.0
-lance-namespace-urllib3-client==0.9.0
+lance-namespace==0.8.6
+lance-namespace-urllib3-client==0.8.6
 llvmlite==0.48.0
 markdown-it-py==4.2.0
 mdurl==0.1.2

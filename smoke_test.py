@@ -15,6 +15,58 @@ import pyarrow as pa
 import search_engine
 
 
+
+test_load_corpus_lance_reads_rank_shards() -> None:
+    """The rank=NNNNN/ lancedb loader, end to end on a temp-dir corpus.
+
+    This is the only path that goes through the lancedb client rather than
+    pylance, so a client upgrade can break it without any other check
+    noticing. Writes with the same create_table call the inference pipeline
+    uses, then reads it back the way search_engine does.
+    """
+    import lancedb
+
+    from config import OUTPUT_TABLE_NAME
+
+    dim, rows, shards = 8, 6, 2
+    rng = np.random.default_rng(0)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for shard in range(shards):
+            rank_dir = root / f"rank={shard:05d}"
+            rank_dir.mkdir()
+            vectors = rng.standard_normal((rows, dim)).astype("float32")
+            vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+            lancedb.connect(str(rank_dir)).create_table(
+                OUTPUT_TABLE_NAME,
+                data=pa.table(
+                    {
+                        "chunk_id": [f"run-{shard}#t{i}" for i in range(rows)],
+                        "run_uuid": [f"run-{shard}"] * rows,
+                        "chunk_start_unix": np.arange(rows, dtype="int64"),
+                        "source_media_uri": [f"s3://b/{shard}-{i}.mp4" for i in range(rows)],
+                        "segment_id": [f"seg-{shard}-{i}" for i in range(rows)],
+                        "dx_internal_id": np.arange(
+                            shard * rows, (shard + 1) * rows, dtype="int64"
+                        ),
+                        "vector": pa.FixedSizeListArray.from_arrays(
+                            pa.array(vectors.reshape(-1)), dim
+                        ),
+                    }
+                ),
+            )
+
+        corpus = search_engine._load_corpus_lance(root, "s3://bucket/corpus", "float32")
+
+    assert corpus.num_rows == rows * shards, corpus.num_rows
+    assert corpus.matrix.shape == (rows * shards, dim), corpus.matrix.shape
+    assert corpus.has_internal_ids(), "dx_internal_id column was dropped"
+    assert corpus.segment_id[0] == "seg-0-0", corpus.segment_id[0]
+    # Shards are concatenated in rank order, so row 5 is still shard 0's row 5.
+    hits = search_engine.rank_top_k(corpus.matrix[5].astype("float32"), corpus, top_k=3)
+    assert hits[0].index == 5, hits[0]
+    assert hits[0].run_uuid == "run-0", hits[0]
+
 def test_vectors_from_arrow_roundtrip() -> None:
     vectors = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]
     table = pa.table({"vector": pa.array(vectors, type=pa.list_(pa.float32()))})

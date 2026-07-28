@@ -1,0 +1,31 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Keep in step with the Dockerfile's base image.
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install CPU torch stack
+        run: |
+          pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchvision==0.23.0
+
+      - name: Install pinned requirements
+        run: pip install -r requirements.txt
+
+      - name: Run search-core tests
+        run: python smoke_test.py
