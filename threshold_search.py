@@ -179,14 +179,17 @@ def _search_resident(
     # for a selective query, so this is bounded by the match count, not
     # corpus size (a broad/low-tau query can still make this large -- see
     # design.md's latency budget, which this module does not attempt to cap).
-    query_pca64 = query_pca.astype(np.float64)
-
     def _exact_scores(idx: np.ndarray) -> np.ndarray:
         if idx.size == 0:
             return np.empty(0, dtype=np.float64)
         rows = dataset.take(idx.tolist(), columns=[lance_writer.VECTOR_FP_COLUMN])
-        fp = _fixed_size_list_matrix(rows, lance_writer.VECTOR_FP_COLUMN, np.float64)
-        return fp @ query_pca64
+        fp = _fixed_size_list_matrix(rows, lance_writer.VECTOR_FP_COLUMN, np.float32)
+        # Accumulate in float64 without materializing a float64 copy of the
+        # take() result. Reading the column as float64 instead costs more in
+        # the upcast than the dot product itself, and dominates this stage
+        # once a query matches thousands of rows; `dtype` keeps the
+        # accumulator at full precision, so scores are unchanged.
+        return np.einsum("ij,j->i", fp, query_pca, dtype=np.float64)
 
     above_scores = _exact_scores(above_idx)
     band_scores = _exact_scores(band_idx)

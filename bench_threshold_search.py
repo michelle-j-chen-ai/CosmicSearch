@@ -64,6 +64,7 @@ import threshold_search as ts
 D = 256
 MODEL_DIM = 768
 _REPEATS = 5
+_GRAM_BLOCK_ROWS = 100_000
 # A 10,000-row seeded random sample of the production corpus, stored as its
 # PCA-256 projection plus the basis (derived from all 902,827 rows) rather
 # than raw 768-d vectors: the corpus is rank-256, so reconstruction is exact
@@ -173,8 +174,14 @@ def pca_basis(embeddings: np.ndarray) -> np.ndarray:
 
     The 768x768 Gram matrix makes this exact and dependency-free -- its top-D
     eigenvectors are the right singular vectors a truncated SVD would return.
+    Accumulated in row blocks so the float64 working copy stays bounded rather
+    than scaling with the corpus (a whole-matrix upcast is ~8 bytes/value,
+    which at tens of millions of rows exceeds RAM).
     """
-    gram = embeddings.astype(np.float64).T @ embeddings.astype(np.float64)
+    gram = np.zeros((embeddings.shape[1], embeddings.shape[1]), dtype=np.float64)
+    for start in range(0, embeddings.shape[0], _GRAM_BLOCK_ROWS):
+        block = embeddings[start : start + _GRAM_BLOCK_ROWS].astype(np.float64)
+        gram += block.T @ block
     _eigenvalues, eigenvectors = np.linalg.eigh(gram)
     return np.ascontiguousarray(eigenvectors[:, ::-1][:, :D].T.astype("float32"))
 
