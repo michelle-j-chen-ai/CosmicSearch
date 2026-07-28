@@ -215,6 +215,60 @@ def test_threshold_corpus_decodes_embedding_i8_once_and_rejects_bad_queries() ->
             corpus.threshold_search(query * 3.0, tau)
 
 
+def test_eps_bounds_the_screen_error_even_when_the_basis_amplifies() -> None:
+    """The eps window is scaled by ||query_pca||, not left at the corpus
+    constant, so the bound survives a basis whose rows are not orthonormal.
+
+    A unit-norm model-space query can project to a much longer PCA-space
+    vector through such a basis, and the screening error scales with it. This
+    fixture is built to defeat the unscaled constant, so the assertions below
+    fail if that scaling is ever dropped.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(
+            Path(tmp), n=4_000, seed=13, orthonormal_pca=False, pre_quant_fp32=True
+        )
+        pca, scale = lance_writer.read_pca_metadata(ds)
+        query = conftest.unit_query(seed=113)
+        query_pca = ts._project_query(query, pca)
+        amplification = float(np.linalg.norm(query_pca))
+        assert amplification > 1.5, f"fixture should amplify the projection, got {amplification}"
+
+        corpus_i8 = ts._fixed_size_list_matrix(
+            ds.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True),
+            lance_writer.EMBEDDING_I8_COLUMN,
+            np.int8,
+        )
+        screen = np.empty(corpus_i8.shape[0], dtype=np.float32)
+        ts.gpu_corpus._cpu_score_kernel()(
+            np.ascontiguousarray(corpus_i8),
+            (query_pca * (scale.astype(np.float32) / 127.0)).astype(np.float32),
+            screen,
+        )
+        exact = conftest.exact_scores(ds, query)
+        corpus_eps = eps_bound.eps_cauchy_schwarz(scale)
+
+        # Plant tau where the UNSCALED corpus constant would exclude a row the
+        # exact score keeps: screen[row] < tau - corpus_eps <= exact[row]. Only
+        # a window scaled by the projection's amplification still covers it.
+        gap = exact - screen.astype(np.float64)
+        row = int(np.argmax(gap))
+        assert gap[row] > corpus_eps, (
+            f"fixture is not adversarial: largest screen error {gap[row]} is "
+            f"already inside the unscaled eps {corpus_eps}"
+        )
+        tau = float(screen[row]) + corpus_eps + (gap[row] - corpus_eps) / 2.0
+        assert float(screen[row]) < tau - corpus_eps <= exact[row]
+
+        hits = ts.threshold_search(query, tau, ds)
+        assert row in {h.row_id for h in hits}, (
+            "dropped a row whose exact score is above tau -- the eps window was "
+            "not scaled by ||query_pca||, so it is too narrow for this basis"
+        )
+        missing = set(np.nonzero(exact >= tau)[0].tolist()) - {h.row_id for h in hits}
+        assert not missing, f"dropped {len(missing)} row(s) above tau"
+
+
 def test_no_false_negatives_on_the_real_corpus_sample() -> None:
     """The guarantee on a real score distribution, offline.
 

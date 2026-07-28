@@ -250,7 +250,7 @@ def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic")
         tau = float(np.percentile(embeddings @ query, tau_percentile))
 
         mem_s, mem_scores = _median_time(lambda: embeddings @ query)
-        mem_matches = int((np.asarray(mem_scores) >= tau).sum())
+        mem_above = np.sort(np.asarray(mem_scores)[np.asarray(mem_scores) >= tau])[::-1]
 
         ds = lance.dataset(uri)
         t0 = time.perf_counter()
@@ -260,13 +260,23 @@ def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic")
         lance_s, hits = _median_time(lambda: corpus.threshold_search(query, tau))
 
         # Row ids address the dataset's sorted order and the in-memory matrix
-        # its generation order, so compare match COUNT plus the invariant every
-        # returned row must satisfy.
+        # its generation order, so the two match sets cannot be compared by id.
+        # Compare the sorted SCORES instead: same count and same values means
+        # the same rows, up to the ~1e-4 gap between scoring in model space and
+        # in the PCA-256 space (identical only because the corpus is rank-256).
         assert all(h.score >= tau for h in hits), "returned a row scoring below tau"
-        if len(hits) != mem_matches:
+        lance_above = np.array([h.score for h in hits])
+        if lance_above.size != mem_above.size:
             raise SystemExit(
-                f"FAIL: brute force found {mem_matches} rows >= tau, Lance path "
-                f"returned {len(hits)} -- the exact-threshold guarantee is broken"
+                f"FAIL: brute force found {mem_above.size} rows >= tau, Lance path "
+                f"returned {lance_above.size} -- the exact-threshold guarantee is broken"
+            )
+        if lance_above.size and not np.allclose(lance_above, mem_above, rtol=0, atol=1e-3):
+            worst = float(np.abs(lance_above - mem_above).max())
+            raise SystemExit(
+                f"FAIL: the two paths returned the same number of rows but "
+                f"different scores (max difference {worst:.2e}) -- they are not "
+                f"returning the same rows"
             )
 
         return {
@@ -328,7 +338,8 @@ def main() -> int:
         f"\nresident ratio     : {r['mem_resident_mb'] / r['lance_resident_mb']:.1f}x less "
         f"held by the Lance path"
     )
-    print(f"exact match count  : PASS (both paths agree on {r['matches']:,} rows)")
+    print(f"exactness          : PASS (both paths return the same {r['matches']:,} "
+          f"rows, scores agreeing)")
     return 0
 
 

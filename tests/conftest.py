@@ -35,7 +35,7 @@ def write_artifact(
     n: int,
     *,
     seed: int = 0,
-    orthonormal_pca: bool = False,
+    orthonormal_pca: bool = True,
     pre_quant_fp32: bool = False,
 ) -> Path:
     """Write a gpu_corpus-style int8 PCA artifact -- `build_dataset`'s input.
@@ -47,9 +47,11 @@ def write_artifact(
     fallback -- the only configuration in which an oracle is independent of
     the int8 screen (see `lance_writer.py`'s module docstring).
 
-    `orthonormal_pca` makes the basis rows orthonormal, so a unit-norm query
-    in its row space stays unit-norm after projection -- the precondition
-    `eps_bound.eps_cauchy_schwarz` assumes, and what a real SVD basis gives.
+    The basis rows are orthonormal by default, matching what a real SVD
+    produces: a unit-norm query stays within unit norm after projection.
+    Pass `orthonormal_pca=False` for a basis that amplifies the projection
+    instead, which is what makes the eps scaling in `threshold_search`
+    load-bearing rather than decorative.
     """
     rng = np.random.default_rng(seed)
     artifact_dir.mkdir(parents=True, exist_ok=True)

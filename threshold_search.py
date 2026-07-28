@@ -66,8 +66,7 @@ import lance_writer
 # can be resolved to a clip without a second pass over the dataset.
 _METADATA_COLUMNS = ("run_uuid", "segment_id", "chunk_start_unix", "chunk_end_unix", "vehicle")
 
-# eps_cauchy_schwarz's bound assumes ||query||_2 == 1 (see eps_bound.py); this
-# is the tolerance for treating a query as unit-norm.
+# Tolerance for treating a model-space query as unit-norm (see _assert_unit_norm).
 _UNIT_NORM_TOLERANCE = 1e-3
 
 
@@ -112,12 +111,20 @@ def _project_query(query: np.ndarray, pca: np.ndarray) -> np.ndarray:
 
 
 def _assert_unit_norm(query: np.ndarray) -> None:
+    """Reject a query that is not unit-norm in model space.
+
+    Scores are cosine similarities only for a unit-norm query, so `tau` is
+    not comparable across queries otherwise. (The eps bound itself no longer
+    depends on this -- `_search_resident` scales it by the projected query's
+    norm -- but a caller passing an unnormalized query is choosing a
+    threshold against a different scale than they think.)
+    """
     norm = float(np.linalg.norm(query))
     if abs(norm - 1.0) > _UNIT_NORM_TOLERANCE:
         raise ValueError(
-            f"threshold_search requires a unit-norm query -- "
-            f"eps_bound.eps_cauchy_schwarz's bound assumes ||query||_2 == 1 "
-            f"(see its docstring); got ||query||_2 = {norm:.6f}"
+            f"threshold_search requires a unit-norm query so that scores are "
+            f"cosine similarities and tau means the same thing across "
+            f"queries; got ||query||_2 = {norm:.6f}"
         )
 
 
@@ -170,7 +177,15 @@ def _search_resident(
     screening_scores = np.empty(n, dtype=np.float32)
     gpu_corpus._cpu_score_kernel()(np.ascontiguousarray(resident.corpus_i8), w, screening_scores)
 
-    above, band, _below = eps_bound.classify(screening_scores, tau, resident.eps)
+    # Cauchy-Schwarz bounds the screening error by ||query_pca|| * ||e||, and
+    # `resident.eps` is the ||e|| half. The scan happens in PCA space, so the
+    # norm that matters is the PROJECTED query's, not the model-space query's:
+    # a basis whose rows are not orthonormal can amplify the projection past
+    # 1 and would leave an unscaled bound too small to be a bound at all. For
+    # the orthonormal basis a real SVD produces this factor is <= 1, so the
+    # window is also tighter than the corpus-wide constant.
+    eps = resident.eps * float(np.linalg.norm(query_pca))
+    above, band, _below = eps_bound.classify(screening_scores, tau, eps)
     above_idx = np.nonzero(above)[0]
     band_idx = np.nonzero(band)[0]
 
