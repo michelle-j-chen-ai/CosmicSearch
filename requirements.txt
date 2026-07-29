@@ -1,8 +1,4 @@
-# Direct dependencies only — exact pins from the deployed image
-# (pip freeze 2026-07-28), with targeted Lance vector-search bumps:
-#   lancedb 0.30.2 -> 0.34.0, pylance 4.0.0 -> 9.0.0.
-# Transitive packages are NOT listed here; they live in requirements.lock
-# (including lance-namespace 0.8.6, required by pylance 9's <0.9 ceiling).
+# Direct dependencies (exact pins). Transitives live in requirements.lock;
 # Docker/CI install the lock. Regenerate after editing this file:
 #
 #     uv pip compile requirements.txt --python-version 3.13 \

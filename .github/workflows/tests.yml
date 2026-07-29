@@ -28,7 +28,5 @@ jobs:
       - name: Install locked requirements
         run: uv pip install -r requirements.lock
 
-      # smoke_test.py is the full offline suite on this branch (no pytest tree
-      # yet): its __main__ discovers and runs every test_* function.
       - name: Run all smoke tests
         run: uv run python smoke_test.py
