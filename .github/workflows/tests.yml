@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Keep in step with the Dockerfile's base image.
+          python-version: "3.13"
+
+      - name: Create venv and install CPU torch stack
+        run: |
+          uv venv
+          uv pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchvision==0.23.0
+
+      - name: Install locked requirements
+        run: uv pip install -r requirements.lock
+
+      - name: Run all smoke tests
+        run: uv run python smoke_test.py
