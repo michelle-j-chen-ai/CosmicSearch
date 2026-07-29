@@ -1,8 +1,7 @@
 # Direct dependencies (exact pins). Transitives live in requirements.lock;
 # Docker/CI install the lock. Regenerate after editing this file:
 #
-#     uv pip compile requirements.txt --python-version 3.13 \
-#         -c requirements.lock -o requirements.lock
+#     uv pip compile requirements.txt --python-version 3.13 -o requirements.lock
 #
 # torch + torchvision are installed separately in the Dockerfile from the CPU
 # wheel index, and lilypad_py is vendored (--no-deps), so neither appears here.
