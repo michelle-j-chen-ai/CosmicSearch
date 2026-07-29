@@ -30,3 +30,32 @@ jobs:
 
       - name: Run all smoke tests
         run: uv run python smoke_test.py
+
+  docker-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - file: Dockerfile
+            tag: nls-cpu-deps
+            run_smoke: "true"
+          - file: Dockerfile.gpu
+            tag: nls-gpu-deps
+            run_smoke: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build deps stage (torch + lock via uv)
+        run: docker build --target deps -t "${{ matrix.tag }}" -f "${{ matrix.file }}" .
+
+      - name: Run smoke tests inside CPU deps image
+        if: matrix.run_smoke == 'true'
+        run: |
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -w /src \
+            -e PYTHONPATH=/src \
+            "${{ matrix.tag }}" \
+            python smoke_test.py

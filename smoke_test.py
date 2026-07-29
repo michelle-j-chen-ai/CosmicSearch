@@ -296,6 +296,87 @@ def test_lance_storage_options_from_env() -> None:
     assert opts["aws_allow_http"] == "false"
 
 
+def _toy_lance_rows() -> pa.Table:
+    """Minimal Arrow schema matching production corpus columns."""
+    return pa.table(
+        {
+            "vector": pa.array(
+                [[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]],
+                type=pa.list_(pa.float32()),
+            ),
+            "chunk_id": ["a", "b", "c"],
+            "run_uuid": ["r", "r", "r"],
+            "chunk_start_unix": [100, 200, 300],
+            "source_media_uri": [
+                "s3://x/a.mp4",
+                "s3://x/b.mp4",
+                "s3://x/c.mp4",
+            ],
+            "segment_id": ["seg_a", "seg_b", "seg_c"],
+            "dx_internal_id": [11, 22, 33],
+        }
+    )
+
+
+def test_load_corpus_via_lance_and_lancedb() -> None:
+    """Corpus load paths that matter at query time: direct Lance + rank shards.
+
+    Mirrors ``search_engine._load_corpus_lance_dataset`` (``lance.dataset`` +
+    ``to_table``) and ``_load_corpus_lance`` (``lancedb.connect`` /
+    ``open_table(video_embeddings)``), then ranks so the loaded matrix is
+    actually used.
+    """
+    import tempfile
+    from pathlib import Path
+
+    import lance
+    import lancedb
+    from config import OUTPUT_TABLE_NAME
+
+    rows = _toy_lance_rows()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        # Direct ``*.lance`` dataset (URI ends with .lance).
+        ds_dir = root / "chunks.lance"
+        lance.write_dataset(rows, str(ds_dir))
+        # Also exercise the column projection used when reading scan segment sets.
+        seg_only = lance.dataset(str(ds_dir)).to_table(columns=["segment_id"])
+        assert seg_only.column("segment_id").to_pylist() == [
+            "seg_a",
+            "seg_b",
+            "seg_c",
+        ]
+        corpus = search_engine._load_corpus_lance_dataset(ds_dir, "float32")
+        assert corpus.num_rows == 3 and corpus.dim == 2
+        assert corpus.chunk_id == ["a", "b", "c"]
+        assert corpus.dx_internal_id == [11, 22, 33]
+        hits = search_engine.rank_top_k(
+            np.array([1.0, 0.0], dtype="float32"), corpus, top_k=1
+        )
+        assert hits[0].chunk_id == "a" and hits[0].index == 0
+
+        # Rank-shard layout: one lancedb table per ``rank=NNNNN/`` dir.
+        shard_root = root / "rank_corpus"
+        for i, name in enumerate(("rank=00000", "rank=00001")):
+            rank_dir = shard_root / name
+            rank_dir.mkdir(parents=True)
+            # Split rows across shards the way production caches do.
+            start, end = (0, 2) if i == 0 else (2, 3)
+            db = lancedb.connect(str(rank_dir))
+            db.create_table(OUTPUT_TABLE_NAME, rows.slice(start, end - start))
+        shard_corpus = search_engine._load_corpus_lance(
+            shard_root, "s3://bucket/rank_corpus/", "float32"
+        )
+        assert shard_corpus.num_rows == 3 and shard_corpus.dim == 2
+        assert shard_corpus.chunk_id == ["a", "b", "c"]
+        assert shard_corpus.segment_id == ["seg_a", "seg_b", "seg_c"]
+        hits2 = search_engine.rank_top_k(
+            np.array([0.0, 1.0], dtype="float32"), shard_corpus, top_k=1
+        )
+        assert hits2[0].chunk_id == "b"
+
+
 def test_uri_key_stable_and_safe() -> None:
     uri = "s3://bucket/sibogeng/eval_pipeline/embeddings/main_bal_2k-ckpt-1200/"
     key = local_cache._uri_key(uri)
