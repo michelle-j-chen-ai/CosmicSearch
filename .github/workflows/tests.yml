@@ -12,19 +12,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
+          # Keep in step with the Dockerfile's base image.
           python-version: "3.13"
-          cache: pip
 
-      - name: Install CPU torch stack
+      - name: Create venv and install CPU torch stack
         run: |
-          pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu \
+          uv venv
+          uv pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
             torch==2.8.0 torchvision==0.23.0
 
       - name: Install locked requirements
-        run: pip install -r requirements.lock
+        run: uv pip install -r requirements.lock
 
-      - name: Run search-core tests
-        run: python smoke_test.py
+      # smoke_test.py is the full offline suite on this branch (no pytest tree
+      # yet): its __main__ discovers and runs every test_* function.
+      - name: Run all smoke tests
+        run: uv run python smoke_test.py

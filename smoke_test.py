@@ -7,6 +7,8 @@ Run from this directory:
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 import local_cache
 import numpy as np
@@ -15,8 +17,7 @@ import pyarrow as pa
 import search_engine
 
 
-
-test_load_corpus_lance_reads_rank_shards() -> None:
+def test_load_corpus_lance_reads_rank_shards() -> None:
     """The rank=NNNNN/ lancedb loader, end to end on a temp-dir corpus.
 
     This is the only path that goes through the lancedb client rather than
@@ -66,6 +67,7 @@ test_load_corpus_lance_reads_rank_shards() -> None:
     hits = search_engine.rank_top_k(corpus.matrix[5].astype("float32"), corpus, top_k=3)
     assert hits[0].index == 5, hits[0]
     assert hits[0].run_uuid == "run-0", hits[0]
+
 
 def test_vectors_from_arrow_roundtrip() -> None:
     vectors = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]
