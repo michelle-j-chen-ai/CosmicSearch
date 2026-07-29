@@ -292,6 +292,16 @@ def test_no_false_negatives_on_the_real_corpus_sample() -> None:
             assert not missing, f"tau={tau}: dropped {len(missing)} real row(s)"
 
 
+def test_threshold_hit_defaults_to_exact_score_kind() -> None:
+    """The new fields default so existing callers (exact re-rank) are unchanged."""
+    h = ts.ThresholdHit(
+        row_id=0, score=0.5, run_uuid="r", segment_id="s",
+        chunk_start_unix=1, chunk_end_unix=2, vehicle="v",
+    )
+    assert h.score_kind == "exact"
+    assert h.score_error_bound == 0.0
+
+
 def test_bench_agrees_with_brute_force_end_to_end() -> None:
     # Smoke test for the standalone benchmark: it must build, run both paths,
     # and find them in agreement -- so a broken bench fails here rather than

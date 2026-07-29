@@ -87,6 +87,12 @@ class ThresholdHit:
     chunk_start_unix: int
     chunk_end_unix: int | None
     vehicle: str | None
+    # "exact" = recomputed from `vector_fp` via take(); "bounded_approx" = the
+    # int8 screening score, kept without a take() in fast_curation mode (ABOVE
+    # rows only). For bounded rows, the true score lies within
+    # [score - score_error_bound, score + score_error_bound].
+    score_kind: str = "exact"
+    score_error_bound: float = 0.0
 
 
 def _fixed_size_list_matrix(table: object, column: str, dtype: np.dtype) -> np.ndarray:
