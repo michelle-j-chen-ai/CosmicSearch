@@ -39,10 +39,14 @@ class AppConfig:
     # NLS_OWNER_EMAIL as a comma-separated list. Empty -> nobody sees the view
     # (fail closed), so a misconfigured deploy never leaks usage to all users.
     maintainer_emails: frozenset[str]
-    # Offline full-corpus interval scan: the FULL embedding dataset the Flyte
-    # workflow scans (the resident in-app corpus is a small subset). Must be the
-    # same embedding space as the app's model (rd_4g_siglip_bias7-final). The scan
-    # writes intervals.{parquet,csv} under scan_output_bucket/scan_output_prefix/<id>/.
+    # Offline full-corpus interval scan: the FULL embedding dataset the scan worker
+    # reads (the resident in-app corpus is a small subset). MUST be encoded by the
+    # same model as the app's query encoder + resident corpus (black dwarf) -- a
+    # query vector scored against a different model's video embeddings yields
+    # systematically depressed cosines, so a threshold calibrated in the app UI
+    # rejects everything. The scan writes intervals.{parquet,csv} under
+    # scan_output_bucket/scan_output_prefix/<id>/. Trucking overrides this with its
+    # own corpus via the NLS_SCAN_EMBEDDINGS_URI env var.
     scan_embeddings_uri: str
     scan_output_bucket: str
     scan_output_prefix: str
@@ -70,8 +74,8 @@ class AppConfig:
             ),
             scan_embeddings_uri=os.environ.get(
                 "NLS_SCAN_EMBEDDINGS_URI",
-                "s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/"
-                "embeddings/rd_4g_siglip_bias7-final/",
+                "s3://neuron-prod-data-intelligence-exploratory/michelle/nls_search/"
+                "black-dwarf/embeddings/cars/",
             ).strip(),
             scan_output_bucket=os.environ.get(
                 "NLS_SCAN_OUTPUT_BUCKET", "neuron-prod-data-intelligence-exploratory"
