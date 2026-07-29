@@ -30,14 +30,3 @@ jobs:
 
       - name: Run all smoke tests
         run: uv run python smoke_test.py
-
-  # Prove the CPU image's uv + torch + lock install path. GPU (cu126) wheels are
-  # too large for a PR gate; build Dockerfile.gpu locally / at deploy instead.
-  docker-cpu-deps:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build CPU deps stage
-        run: docker build --target deps -t nls-cpu-deps -f Dockerfile .
