@@ -12,7 +12,8 @@ WORKDIR /app
 
 ENV UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1
 
 # CUDA torch stack (cu126 wheels bundle the CUDA runtime; the Cloud Run GPU host
 # provides the driver). torchvision is required by the Cosmos-Embed remote code.

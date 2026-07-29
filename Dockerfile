@@ -8,7 +8,8 @@ WORKDIR /app
 
 ENV UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1
 
 # CPU-only torch stack. torchvision is required by the Cosmos-Embed remote
 # code even for text-only encoding. Pin to the versions validated for the
