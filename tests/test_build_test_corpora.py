@@ -20,52 +20,9 @@ import search_engine
 import threshold_search as ts
 
 from bench_common import pca_basis
+from bench_e2e import make_legacy_shard
 
 MODEL_DIM = conftest.MODEL_DIM  # 768
-
-
-# ---------------------------------------------------------------------------
-# Synthetic legacy-shard builder for offline tests.
-# ---------------------------------------------------------------------------
-def _make_legacy_shard(
-    dir_: Path, n: int, seed: int, week: str, *, with_vehicle: bool = False
-) -> str:
-    """Write a synthetic legacy-format video_embeddings.lance.
-
-    Legacy shards carry ``vector`` (768-d fp32 FSL) plus ``chunk_id``,
-    ``run_uuid``, ``chunk_start_unix``, ``source_media_uri``, and optionally
-    ``metadata_json`` (a JSON string column). Returns the dataset URI.
-    """
-    rng = np.random.default_rng(seed)
-    dir_.mkdir(parents=True, exist_ok=True)
-    vectors = rng.standard_normal((n, MODEL_DIM)).astype("float32")
-    chunk_ids = [f"{week}-chunk-{i}" for i in range(n)]
-    run_uuids = [f"run-{week}"] * n
-    chunk_starts = np.arange(
-        1_700_000_000, 1_700_000_000 + n, dtype="int64"
-    )
-    source_uris = [f"s3://bucket/{week}/{i}.mp4" for i in range(n)]
-
-    cols: dict[str, object] = {
-        "vector": pa.FixedSizeListArray.from_arrays(
-            pa.array(vectors.reshape(-1)), MODEL_DIM
-        ),
-        "chunk_id": pa.array(chunk_ids),
-        "run_uuid": pa.array(run_uuids),
-        "chunk_start_unix": pa.array(chunk_starts),
-        "source_media_uri": pa.array(source_uris),
-    }
-    if with_vehicle:
-        metadata_json = [
-            json.dumps({"vehicle": f"veh-{week}"}) for _ in range(n)
-        ]
-    else:
-        metadata_json = [json.dumps({}) for _ in range(n)]
-    cols["metadata_json"] = pa.array(metadata_json)
-
-    uri = str(dir_ / "video_embeddings.lance")
-    lance.write_dataset(pa.table(cols), uri, mode="create")
-    return uri
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +49,7 @@ def _make_shards(
     shards = []
     for prefix_name, rank, n, seed, with_vehicle in specs:
         rank_dir = tmp / prefix_name / f"rank={rank:05d}"
-        uri = _make_legacy_shard(rank_dir, n, seed, prefix_name, with_vehicle=with_vehicle)
+        uri = make_legacy_shard(rank_dir, n, seed, prefix_name, with_vehicle=with_vehicle)
         shards.append(_shard(prefix_name, rank, uri))
     return shards
 
@@ -141,7 +98,7 @@ def test_dedup_on_chunk_id_keeps_first() -> None:
         # Two shards with overlapping chunk_ids: both have "dup-0".."dup-4",
         # second shard adds 3 unique ones.
         rank_dir_1 = tmp_path / "mce113" / "rank=00000"
-        _make_legacy_shard(rank_dir_1, 5, 0, "dup", with_vehicle=False)
+        make_legacy_shard(rank_dir_1, 5, 0, "dup", with_vehicle=False)
 
         # Second shard with overlapping chunk_ids
         rank_dir_2 = tmp_path / "week1_20250101" / "rank=00000"

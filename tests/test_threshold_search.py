@@ -278,7 +278,7 @@ def test_no_false_negatives_on_the_real_corpus_sample() -> None:
     of the real corpus (no network) whose `vector_fp` is a genuine
     pre-quantization projection, so the oracle is independent of the screen.
     """
-    import bench_threshold_search as bench
+    import bench_common as bench
 
     with tempfile.TemporaryDirectory() as tmp:
         embeddings, metadata, pca = bench.fixture_embeddings()
@@ -380,27 +380,19 @@ def test_default_mode_is_fast_curation() -> None:
         )
 
 
-def test_bench_runs_fast_curation_and_exact_and_reports_accuracy() -> None:
-    """The bench must run fast_curation + exact + brute-force, report
-    membership set-equality (no missing/extra) and score deviation, and
-    exit cleanly on a small corpus."""
-    import bench_threshold_search as bench
+def test_bench_e2e_offline_smoke() -> None:
+    """Offline e2e bench: builds synthetic master+threshold corpora, runs the
+    sweep, membership + eps gates pass, both paths timed."""
+    import bench_e2e
 
-    r = bench.run(n=2_000, tau_percentile=99.0, seed=5)
-    assert r["matches"] > 0
-    # Both Lance paths must have zero missing and zero extra vs ground truth.
-    assert r["membership_missing_fast"] == 0
-    assert r["membership_extra_fast"] == 0
-    assert r["membership_missing_exact"] == 0
-    assert r["membership_extra_exact"] == 0
-    # Score deviation is reported.
-    assert "score_dev_fast_max" in r and r["score_dev_fast_max"] >= 0.0
-    # No bound violation for fast_curation's bounded rows.
-    assert r["bound_violations_fast"] == 0
-    # Both Lance paths are timed.
-    assert r["fast_ms"] > 0.0 and r["exact_ms"] > 0.0
-    # Lance residency is lower than in-memory.
-    assert r["lance_resident_mb"] < r["mem_resident_mb"]
+    r = bench_e2e.run_synthetic(n=2_000, seed=5)
+    assert r["cells"], "no cells produced"
+    for cell in r["cells"]:
+        assert cell["membership_missing"] == 0 and cell["membership_extra"] == 0
+        assert cell["bound_violations"] == 0
+        assert cell["master_ms"] > 0 and cell["pr3_ms"] > 0
+    names = {c["filter"] for c in r["cells"]}
+    assert "none" in names and "vehicle" in names, f"expected none + vehicle cells, got {names}"
 
 
 def test_prefilter_matches_brute_force_filtered_reference() -> None:
