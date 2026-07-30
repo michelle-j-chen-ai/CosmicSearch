@@ -42,18 +42,18 @@ cache anything across calls.
 `rank_top_k` / `score_corpus` in `search_engine.py` are a different code path
 (approximate top-k over a resident matrix) and are untouched by this module.
 
-No date/segment/vehicle prefilter yet: `threshold_search` always screens the
-entire `embedding_i8` column, so the writer's physical sort and its
-BTREE/BITMAP scalar indices (`lance_writer.build_dataset`) are not consulted
-here. Deliberately deferred rather than added unsafely: a filtered scan's
-row positions no longer address the dataset the way `Dataset.take()` expects
-(see `_load_resident_corpus`'s docstring on why `scan_in_order=True` on an
-UNfiltered scan is what makes positional indexing safe); resolving a
-filtered scan's rows back to `take()`-addressable positions needs either
-Lance's stable row ids (still experimental) or its internal, unstable
-`_take_rows` row-address API. Implement this only by adopting one of those
-two mechanisms deliberately, not by passing `filter=` to the `embedding_i8`
-scan below.
+Pre-retrieval filters (`vehicle`, `date_range`, `run_uuids`) are applied
+before screening via a canonical-order resident mask: the int8 screen runs
+only over surviving rows, but every index handed to `Dataset.take()` or
+emitted as a `ThresholdHit.row_id` is a canonical position (see
+`_filter_mask` and the subset-to-canonical remap in `_search_resident`).
+This keeps positional `take()` addressing safe -- the invariant
+`_load_resident_corpus`'s `scan_in_order=True` establishes for the
+unfiltered path is preserved under a filter by remapping subset positions
+back to canonical ids before any `take()`/metadata/`row_id` use. Lance
+`filter=` scans remain unused; pushing the predicate into a Lance scalar
+index scan is a separate concern for out-of-core corpora and is not needed
+here because the int8 screen is already resident.
 """
 
 from __future__ import annotations
@@ -153,6 +153,9 @@ class _ResidentCorpus:
     pca: np.ndarray  # (D, model_dim) fp32
     scale: np.ndarray  # (D,) fp32
     eps: float
+    vehicle: np.ndarray  # (N,) object (str or None), canonical scan order
+    chunk_start_unix: np.ndarray  # (N,) int64
+    run_uuid: np.ndarray  # (N,) object
 
 
 def _load_resident_corpus(dataset: lance.LanceDataset) -> _ResidentCorpus:
@@ -172,12 +175,50 @@ def _load_resident_corpus(dataset: lance.LanceDataset) -> _ResidentCorpus:
     i8_table = dataset.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True)
     corpus_i8 = _fixed_size_list_matrix(i8_table, lance_writer.EMBEDDING_I8_COLUMN, np.int8)
     eps = eps_bound.eps_cauchy_schwarz(scale)
-    return _ResidentCorpus(corpus_i8=corpus_i8, pca=pca, scale=scale, eps=eps)
+    meta_table = dataset.to_table(
+        columns=["vehicle", "chunk_start_unix", "run_uuid"], scan_in_order=True
+    )
+    return _ResidentCorpus(
+        corpus_i8=corpus_i8,
+        pca=pca,
+        scale=scale,
+        eps=eps,
+        vehicle=np.array(meta_table.column("vehicle").to_pylist()),
+        chunk_start_unix=np.array(meta_table.column("chunk_start_unix").to_pylist()),
+        run_uuid=np.array(meta_table.column("run_uuid").to_pylist()),
+    )
+
+
+def _filter_mask(
+    resident: _ResidentCorpus,
+    vehicle: str | None,
+    date_range: tuple[int | None, int | None] | None,
+    run_uuids: "set[str] | None",
+) -> np.ndarray | None:
+    """AND of the given filters over canonical order; None when no filter given."""
+    if vehicle is None and date_range is None and run_uuids is None:
+        return None
+    n = resident.corpus_i8.shape[0]
+    mask = np.ones(n, dtype=bool)
+    if vehicle is not None:
+        mask &= resident.vehicle == vehicle
+    if date_range is not None:
+        lo, hi = date_range
+        if lo is not None:
+            mask &= resident.chunk_start_unix >= lo
+        if hi is not None:
+            mask &= resident.chunk_start_unix < hi
+    if run_uuids is not None:
+        mask &= np.isin(resident.run_uuid, list(run_uuids))
+    return mask
 
 
 def _search_resident(
     query: np.ndarray, tau: float, dataset: lance.LanceDataset, resident: _ResidentCorpus,
     *, fast_curation: bool = True,
+    vehicle: str | None = None,
+    date_range: tuple[int | None, int | None] | None = None,
+    run_uuids: "set[str] | None" = None,
 ) -> list[ThresholdHit]:
     """Screen+re-rank `query` against an already-decoded `_ResidentCorpus`.
 
@@ -191,8 +232,19 @@ def _search_resident(
 
     query_pca = _project_query(query, resident.pca)
     w = (query_pca * (resident.scale.astype(np.float32) / np.float32(127.0))).astype(np.float32)
-    screening_scores = np.empty(n, dtype=np.float32)
-    gpu_corpus._cpu_score_kernel()(np.ascontiguousarray(resident.corpus_i8), w, screening_scores)
+
+    allowed = _filter_mask(resident, vehicle, date_range, run_uuids)
+    if allowed is None:
+        sub_idx = None  # unfiltered: screen everything as today
+        corpus_i8 = np.ascontiguousarray(resident.corpus_i8)
+    else:
+        sub_idx = np.nonzero(allowed)[0]  # canonical ids of survivors
+        if sub_idx.size == 0:
+            return []
+        corpus_i8 = np.ascontiguousarray(resident.corpus_i8[sub_idx])
+
+    screening_scores = np.empty(corpus_i8.shape[0], dtype=np.float32)
+    gpu_corpus._cpu_score_kernel()(corpus_i8, w, screening_scores)
 
     # Cauchy-Schwarz bounds the screening error by ||query_pca|| * ||e||, and
     # `resident.eps` is the ||e|| half. The scan happens in PCA space, so the
@@ -203,8 +255,20 @@ def _search_resident(
     # window is also tighter than the corpus-wide constant.
     eps = resident.eps * float(np.linalg.norm(query_pca))
     above, band, _below = eps_bound.classify(screening_scores, tau, eps)
-    above_idx = np.nonzero(above)[0]
-    band_idx = np.nonzero(band)[0]
+    # SUBSET positions (index into screening_scores / corpus_i8), NOT canonical
+    # ids. Score lookups below use these; take()/row_id/metadata use canonical.
+    above_pos = np.nonzero(above)[0]
+    band_pos = np.nonzero(band)[0]
+
+    # fast_curation ABOVE acceptance reads the bounded score at SUBSET position.
+    # Remap to canonical ids AFTER all subset-position score lookups are done,
+    # so take()/row_id/metadata address the right rows.
+    if sub_idx is None:
+        above_idx = above_pos  # unfiltered: subset position == canonical id
+        band_idx = band_pos
+    else:
+        above_idx = sub_idx[above_pos]  # canonical ids for take()/metadata/row_id
+        band_idx = sub_idx[band_pos]
 
     # Exact re-rank via take() on vector_fp -- 1 IOP/row, never a full column
     # read. ABOVE and BAND are each typically a tiny fraction of the corpus
@@ -226,7 +290,7 @@ def _search_resident(
     if fast_curation:
         # ABOVE rows are provable members (screen - eps >= tau): accept the
         # int8 screening score as a bounded approximation, no take() re-rank.
-        above_scores = screening_scores[above_idx].astype(np.float64)
+        above_scores = screening_scores[above_pos].astype(np.float64)
         above_kind = "bounded_approx"
         above_bound = eps
     else:
@@ -279,6 +343,9 @@ def _search_resident(
 def threshold_search(
     query: np.ndarray, tau: float, dataset: lance.LanceDataset,
     *, fast_curation: bool = True,
+    vehicle: str | None = None,
+    date_range: tuple[int | None, int | None] | None = None,
+    run_uuids: "set[str] | None" = None,
 ) -> list[ThresholdHit]:
     """Every row of `dataset` with re-rank score >= `tau`.
 
@@ -312,7 +379,10 @@ def threshold_search(
             f"'{lance_writer.MIN_DATA_STORAGE_VERSION}', PCA schema metadata present)"
         )
     resident = _load_resident_corpus(dataset)
-    return _search_resident(query, tau, dataset, resident, fast_curation=fast_curation)
+    return _search_resident(
+        query, tau, dataset, resident, fast_curation=fast_curation,
+        vehicle=vehicle, date_range=date_range, run_uuids=run_uuids,
+    )
 
 
 class ThresholdCorpus:
@@ -348,6 +418,12 @@ class ThresholdCorpus:
 
     def threshold_search(
         self, query: np.ndarray, tau: float, *, fast_curation: bool = True,
+        vehicle: str | None = None,
+        date_range: tuple[int | None, int | None] | None = None,
+        run_uuids: "set[str] | None" = None,
     ) -> list[ThresholdHit]:
         """Every row with re-rank score >= `tau`; see `threshold_search`."""
-        return _search_resident(query, tau, self._dataset, self._resident, fast_curation=fast_curation)
+        return _search_resident(
+            query, tau, self._dataset, self._resident, fast_curation=fast_curation,
+            vehicle=vehicle, date_range=date_range, run_uuids=run_uuids,
+        )

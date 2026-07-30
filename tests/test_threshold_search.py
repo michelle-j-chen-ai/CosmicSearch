@@ -401,3 +401,72 @@ def test_bench_runs_fast_curation_and_exact_and_reports_accuracy() -> None:
     assert r["fast_ms"] > 0.0 and r["exact_ms"] > 0.0
     # Lance residency is lower than in-memory.
     assert r["lance_resident_mb"] < r["mem_resident_mb"]
+
+
+def test_prefilter_matches_brute_force_filtered_reference() -> None:
+    """Filtered search returns exactly the rows passing BOTH the filter and
+    the tau cut — vehicle, date, run_uuid, each alone and combined."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=11, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=11)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 95.0))
+        corpus = ts.ThresholdCorpus(ds)
+
+        meta = ds.to_table(
+            columns=["vehicle", "chunk_start_unix", "run_uuid"], scan_in_order=True
+        )
+        veh = np.array(meta.column("vehicle").to_pylist())
+        csu = np.array(meta.column("chunk_start_unix").to_pylist())
+        run = np.array(meta.column("run_uuid").to_pylist())
+
+        lo, hi = int(np.percentile(csu, 25)), int(np.percentile(csu, 75))
+        cases = [
+            ({"vehicle": "veh_a"}, veh == "veh_a"),
+            ({"date_range": (lo, hi)}, (csu >= lo) & (csu < hi)),
+            ({"run_uuids": {"run-1", "run-3"}}, np.isin(run, ["run-1", "run-3"])),
+            (
+                {"vehicle": "veh_b", "date_range": (lo, None)},
+                (veh == "veh_b") & (csu >= lo),
+            ),
+        ]
+        for kwargs, fmask in cases:
+            hits = corpus.threshold_search(query, tau, **kwargs)
+            expected = set(np.nonzero(fmask & (scores >= tau))[0].tolist())
+            got = {h.row_id for h in hits}
+            assert got == expected, f"{kwargs}: diff {got ^ expected}"
+
+
+def test_prefilter_empty_and_none_cases() -> None:
+    """Zero-match filter returns [] cleanly; no-filter equals unfiltered."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=1_000, seed=12, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=12)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 99.0))
+        corpus = ts.ThresholdCorpus(ds)
+        assert corpus.threshold_search(query, tau, vehicle="no_such_vehicle") == []
+        unfiltered = {h.row_id for h in corpus.threshold_search(query, tau)}
+        nofilter_kwargs = {h.row_id for h in corpus.threshold_search(
+            query, tau, vehicle=None, date_range=None, run_uuids=None)}
+        assert unfiltered == nofilter_kwargs
+
+
+def test_prefilter_preserves_fast_curation_semantics() -> None:
+    """Under a filter, ABOVE rows are still bounded_approx within their eps
+    bound and BAND rows exact — same contract as unfiltered."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=13, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=13)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 95.0))
+        corpus = ts.ThresholdCorpus(ds)
+        hits = corpus.threshold_search(query, tau, vehicle="veh_a")
+        assert hits, "fixture bug: veh_a filter matched nothing at p95"
+        kinds = {h.score_kind for h in hits}
+        assert kinds <= {"exact", "bounded_approx"}
+        for h in hits:
+            if h.score_kind == "bounded_approx":
+                assert abs(h.score - scores[h.row_id]) <= h.score_error_bound + 1e-6
+            else:
+                assert np.isclose(h.score, scores[h.row_id], rtol=1e-9, atol=1e-9)
