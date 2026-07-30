@@ -1,12 +1,13 @@
 steps:
-  - name: python:3.10-slim
+  - name: ghcr.io/astral-sh/uv:0.11.21-python3.13-bookworm
     entrypoint: bash
     args:
       - -c
       - |
         set -e
-        pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.8.0
-        pip install --no-cache-dir -r requirements.txt
+        export UV_SYSTEM_PYTHON=1 UV_NO_CACHE=1
+        uv pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torchvision==0.23.0
+        uv pip install -r requirements.lock
         python -m pytest tests/ -v
         python smoke_test.py
 options:
