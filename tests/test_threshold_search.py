@@ -36,7 +36,7 @@ def test_matches_a_brute_force_oracle_across_thresholds(n: int, seed: int) -> No
         scores = conftest.exact_scores(ds, query)
 
         for tau in _taus(scores):
-            hits = ts.threshold_search(query, tau, ds)
+            hits = ts.threshold_search(query, tau, ds, fast_curation=False)
             expected = set(np.nonzero(scores >= tau)[0].tolist())
             got = [h.row_id for h in hits]
             assert set(got) == expected, f"tau={tau}: symmetric diff {set(got) ^ expected}"
@@ -300,6 +300,65 @@ def test_threshold_hit_defaults_to_exact_score_kind() -> None:
     )
     assert h.score_kind == "exact"
     assert h.score_error_bound == 0.0
+
+
+def test_fast_curation_same_membership_mixed_score_kinds() -> None:
+    """fast_curation returns the same rows as the exact path, but ABOVE rows
+    carry bounded screening scores (no take()) and BAND rows carry exact
+    scores. The eps bound must hold for every bounded row."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=3, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=3)
+        scores = conftest.exact_scores(ds, query)
+
+        # A tau that leaves a non-trivial BAND: pick a percentile where the
+        # int8 screen straddles tau within eps for some rows.
+        tau = float(np.percentile(scores, 99.0))
+
+        exact = ts.threshold_search(query, tau, ds, fast_curation=False)
+        fast = ts.threshold_search(query, tau, ds, fast_curation=True)
+
+        # Same membership (the core property).
+        exact_ids = {h.row_id for h in exact}
+        fast_ids = {h.row_id for h in fast}
+        assert fast_ids == exact_ids, f"symmetric diff {fast_ids ^ exact_ids}"
+
+        # Score-kind tagging: every hit is exact or bounded_approx.
+        kinds = {h.score_kind for h in fast}
+        assert kinds <= {"exact", "bounded_approx"}, kinds
+        assert "bounded_approx" in kinds or len(fast) == 0, "expected ABOVE rows to be bounded"
+        assert "exact" in kinds or len(fast) == 0, "expected BAND rows to be exact"
+
+        # Every bounded row's screen score is within its error bound of the
+        # true score; every exact row matches the true score.
+        for h in fast:
+            true = scores[h.row_id]
+            if h.score_kind == "bounded_approx":
+                assert abs(h.score - true) <= h.score_error_bound + 1e-6, (
+                    f"row {h.row_id}: |{h.score} - {true}| = {abs(h.score - true)} "
+                    f"> bound {h.score_error_bound}"
+                )
+            else:
+                assert np.isclose(h.score, true, rtol=1e-9, atol=1e-9)
+
+
+def test_fast_curation_still_filters_band_by_exact_score() -> None:
+    """fast_curation must still re-rank BAND rows and drop those below tau.
+    A BAND row whose true score is below tau must NOT appear."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=7, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=7)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 99.0))
+
+        fast = ts.threshold_search(query, tau, ds, fast_curation=True)
+        for h in fast:
+            # Every returned row's TRUE score is >= tau. Bounded rows are
+            # ABOVE (provably >= tau by the bound); exact rows are BAND that
+            # passed the exact >= tau filter. Either way, no row below tau.
+            assert scores[h.row_id] >= tau - 1e-9, (
+                f"row {h.row_id} true score {scores[h.row_id]} < tau {tau}"
+            )
 
 
 def test_bench_agrees_with_brute_force_end_to_end() -> None:

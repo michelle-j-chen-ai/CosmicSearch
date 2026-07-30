@@ -170,9 +170,14 @@ def _load_resident_corpus(dataset: lance.LanceDataset) -> _ResidentCorpus:
 
 
 def _search_resident(
-    query: np.ndarray, tau: float, dataset: lance.LanceDataset, resident: _ResidentCorpus
+    query: np.ndarray, tau: float, dataset: lance.LanceDataset, resident: _ResidentCorpus,
+    *, fast_curation: bool = True,
 ) -> list[ThresholdHit]:
-    """Screen+re-rank `query` against an already-decoded `_ResidentCorpus`."""
+    """Screen+re-rank `query` against an already-decoded `_ResidentCorpus`.
+
+    When `fast_curation` is true, ABOVE rows keep their bounded screening score
+    and skip `take()`; BAND rows are always re-ranked. Membership is identical
+    in both modes."""
     _assert_unit_norm(query)
     n = resident.corpus_i8.shape[0]
     if n == 0:
@@ -212,24 +217,37 @@ def _search_resident(
         # accumulator at full precision, so scores are unchanged.
         return np.einsum("ij,j->i", fp, query_pca, dtype=np.float64)
 
-    above_scores = _exact_scores(above_idx)
-    band_scores = _exact_scores(band_idx)
+    if fast_curation:
+        # ABOVE rows are provable members (screen - eps >= tau): accept the
+        # int8 screening score as a bounded approximation, no take() re-rank.
+        above_scores = screening_scores[above_idx].astype(np.float64)
+        above_kind = "bounded_approx"
+        above_bound = eps
+    else:
+        above_scores = _exact_scores(above_idx)
+        above_keep = above_scores >= tau
+        above_idx = above_idx[above_keep]
+        above_scores = above_scores[above_keep]
+        above_kind = "exact"
+        above_bound = 0.0
 
-    # Filter both ABOVE and BAND to score >= tau. BAND needs it because the
-    # eps window alone does not decide membership; ABOVE is filtered too as a
-    # cheap, unconditional safety net (see module docstring point 3).
-    above_keep = above_scores >= tau
-    above_idx = above_idx[above_keep]
-    above_scores = above_scores[above_keep]
+    # BAND rows are always re-ranked: the eps window alone does not decide
+    # membership, so the exact score is required to filter to >= tau.
+    band_scores = _exact_scores(band_idx)
     band_keep = band_scores >= tau
     band_idx = band_idx[band_keep]
     band_scores = band_scores[band_keep]
 
     all_idx = np.concatenate([above_idx, band_idx])
     all_scores = np.concatenate([above_scores, band_scores])
+    all_kind = [above_kind] * above_idx.size + ["exact"] * band_idx.size
+    all_bound = [above_bound] * above_idx.size + [0.0] * band_idx.size
+
     order = np.argsort(-all_scores, kind="stable")
     sorted_idx = all_idx[order]
     sorted_scores = all_scores[order]
+    sorted_kind = [all_kind[i] for i in order]
+    sorted_bound = [all_bound[i] for i in order]
 
     if sorted_idx.size == 0:
         return []
@@ -245,13 +263,16 @@ def _search_resident(
             chunk_start_unix=meta["chunk_start_unix"][i],
             chunk_end_unix=meta["chunk_end_unix"][i],
             vehicle=meta["vehicle"][i],
+            score_kind=sorted_kind[i],
+            score_error_bound=sorted_bound[i],
         )
         for i in range(sorted_idx.size)
     ]
 
 
 def threshold_search(
-    query: np.ndarray, tau: float, dataset: lance.LanceDataset
+    query: np.ndarray, tau: float, dataset: lance.LanceDataset,
+    *, fast_curation: bool = True,
 ) -> list[ThresholdHit]:
     """Every row of `dataset` with re-rank score >= `tau`.
 
@@ -267,6 +288,12 @@ def threshold_search(
     re-rank (BAND), never drop a row whose exact score is >= tau. Sorted by
     score descending.
 
+    `fast_curation` is the shipped mode: ABOVE rows (provably above tau by the
+    eps bound) keep their bounded int8 screening score and skip `take()`;
+    BAND rows are always re-ranked exactly. `fast_curation=False` refines
+    ABOVE too, used internally for benchmark comparison. Membership is
+    identical in both modes.
+
     This is the standalone entry point: it decodes `embedding_i8` fresh on
     every call. A caller making repeated queries against the same dataset
     should use `ThresholdCorpus` instead, which decodes once and reuses the
@@ -279,7 +306,7 @@ def threshold_search(
             f"'{lance_writer.MIN_DATA_STORAGE_VERSION}', PCA schema metadata present)"
         )
     resident = _load_resident_corpus(dataset)
-    return _search_resident(query, tau, dataset, resident)
+    return _search_resident(query, tau, dataset, resident, fast_curation=fast_curation)
 
 
 class ThresholdCorpus:
@@ -313,6 +340,8 @@ class ThresholdCorpus:
     def num_rows(self) -> int:
         return self._resident.corpus_i8.shape[0]
 
-    def threshold_search(self, query: np.ndarray, tau: float) -> list[ThresholdHit]:
+    def threshold_search(
+        self, query: np.ndarray, tau: float, *, fast_curation: bool = True,
+    ) -> list[ThresholdHit]:
         """Every row with re-rank score >= `tau`; see `threshold_search`."""
-        return _search_resident(query, tau, self._dataset, self._resident)
+        return _search_resident(query, tau, self._dataset, self._resident, fast_curation=fast_curation)
