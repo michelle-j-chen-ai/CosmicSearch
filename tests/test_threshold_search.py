@@ -361,15 +361,23 @@ def test_fast_curation_still_filters_band_by_exact_score() -> None:
             )
 
 
-def test_bench_agrees_with_brute_force_end_to_end() -> None:
-    # Smoke test for the standalone benchmark: it must build, run both paths,
-    # and find them in agreement -- so a broken bench fails here rather than
-    # when someone runs it by hand.
-    import bench_threshold_search as bench
+def test_default_mode_is_fast_curation() -> None:
+    """Calling threshold_search WITHOUT the fast_curation kwarg must default to
+    fast_curation=True: ABOVE rows carry a bounded_approx screening score.
+    If the default were ever flipped back to False, this test catches it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2000, seed=3, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=3)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 99.0))
 
-    result = bench.run(n=2_000, tau_percentile=99.0, seed=5)
-    assert result["matches"] > 0
-    assert result["lance_resident_mb"] < result["mem_resident_mb"]
+        hits = ts.threshold_search(query, tau, ds)
+        assert hits, "expected at least one match at p99"
+        kinds = {h.score_kind for h in hits}
+        assert "bounded_approx" in kinds, (
+            f"default mode produced no bounded_approx hits; kinds={kinds} "
+            "-- the default is not fast_curation"
+        )
 
 
 def test_bench_runs_fast_curation_and_exact_and_reports_accuracy() -> None:
@@ -391,3 +399,5 @@ def test_bench_runs_fast_curation_and_exact_and_reports_accuracy() -> None:
     assert r["bound_violations_fast"] == 0
     # Both Lance paths are timed.
     assert r["fast_ms"] > 0.0 and r["exact_ms"] > 0.0
+    # Lance residency is lower than in-memory.
+    assert r["lance_resident_mb"] < r["mem_resident_mb"]

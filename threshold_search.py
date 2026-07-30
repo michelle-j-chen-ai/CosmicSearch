@@ -84,8 +84,9 @@ class ThresholdHit:
     # dataset version -- compaction or a new append changes fragment layout
     # and invalidates it as an address into a later version.
     row_id: int
-    # Exact re-rank score, i.e. `vector_fp[row_id] . query_pca` (see
-    # `lance_writer.py`'s module docstring for what `vector_fp` holds).
+    # Re-rank score. For score_kind="exact" this is `vector_fp[row_id] .
+    # query_pca`; for score_kind="bounded_approx" it is the int8 screening
+    # score (see `score_kind` / `score_error_bound` below).
     score: float
     run_uuid: str
     segment_id: str

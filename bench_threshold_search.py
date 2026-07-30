@@ -1,24 +1,25 @@
-"""Standalone benchmark: resident fp32 brute force vs the Lance threshold scan.
+"""Standalone benchmark: brute-force vs fast_curation vs exact_scores.
 
 Builds a corpus into an exact-threshold Lance dataset and runs the same query
-both ways:
+three ways:
 
-  in-memory   the whole fp32 model-space matrix resident, one numpy gemv per
-              query -- what `search_engine.rank_top_k` does today
-  lance       `ThresholdCorpus`: only the int8 PCA column resident, screened
-              at `tau - eps`, boundary rows re-ranked from `vector_fp` via
-              `take()` (see `threshold_search.py`)
+  brute-force     the whole fp32 PCA-space matrix resident, one numpy gemvm
+                  per query -- the ground-truth reference for membership and
+                  score deviation
+  fast_curation   the shipped default: only the int8 PCA column resident,
+                  screened at `tau - eps`; ABOVE rows accepted with their
+                  bounded screening score (no `take()`), BAND rows re-ranked
+                  from `vector_fp` via `take()` (see `threshold_search.py`)
+  exact_scores    internal reference: like fast_curation but re-ranks ABOVE
+                  too, so every returned score is exact -- used to measure
+                  the screening-score deviation fast_curation introduces
 
-Both must return the same number of rows; the run exits non-zero otherwise,
-so the exactness guarantee is checked every time.
+All three must agree on membership (no false dismissals, no extras); the run
+exits non-zero otherwise. Score deviation is reported per-path, split by
+score kind (exact vs bounded_approx), and the eps bound is checked for every
+bounded row.
 
-Reading the result: at any corpus that fits in RAM the brute force wins on
-per-query latency, and that is expected -- the Lance path trades per-query
-work for residency. The columns to watch are `resident` (what the process
-must hold to answer a query at all) and how each scales with `--rows`. At
-100M the fp32 matrix is ~307GB and the in-memory column has no answer at all.
-
-`--tau-percentile` matters as much as `--rows`: every returned row costs a
+`--tau-percentile` matters as much as `--rows`: every BAND row costs a
 `take()`, so a broad threshold benchmarks the re-rank path while a tight one
 (the curation workload this is built for) benchmarks the screen.
 
@@ -222,7 +223,7 @@ def _median_time(fn, repeats: int = _REPEATS):
 
 
 def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic") -> dict:
-    """Build, time both paths, verify they agree. Returns the report row."""
+    """Build, time all three paths, verify membership. Returns the report row."""
     tmp = Path(tempfile.mkdtemp(prefix="nls_bench_"))
     try:
         t0 = time.perf_counter()
@@ -266,15 +267,15 @@ def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic")
         bf_scores = projected.astype(np.float64) @ query_pca
         bf_set = set(np.nonzero(bf_scores >= tau)[0].tolist())
 
-        # segment_id = f"seg-{i}" embeds the generation index i uniquely.
-        # Read it in scan order to map row_id (dataset position) -> generation
-        # index (brute-force order).
+        # Map row_id (dataset scan position) -> generation index (brute-force
+        # order) by joining on the segment_id VALUE, not by parsing it. The
+        # `metadata` table in scope here is generation-ordered (row i =
+        # generation index i), so its segment_id column gives the lookup map.
+        gen_segment_ids = metadata.column("segment_id").to_pylist()
+        seg_to_gen = {sid: i for i, sid in enumerate(gen_segment_ids)}
         seg_table = ds.to_table(columns=["segment_id"], scan_in_order=True)
         seg_by_row = seg_table.column("segment_id").to_pylist()
-        row_to_gen = {}
-        for row_id in range(len(seg_by_row)):
-            sid = seg_by_row[row_id]
-            row_to_gen[row_id] = int(sid.split("-")[1])
+        row_to_gen = {row_id: seg_to_gen[seg_by_row[row_id]] for row_id in range(len(seg_by_row))}
 
         def _hit_gen_ids(hits):
             return {row_to_gen[h.row_id] for h in hits}
