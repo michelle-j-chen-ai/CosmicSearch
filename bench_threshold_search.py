@@ -256,8 +256,8 @@ def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic")
         t0 = time.perf_counter()
         corpus = ts.ThresholdCorpus(ds)
         hydrate_s = time.perf_counter() - t0
-        corpus.threshold_search(query, tau)  # numba JIT warmup, excluded from timing
-        lance_s, hits = _median_time(lambda: corpus.threshold_search(query, tau))
+        corpus.threshold_search(query, tau, fast_curation=False)  # numba JIT warmup, excluded from timing
+        lance_s, hits = _median_time(lambda: corpus.threshold_search(query, tau, fast_curation=False))
 
         # Row ids address the dataset's sorted order and the in-memory matrix
         # its generation order, so the two match sets cannot be compared by id.

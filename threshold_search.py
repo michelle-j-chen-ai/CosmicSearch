@@ -15,14 +15,19 @@ pieces together against a real `lance_writer.build_dataset` output:
      excluded, never touched again).
   3. The dataset's `vector_fp` column is this system's re-rank reference (see
      `lance_writer.py`'s module docstring for what it holds and when it is a
-     true pre-quantization signal vs a fallback dequantized-int8 value).
-     ABOVE and BAND rows both get their exact score recomputed from
-     `vector_fp` via `Dataset.take()` -- one IOP per row, never a full-column
-     read. Both ABOVE and BAND are then filtered to `score >= tau`: BAND
-     because the eps window does not by itself decide membership, and ABOVE
-     as a cheap unconditional safety net so "every returned score >= tau"
-     never rests solely on the (empirically large but formally unbounded)
-     margin between the fastmath-fp32 screening kernel and the fp64 re-rank.
+     true pre-quantization signal vs a fallback dequantized-int8 value). The
+     shipped default (`fast_curation=True`) accepts ABOVE rows with their
+     bounded int8 screening score and no `take()` re-rank -- membership is
+     proven by the eps bound (`screen - eps >= tau`), so the screen score is a
+     bounded approximation, not an exact value. BAND rows are always re-ranked
+     from `vector_fp` via `Dataset.take()` (one IOP per row, never a full-column
+     read) and filtered to `score >= tau`, because the eps window alone does
+     not decide their membership. The exact path (`fast_curation=False`)
+     re-ranks ABOVE too and filters it to `score >= tau`; it is the internal
+     reference used for benchmark comparison. The eps bound is proven against
+     `vector_fp`, but the fastmath-fp32 screening kernel's own numeric error
+     relative to that bound is empirically large yet formally unbounded -- the
+     exact path exists precisely to measure that gap.
   4. Return ABOVE union filtered-BAND, sorted by score descending, with each
      hit's scalar metadata (fetched via the same `take()` pass).
 
