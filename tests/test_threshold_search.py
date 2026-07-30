@@ -370,3 +370,24 @@ def test_bench_agrees_with_brute_force_end_to_end() -> None:
     result = bench.run(n=2_000, tau_percentile=99.0, seed=5)
     assert result["matches"] > 0
     assert result["lance_resident_mb"] < result["mem_resident_mb"]
+
+
+def test_bench_runs_fast_curation_and_exact_and_reports_accuracy() -> None:
+    """The bench must run fast_curation + exact + brute-force, report
+    membership set-equality (no missing/extra) and score deviation, and
+    exit cleanly on a small corpus."""
+    import bench_threshold_search as bench
+
+    r = bench.run(n=2_000, tau_percentile=99.0, seed=5)
+    assert r["matches"] > 0
+    # Both Lance paths must have zero missing and zero extra vs ground truth.
+    assert r["membership_missing_fast"] == 0
+    assert r["membership_extra_fast"] == 0
+    assert r["membership_missing_exact"] == 0
+    assert r["membership_extra_exact"] == 0
+    # Score deviation is reported.
+    assert "score_dev_fast_max" in r and r["score_dev_fast_max"] >= 0.0
+    # No bound violation for fast_curation's bounded rows.
+    assert r["bound_violations_fast"] == 0
+    # Both Lance paths are timed.
+    assert r["fast_ms"] > 0.0 and r["exact_ms"] > 0.0

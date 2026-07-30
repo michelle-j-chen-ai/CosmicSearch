@@ -250,34 +250,82 @@ def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic")
         tau = float(np.percentile(embeddings @ query, tau_percentile))
 
         mem_s, mem_scores = _median_time(lambda: embeddings @ query)
-        mem_above = np.sort(np.asarray(mem_scores)[np.asarray(mem_scores) >= tau])[::-1]
 
         ds = lance.dataset(uri)
         t0 = time.perf_counter()
         corpus = ts.ThresholdCorpus(ds)
         hydrate_s = time.perf_counter() - t0
-        corpus.threshold_search(query, tau, fast_curation=False)  # numba JIT warmup, excluded from timing
-        lance_s, hits = _median_time(lambda: corpus.threshold_search(query, tau, fast_curation=False))
 
-        # Row ids address the dataset's sorted order and the in-memory matrix
-        # its generation order, so the two match sets cannot be compared by id.
-        # Compare the sorted SCORES instead: same count and same values means
-        # the same rows, up to the ~1e-4 gap between scoring in model space and
-        # in the PCA-256 space (identical only because the corpus is rank-256).
-        assert all(h.score >= tau for h in hits), "returned a row scoring below tau"
-        lance_above = np.array([h.score for h in hits])
-        if lance_above.size != mem_above.size:
+        # Brute-force ground truth in the vector_fp (PCA-256) space: the exact
+        # reference the Lance paths score against. `projected` is the
+        # pre-quantization PCA projection the corpus was built from (same
+        # content as `vector_fp`), and `query_pca` is the query projected into
+        # that same space.
+        projected = (embeddings @ pca.T).astype("float32")
+        query_pca = pca.astype(np.float64) @ query
+        bf_scores = projected.astype(np.float64) @ query_pca
+        bf_set = set(np.nonzero(bf_scores >= tau)[0].tolist())
+
+        # segment_id = f"seg-{i}" embeds the generation index i uniquely.
+        # Read it in scan order to map row_id (dataset position) -> generation
+        # index (brute-force order).
+        seg_table = ds.to_table(columns=["segment_id"], scan_in_order=True)
+        seg_by_row = seg_table.column("segment_id").to_pylist()
+        row_to_gen = {}
+        for row_id in range(len(seg_by_row)):
+            sid = seg_by_row[row_id]
+            row_to_gen[row_id] = int(sid.split("-")[1])
+
+        def _hit_gen_ids(hits):
+            return {row_to_gen[h.row_id] for h in hits}
+
+        def _check(path_hits):
+            gen_ids = _hit_gen_ids(path_hits)
+            missing = bf_set - gen_ids
+            extra = gen_ids - bf_set
+            return gen_ids, missing, extra
+
+        # numba JIT warmup, excluded from timing.
+        corpus.threshold_search(query, tau, fast_curation=False)
+
+        exact_s, exact_hits = _median_time(
+            lambda: corpus.threshold_search(query, tau, fast_curation=False))
+        _exact_ids, exact_missing, exact_extra = _check(exact_hits)
+
+        fast_s, fast_hits = _median_time(
+            lambda: corpus.threshold_search(query, tau, fast_curation=True))
+        _fast_ids, fast_missing, fast_extra = _check(fast_hits)
+
+        # Hard-fail on any false dismissal or false positive (both paths).
+        if fast_missing or fast_extra:
             raise SystemExit(
-                f"FAIL: brute force found {mem_above.size} rows >= tau, Lance path "
-                f"returned {lance_above.size} -- the exact-threshold guarantee is broken"
+                f"FAIL: fast_curation missing={len(fast_missing)} extra={len(fast_extra)} vs ground truth"
             )
-        if lance_above.size and not np.allclose(lance_above, mem_above, rtol=0, atol=1e-3):
-            worst = float(np.abs(lance_above - mem_above).max())
+        if exact_missing or exact_extra:
             raise SystemExit(
-                f"FAIL: the two paths returned the same number of rows but "
-                f"different scores (max difference {worst:.2e}) -- they are not "
-                f"returning the same rows"
+                f"FAIL: exact path missing={len(exact_missing)} extra={len(exact_extra)} vs ground truth"
             )
+
+        # Score deviation, split by score kind.
+        bf_by_gen = {i: float(bf_scores[i]) for i in range(n)}
+        fast_devs_exact, fast_devs_bounded, bound_violations = [], [], 0
+        for h in fast_hits:
+            true = bf_by_gen[row_to_gen[h.row_id]]
+            dev = abs(h.score - true)
+            if h.score_kind == "bounded_approx":
+                fast_devs_bounded.append(dev)
+                if dev > h.score_error_bound + 1e-6:
+                    bound_violations += 1
+            else:
+                fast_devs_exact.append(dev)
+        if bound_violations:
+            raise SystemExit(
+                f"FAIL: {bound_violations} fast_curation rows exceeded their eps bound"
+            )
+        exact_devs = [abs(h.score - bf_by_gen[row_to_gen[h.row_id]]) for h in exact_hits]
+
+        fast_above = sum(1 for h in fast_hits if h.score_kind == "bounded_approx")
+        fast_band = sum(1 for h in fast_hits if h.score_kind == "exact")
 
         return {
             "rows": n,
@@ -286,12 +334,23 @@ def run(n: int, tau_percentile: float, seed: int = 0, source: str = "synthetic")
             "disk_mb": disk_mb,
             "tau": tau,
             "tau_percentile": tau_percentile,
-            "matches": len(hits),
+            "matches": len(fast_hits),
             "mem_resident_mb": embeddings.nbytes / 1e6,
             "mem_ms": mem_s * 1e3,
             "lance_resident_mb": n * D / 1e6,
             "lance_hydrate_s": hydrate_s,
-            "lance_ms": lance_s * 1e3,
+            "fast_ms": fast_s * 1e3,
+            "exact_ms": exact_s * 1e3,
+            "fast_above": fast_above,
+            "fast_band": fast_band,
+            "membership_missing_fast": len(fast_missing),
+            "membership_extra_fast": len(fast_extra),
+            "membership_missing_exact": len(exact_missing),
+            "membership_extra_exact": len(exact_extra),
+            "score_dev_fast_max": max(fast_devs_exact + fast_devs_bounded) if (fast_devs_exact or fast_devs_bounded) else 0.0,
+            "score_dev_fast_mean": (sum(fast_devs_exact + fast_devs_bounded) / len(fast_devs_exact + fast_devs_bounded)) if (fast_devs_exact or fast_devs_bounded) else 0.0,
+            "score_dev_exact_max": max(exact_devs) if exact_devs else 0.0,
+            "bound_violations_fast": bound_violations,
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -328,18 +387,32 @@ def main() -> int:
         f"tau p{r['tau_percentile']} = {r['tau']:.6f} -> {r['matches']:,} matches "
         f"({r['matches'] / r['rows']:.4%} of corpus)\n"
     )
-    print(f"{'path':<12}{'resident':>14}{'per query':>14}{'startup':>12}")
-    print(f"{'in-memory':<12}{r['mem_resident_mb']:>11.1f} MB{r['mem_ms']:>11.1f} ms{'-':>12}")
+    print(f"{'path':<16}{'resident':>14}{'per query':>14}{'startup':>12}")
+    print(f"{'in-memory':<16}{r['mem_resident_mb']:>11.1f} MB{r['mem_ms']:>11.1f} ms{'-':>12}")
     print(
-        f"{'lance':<12}{r['lance_resident_mb']:>11.1f} MB{r['lance_ms']:>11.1f} ms"
+        f"{'fast_curation':<16}{r['lance_resident_mb']:>11.1f} MB{r['fast_ms']:>11.1f} ms"
         f"{r['lance_hydrate_s']:>9.2f} s"
     )
     print(
-        f"\nresident ratio     : {r['mem_resident_mb'] / r['lance_resident_mb']:.1f}x less "
-        f"held by the Lance path"
+        f"{'exact_scores':<16}{r['lance_resident_mb']:>11.1f} MB{r['exact_ms']:>11.1f} ms"
+        f"{r['lance_hydrate_s']:>9.2f} s"
     )
-    print(f"exactness          : PASS (both paths return the same {r['matches']:,} "
-          f"rows, scores agreeing)")
+    print(
+        f"\nfast_curation breakdown: {r['fast_above']:,} ABOVE (bounded, no take()) + "
+        f"{r['fast_band']:,} BAND (exact, take())"
+    )
+    print(
+        f"membership        : PASS (fast missing={r['membership_missing_fast']} extra={r['membership_extra_fast']}; "
+        f"exact missing={r['membership_missing_exact']} extra={r['membership_extra_exact']})"
+    )
+    print(
+        f"score deviation   : fast max={r['score_dev_fast_max']:.2e} mean={r['score_dev_fast_mean']:.2e} "
+        f"| exact max={r['score_dev_exact_max']:.2e}"
+    )
+    print(
+        f"eps bound         : {'PASS' if r['bound_violations_fast'] == 0 else 'FAIL'} "
+        f"({r['bound_violations_fast']} violations)"
+    )
     return 0
 
 
