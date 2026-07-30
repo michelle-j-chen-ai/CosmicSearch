@@ -7,9 +7,9 @@ end-to-end latency and result agreement:
                AND the real-app filter masks (vehicle / run / date window),
                cut at ``tau`` -> result ``segment_id`` set. Timed per query
                (median over repeats); the corpus load is timed once.
-  PR3 path     ``ThresholdCorpus.threshold_search`` (Task 2's prefilter +
-               screen + re-rank) in the shipped ``fast_curation`` default.
-               Timed per query; hydrate timed once.
+  PR3 path     ``ThresholdCorpus.threshold_search`` (prefilter + screen +
+               re-rank) in the shipped ``fast_curation`` default. Timed per
+               query; hydrate timed once.
 
 Both paths threshold the same PCA-256 ``vector_fp`` space for the correctness
 reference (the master path's gate reference is computed by projecting the query
@@ -269,22 +269,29 @@ def _run_sweep(
     uses the real 768-d ``score_corpus``; its correctness reference uses
     ``pca_ref_scores``.
     """
-    # Master path: real 768-d model-space scores for latency timing.
-    master_scores_768 = search_engine.score_corpus(query, master_corpus)
     # The master copy carries chunk_id (legacy shards have no segment_id); the
     # threshold corpus's segment_id IS chunk_id. Join + report on chunk_id.
     row_keys = np.asarray(master_corpus.chunk_id, dtype=object)
 
     cells: list[dict] = []
     for cell in filters:
+        if cell["vehicle"] is not None and master_corpus.vehicle_array() is None:
+            print(
+                f"skipping {cell['name']!r} filter cell: master corpus has no "
+                "vehicle column"
+            )
+            continue
         mmask = _master_filter_mask(master_corpus, cell)
         if mmask is not None and not mmask.any():
             continue  # corpus lacks values for this filter -> skip gracefully
 
         for tau_p, tau in zip(_TAU_PERCENTILES, taus):
-            # --- master path (timed: real 768-d score_corpus + mask + tau) ---
+            # --- master path (timed: real 768-d score_corpus + mask + tau).
+            # score_corpus runs per query -- the gemv is the dominant,
+            # non-cacheable per-query cost; only the filter masks (which the
+            # app caches) are precomputed outside the timed unit. ---
             def _master_query():
-                scores = master_scores_768
+                scores = search_engine.score_corpus(query, master_corpus)
                 keep = scores >= tau
                 if mmask is not None:
                     keep &= mmask
