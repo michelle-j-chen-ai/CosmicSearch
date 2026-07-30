@@ -199,57 +199,34 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
   handles ~25 queries/s/core. Raise `max_instances` for more concurrent users;
   the model is stateless across requests.
 
-## Exact threshold-search benchmark
+## End-to-end master-vs-threshold benchmark
 
-`bench_threshold_search.py` compares the two ways to answer a
-cosine-threshold query over the same corpus: the resident fp32 matrix with a
-numpy gemv (what `rank_top_k` does today) against `threshold_search` over an
-exact-threshold Lance dataset (only the int8 PCA column resident, boundary
-rows re-ranked from `vector_fp` via `take()`).
+`bench_e2e.py` compares two retrieval paths over the same query, filters, and
+threshold (`tau`):
 
-It is fully standalone -- synthetic corpus generated locally, no model, no
-credentials, no network -- and exits non-zero if the two paths disagree on
-the match set, so the exactness guarantee is checked on every run.
+- **master path** — score the resident 768-d model-space matrix
+  (`score_corpus`), apply the real-app filter masks (vehicle / run / date
+  window), cut at `tau`.
+- **PR3 path** — `ThresholdCorpus.threshold_search` (prefilter + screen +
+  re-rank) in the shipped `fast_curation` default.
+
+Two hard-fail correctness gates (the script exits non-zero on violation):
+
+- **membership** — the master path's PCA-256-space reference set and the PR3
+  path's result set must be equal at the same `tau`.
+- **eps bound** — every `bounded_approx` hit's screening score must satisfy
+  `|fast_score - exact_score| <= score_error_bound + CROSS_SPACE_TOL`, where
+  `exact_score` is the PR3 path's own exact re-rank score.
 
 ```bash
-python bench_threshold_search.py                          # 100k synthetic rows
-python bench_threshold_search.py --rows 1000000
-python bench_threshold_search.py --tau-percentile 99.0    # broader match set
-python bench_threshold_search.py --source fixture         # real rows, offline
+# synthetic mode (default): generates two legacy shards locally, converts to
+# both corpora, runs the full sweep — no model, no credentials, no network.
+python bench_e2e.py --source synthetic --rows 20000
 
-# the full production corpus, reading only the leading --rows rows
-AWS_PROFILE=oci.phx python bench_threshold_search.py --rows 200000 --source \
-    s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/embeddings/v3_lr_5e5-ckpt-6549_npy/embeddings.npy
+# pre-built corpora (local dirs or s3:// URIs)
+python bench_e2e.py --master-uri <dir|uri> --threshold-uri <dir|uri> [--repeats N]
 ```
 
-Three corpus sources, and only the last one touches the network:
-
-- **synthetic** (default) is the only source that scales far enough for the
-  latency comparison to mean anything. Rows are shaped to match a real corpus
-  rather than drawn flat: unit-norm, inside a 256-d subspace (the production
-  corpus's top 256 of 768 components hold 1.00000 of its energy), with
-  per-dimension energy decaying so the top 64 hold ~0.98 of it, as measured on
-  `v3_lr_5e5-ckpt-6549`. That shaping matters because eps is sized from the
-  per-dim quantization scales, which a uniform-energy corpus flattens.
-- **fixture** is a committed 10,000-row seeded sample of that real corpus
-  (`tests/fixtures/real_corpus_sample.npz`, ~10MB), giving a genuine score
-  distribution with no credentials and no download. It is stored as the
-  PCA-256 projection plus a basis derived from all 902,827 rows, which
-  reconstructs the 768-d rows to ~2e-4 in score at a third of the bytes;
-  regenerate it with `tools/make_real_fixture.py`. Its timings are
-  overhead-dominated at 10k rows -- use it for distribution fidelity, not for
-  perf.
-- **a path or `s3://` URI** benchmarks the production corpus itself, deriving
-  the PCA basis from the rows it reads and mapping the artifact's `chunk_id`
-  to the `segment_id` the writer indexes.
-
-Reading the output: at any corpus that fits in RAM the brute force wins on
-per-query latency, which is expected -- the Lance path trades per-query work
-for residency. The columns that matter are `resident` (what the process must
-hold to answer a query at all: ~12x less for the Lance path) and how each
-scales with `--rows`. At 100M the fp32 matrix is ~307GB and the in-memory
-column has no answer at all.
-
-`--tau-percentile` matters as much as `--rows`, because every returned row
-costs a `take()`: a broad threshold benchmarks the re-rank path, a tight one
-(the curation workload this exists for) benchmarks the screen.
+The sweep covers filter cells: none; vehicle; date-window narrow (1 week) and
+medium (4 weeks); run_uuids (one drive). A cell whose corpus lacks values for
+its filter is skipped gracefully.

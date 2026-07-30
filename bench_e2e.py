@@ -124,20 +124,17 @@ def _median_time(fn, repeats: int) -> tuple[float, object]:
 # ---------------------------------------------------------------------------
 # Corpus loading (local dir or S3 URI).
 # ---------------------------------------------------------------------------
-def _load_master_corpus(master_uri: str) -> search_engine.Corpus:
-    """Load the master copy's resident 768-d matrix + metadata.
+def _attach_vehicle_from_shards(
+    corpus: search_engine.Corpus, local_dir: Path
+) -> None:
+    """Read the ``vehicle`` column from the Lance rank shards and attach it to
+    ``corpus`` so the master path's vehicle filter is live.
 
-    Local dirs (the rank-shard layout ``build_master_copy`` produces) are loaded
-    directly via ``_load_corpus_lance``; S3 URIs go through ``load_corpus``.
-    ``_load_corpus_lance`` does not surface the ``vehicle`` column, so for local
-    rank-shard dirs the vehicle column is read from the Lance shards and
-    attached so the master path's vehicle filter is live (matching the PR3 path,
-    whose threshold corpus carries vehicle natively).
+    ``_load_corpus_lance`` (used by both the local-dir and the S3-cached path)
+    builds the Corpus with ``vehicle=None``. The master copy carries the
+    vehicle column (the builder injects it), so both branches read it from the
+    same rank=NNNNN/ shards and attach it here.
     """
-    if master_uri.startswith("s3://"):
-        return search_engine.load_corpus(master_uri, "float32")
-    local_dir = Path(master_uri)
-    corpus = search_engine._load_corpus_lance(local_dir, master_uri, "float32")
     rank_dirs = sorted(
         d for d in local_dir.iterdir()
         if d.is_dir() and d.name.startswith("rank=")
@@ -157,6 +154,32 @@ def _load_master_corpus(master_uri: str) -> search_engine.Corpus:
             vehicles.extend([None] * arrow.num_rows)
     if len(vehicles) == corpus.num_rows:
         corpus.vehicle = vehicles
+
+
+def _load_master_corpus(master_uri: str) -> search_engine.Corpus:
+    """Load the master copy's resident 768-d matrix + metadata.
+
+    Local dirs (the rank-shard layout ``build_master_copy`` produces) are loaded
+    directly via ``_load_corpus_lance``; S3 URIs go through ``load_corpus``,
+    which downloads to a local cache dir (rank-shard layout, deterministic via
+    ``local_cache._uri_key``) before dispatching to ``_load_corpus_lance``.
+
+    Neither path surfaces the ``vehicle`` column through the Corpus, so both
+    attach it from the Lance shards — the master copy carries the column (the
+    builder injects it), and the S3-cached copy is the same rank-shard layout.
+    """
+    if master_uri.startswith("s3://"):
+        corpus = search_engine.load_corpus(master_uri, "float32")
+        # load_corpus downloaded to a local cache dir; the rank=NNNNN/ shards
+        # are there. Reconstruct the cache dir the same way load_corpus does.
+        local_dir = search_engine.local_cache.cache_root() / "corpus" / (
+            search_engine.local_cache._uri_key(master_uri)
+        )
+        _attach_vehicle_from_shards(corpus, local_dir)
+        return corpus
+    local_dir = Path(master_uri)
+    corpus = search_engine._load_corpus_lance(local_dir, master_uri, "float32")
+    _attach_vehicle_from_shards(corpus, local_dir)
     return corpus
 
 
@@ -409,7 +432,10 @@ def run(
     # segment_id); the threshold corpus's segment_id IS chunk_id. Join on
     # chunk_id so the reference is over the master corpus's own rows.
     master_keys = np.asarray(master_corpus.chunk_id, dtype=object)
-    key_to_master = {k: i for i, k in enumerate(master_keys.tolist())}
+    key_to_master: dict[object, int] = {}
+    for i, k in enumerate(master_keys.tolist()):
+        if k not in key_to_master:
+            key_to_master[k] = i
 
     # Read the threshold corpus's vector_fp in canonical order + its segment_ids.
     fp_table = threshold_ds.to_table(

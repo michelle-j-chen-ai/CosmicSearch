@@ -249,6 +249,34 @@ def test_master_copy_loads_via_search_engine_with_vehicle_column() -> None:
                 assert v is not None, f"NULL vehicle in {rank_dir.name}"
 
 
+def test_load_master_corpus_attaches_vehicle() -> None:
+    """_load_master_corpus (local-dir path) attaches the vehicle column from
+    the Lance shards so the master path's vehicle filter is live — the same
+    shared attach used by the S3-cached path."""
+    import bench_e2e
+    import build_test_corpora as btc
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        shards = _make_shards(
+            tmp_path,
+            [
+                ("mce113", 0, 10, 0, False),
+                ("week1_20250101", 0, 10, 1, True),
+            ],
+        )
+        dest = tmp_path / "dest"
+        btc.build_master_copy(shards, dest)
+        master_uri = str(dest / "master_prod_slice")
+
+        corpus = bench_e2e._load_master_corpus(master_uri)
+        assert corpus.num_rows == 20
+        assert corpus.vehicle is not None, "vehicle column not attached"
+        assert len(corpus.vehicle) == 20
+        veh_set = {v for v in corpus.vehicle if v is not None}
+        assert "mce113" in veh_set, f"mce113 missing from {veh_set}"
+
+
 def test_dest_prefix_under_sibogeng_is_refused() -> None:
     """The builder hard-refuses --dest-prefix under sibogeng/ (the prod
     namespace): calling the entry fn with such a dest raises BEFORE any S3
@@ -257,20 +285,20 @@ def test_dest_prefix_under_sibogeng_is_refused() -> None:
     import build_test_corpora as btc
 
     # Trailing slash
-    with pytest.raises(AssertionError, match="sibogeng"):
+    with pytest.raises(ValueError, match="sibogeng"):
         btc.run_build(
             source_prefix="s3://some-bucket/source/",
             dest_prefix="s3://some-bucket/sibogeng/dest/",
         )
     # No trailing slash — the builder appends /master_prod_slice/... so a bare
     # sibogeng segment must still be refused.
-    with pytest.raises(AssertionError, match="sibogeng"):
+    with pytest.raises(ValueError, match="sibogeng"):
         btc.run_build(
             source_prefix="s3://some-bucket/source/",
             dest_prefix="s3://some-bucket/sibogeng",
         )
     # sibogeng as the bucket name
-    with pytest.raises(AssertionError, match="sibogeng"):
+    with pytest.raises(ValueError, match="sibogeng"):
         btc.run_build(
             source_prefix="s3://some-bucket/source/",
             dest_prefix="s3://sibogeng/dest/",

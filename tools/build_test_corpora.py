@@ -341,9 +341,6 @@ def _parse_shard_info(uri: str) -> ShardInfo:
 # ---------------------------------------------------------------------------
 # Safety rail: refuse dest under sibogeng/
 # ---------------------------------------------------------------------------
-_SIBOGENG_PREFIX = "sibogeng/"
-
-
 def _assert_dest_safe(dest_prefix: str) -> None:
     """Hard-refuse a dest prefix under ``sibogeng/`` BEFORE any S3 client is built.
 
@@ -355,9 +352,11 @@ def _assert_dest_safe(dest_prefix: str) -> None:
     """
     parsed = urlparse(dest_prefix)
     segments = parsed.path.strip("/").split("/")
-    assert "sibogeng" not in parsed.netloc and "sibogeng" not in segments, (
-        f"refusing to write dest under sibogeng/ (prod namespace): {dest_prefix!r}"
-    )
+    if "sibogeng" in parsed.netloc or "sibogeng" in segments:
+        raise ValueError(
+            f"refusing to write dest under sibogeng/ (prod namespace): "
+            f"{dest_prefix!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
