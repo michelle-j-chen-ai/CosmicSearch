@@ -227,22 +227,11 @@ def _filter_cells(corpus: search_engine.Corpus) -> list[dict]:
     starts = corpus.chunk_start_array()
     if starts.size:
         lo, hi = int(starts.min()), int(starts.max())
-        if hi - lo >= _WEEK_SECONDS:
-            mid = lo + (hi - lo) // 2
-            cells.append({"name": "date-narrow", "vehicle": None,
-                          "date_range": (mid, mid + _WEEK_SECONDS),
-                          "run_uuids": None})
         if hi - lo >= 4 * _WEEK_SECONDS:
             mid = lo + (hi - lo) // 2
             cells.append({"name": "date-medium", "vehicle": None,
                           "date_range": (mid, mid + 4 * _WEEK_SECONDS),
                           "run_uuids": None})
-
-    runs = set(corpus.run_uuid)
-    if runs:
-        pick = next(iter(sorted(runs)))
-        cells.append({"name": "run_uuids", "vehicle": None, "date_range": None,
-                      "run_uuids": {pick}})
 
     return cells
 
