@@ -3,9 +3,9 @@
 Builds a corpus into an exact-threshold Lance dataset and runs the same query
 three ways:
 
-  brute-force     the whole fp32 PCA-space matrix resident, one numpy gemvm
-                  per query -- the ground-truth reference for membership and
-                  score deviation
+  brute-force     the whole fp32 model-space matrix resident, one numpy gemv
+                  per query; the ground-truth membership and score reference
+                  is computed in the PCA-256 space the Lance paths score in
   fast_curation   the shipped default: only the int8 PCA column resident,
                   screened at `tau - eps`; ABOVE rows accepted with their
                   bounded screening score (no `take()`), BAND rows re-ranked
