@@ -25,8 +25,7 @@ MODEL_DIM = conftest.MODEL_DIM  # 768
 
 
 # ---------------------------------------------------------------------------
-# Synthetic legacy-shard builder (local — Task 4 will centralize this in
-# bench_e2e.py and repoint this import).
+# Synthetic legacy-shard builder for offline tests.
 # ---------------------------------------------------------------------------
 def _make_legacy_shard(
     dir_: Path, n: int, seed: int, week: str, *, with_vehicle: bool = False
@@ -296,11 +295,76 @@ def test_master_copy_loads_via_search_engine_with_vehicle_column() -> None:
 def test_dest_prefix_under_sibogeng_is_refused() -> None:
     """The builder hard-refuses --dest-prefix under sibogeng/ (the prod
     namespace): calling the entry fn with such a dest raises BEFORE any S3
-    client is constructed."""
+    client is constructed. Both trailing-slash and no-trailing-slash forms
+    are refused."""
     import build_test_corpora as btc
 
+    # Trailing slash
     with pytest.raises(AssertionError, match="sibogeng"):
         btc.run_build(
             source_prefix="s3://some-bucket/source/",
             dest_prefix="s3://some-bucket/sibogeng/dest/",
         )
+    # No trailing slash — the builder appends /master_prod_slice/... so a bare
+    # sibogeng segment must still be refused.
+    with pytest.raises(AssertionError, match="sibogeng"):
+        btc.run_build(
+            source_prefix="s3://some-bucket/source/",
+            dest_prefix="s3://some-bucket/sibogeng",
+        )
+    # sibogeng as the bucket name
+    with pytest.raises(AssertionError, match="sibogeng"):
+        btc.run_build(
+            source_prefix="s3://some-bucket/source/",
+            dest_prefix="s3://sibogeng/dest/",
+        )
+
+
+def test_missing_vehicle_persisted_as_null_not_empty_string() -> None:
+    """Weekly shards whose metadata_json has no vehicle key produce NULL in the
+    Lance vehicle column, not empty-string. NULL vs "" differs downstream
+    (BITMAP index cardinality, prefilter semantics, hit.vehicle truthiness)."""
+    import build_test_corpora as btc
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        # mce113 shard (vehicle -> "mce113") + weekly shard WITHOUT vehicle key
+        shards = _make_shards(
+            tmp_path,
+            [
+                ("mce113", 0, 10, 0, False),
+                ("week1_20250101", 0, 10, 1, False),  # with_vehicle=False
+            ],
+        )
+        dest = tmp_path / "dest"
+
+        # Master copy: NULL vehicle for weekly-no-vehicle rows
+        btc.build_master_copy(shards, dest)
+        master_dir = dest / "master_prod_slice"
+        rank_dirs = sorted(
+            d for d in master_dir.iterdir() if d.is_dir() and d.name.startswith("rank=")
+        )
+        # rank=00000 is mce113 (all "mce113"), rank=00001 is weekly (all NULL)
+        weekly_ds = lance.dataset(str(rank_dirs[1] / "video_embeddings.lance"))
+        vehicle_col = weekly_ds.to_table(columns=["vehicle"]).column("vehicle")
+        assert vehicle_col.null_count == 10, (
+            f"expected 10 nulls, got {vehicle_col.null_count}"
+        )
+        for v in vehicle_col.to_pylist():
+            assert v is None, f"expected None, got {v!r}"
+
+        # Threshold corpus: NULL vehicle for weekly-no-vehicle rows
+        btc.build_threshold_corpus(shards, dest, fraction=1.0)
+        threshold_ds = lance.dataset(
+            str(dest / "threshold_prod_slice" / "corpus.lance")
+        )
+        veh = threshold_ds.to_table(columns=["vehicle"]).column("vehicle")
+        # mce113 rows have "mce113", weekly rows have None
+        assert veh.null_count == 10, (
+            f"expected 10 nulls, got {veh.null_count}"
+        )
+        vals = veh.to_pylist()
+        mce_vals = [v for v in vals if v == "mce113"]
+        assert len(mce_vals) == 10
+        none_vals = [v for v in vals if v is None]
+        assert len(none_vals) == 10

@@ -5,7 +5,7 @@ column + sequential rank renumbering) and a *threshold corpus* (the exact-
 threshold int8 PCA Lance dataset the threshold search path scores against)
 from a selectable subset of the production embedding shards.
 
-USAGE (dry-run, for human review before Gate A)::
+USAGE (dry-run, for human review before any real build)::
 
     python tools/build_test_corpora.py \\
         --source-prefix s3://bucket/prod/embeddings/ \\
@@ -169,7 +169,7 @@ def build_master_copy(shards: list[ShardInfo], dest_dir: Path) -> Path:
 
         table = table.append_column(
             "vehicle",
-            pa.array(["" if v is None else v for v in vehicles], type=pa.string()),
+            pa.array(vehicles, type=pa.string()),
         )
         lance.write_dataset(table, out_uri, mode="create")
 
@@ -263,9 +263,7 @@ def build_threshold_corpus(
             "run_uuid": pa.array(run_uuids, type=pa.string()),
             "chunk_start_unix": pa.array(chunk_starts, type=pa.int64()),
             "segment_id": pa.array(chunk_ids, type=pa.string()),
-            "vehicle": pa.array(
-                ["" if v is None else v for v in vehicles], type=pa.string()
-            ),
+            "vehicle": pa.array(vehicles, type=pa.string()),
         }
     )
     pq.write_table(metadata, artifact_dir / lance_writer.METADATA_FILE)
@@ -349,12 +347,15 @@ _SIBOGENG_PREFIX = "sibogeng/"
 def _assert_dest_safe(dest_prefix: str) -> None:
     """Hard-refuse a dest prefix under ``sibogeng/`` BEFORE any S3 client is built.
 
-    Checks both the bucket name and the key path for the ``sibogeng`` segment,
-    so neither ``s3://sibogeng/...`` nor ``s3://bucket/sibogeng/...`` is allowed.
+    Checks both the bucket name and the key path SEGMENTS for ``sibogeng``, so
+    neither ``s3://sibogeng/...`` nor ``s3://bucket/sibogeng/...`` nor the
+    no-trailing-slash form ``s3://bucket/sibogeng`` is allowed (the builder
+    appends ``/master_prod_slice/...``, so a bare segment still lands under
+    the prod namespace).
     """
     parsed = urlparse(dest_prefix)
-    path = parsed.path.lstrip("/")
-    assert "sibogeng" not in parsed.netloc and _SIBOGENG_PREFIX not in path, (
+    segments = parsed.path.strip("/").split("/")
+    assert "sibogeng" not in parsed.netloc and "sibogeng" not in segments, (
         f"refusing to write dest under sibogeng/ (prod namespace): {dest_prefix!r}"
     )
 
