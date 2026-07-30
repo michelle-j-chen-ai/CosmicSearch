@@ -51,8 +51,19 @@ def test_written_dataset_has_the_layout_the_scan_depends_on() -> None:
         assert indexed == {
             (("chunk_start_unix",), "BTree"),
             (("segment_id",), "BTree"),
+            (("run_uuid",), "BTree"),
             (("vehicle",), "Bitmap"),
         }, indexed
+
+
+def test_build_dataset_indexes_exactly_the_filter_columns() -> None:
+    """Scalar indexes exist on exactly the four filter columns: BTREE on
+    chunk_start_unix / segment_id / run_uuid, BITMAP on vehicle — nothing
+    else indexed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=500, seed=0)
+        indexed = {idx["fields"][0] for idx in ds.list_indices()}
+        assert indexed == {"chunk_start_unix", "segment_id", "vehicle", "run_uuid"}
 
 
 def test_embedding_i8_and_pca_metadata_roundtrip() -> None:

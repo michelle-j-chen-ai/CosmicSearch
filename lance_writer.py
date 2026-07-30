@@ -221,8 +221,16 @@ def build_dataset(
     """Build the Lance dataset at `out_uri` from artifacts in `artifact_dir`.
 
     Writes, compacts to `target_rows_per_fragment`-row fragments, and creates
-    the BTREE(chunk_start_unix) / BTREE(segment_id) / BITMAP(vehicle) scalar
-    indices. Returns the resulting dataset handle.
+    scalar indices on the filter columns: BTREE(chunk_start_unix),
+    BTREE(segment_id), BTREE(run_uuid), and BITMAP(vehicle). Returns the
+    resulting dataset handle.
+
+    Index policy (filter columns only, nothing else indexed):
+    BTREE for range queries (chunk_start_unix) and for high-cardinality
+    equality/IN joins (segment_id, run_uuid); BITMAP only for the
+    low-cardinality vehicle column. No index on chunk_end_unix /
+    source_media_uri / provenance / dt / metadata_json (never predicates)
+    or the vector columns.
 
     Raises `FileExistsError` up front if `out_uri` already exists (this
     builder only supports `mode="create"`; there is no append/overwrite path).
@@ -254,6 +262,7 @@ def build_dataset(
     ds.create_scalar_index("chunk_start_unix", "BTREE")
     ds.create_scalar_index("segment_id", "BTREE")
     ds.create_scalar_index("vehicle", "BITMAP")
+    ds.create_scalar_index("run_uuid", "BTREE")
     return lance.dataset(out_uri)
 
 
