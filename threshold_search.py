@@ -153,12 +153,32 @@ class _ResidentCorpus:
     pca: np.ndarray  # (D, model_dim) fp32
     scale: np.ndarray  # (D,) fp32
     eps: float
-    vehicle: np.ndarray  # (N,) object (str or None), canonical scan order
-    chunk_start_unix: np.ndarray  # (N,) int64
-    run_uuid: np.ndarray  # (N,) object
+    vehicle: np.ndarray | None  # (N,) object (str or None); None in hybrid mode
+    chunk_start_unix: np.ndarray | None  # (N,) int64; None in hybrid mode
+    run_uuid: np.ndarray | None  # (N,) object; None in hybrid mode
+    row_ids: np.ndarray | None  # (N,) int64 ascending; None in resident mode
 
 
-def _load_resident_corpus(dataset: lance.LanceDataset) -> _ResidentCorpus:
+def _assert_ascending_row_ids(row_ids: np.ndarray) -> None:
+    """Hard-guard: the row-id map must be strictly ascending.
+
+    `scan_in_order=True` yields fragments in fragment-list order, and a
+    compaction can interleave ids so scan-order row ids descend. `searchsorted`
+    over a non-ascending array returns silently wrong positions -- a
+    zero-false-dismissal violation. This guard turns that into a loud error.
+    """
+    if row_ids.size > 1 and not np.all(np.diff(row_ids) > 0):
+        raise ValueError(
+            "resident row_ids are not strictly ascending -- a compaction likely "
+            "interleaved fragments; the hybrid prefilter cannot safely map "
+            "filtered row ids to resident-screen positions. Rebuild the dataset "
+            "or use prefilter_mode='resident'."
+        )
+
+
+def _load_resident_corpus(
+    dataset: lance.LanceDataset, *, capture_row_ids: bool = False
+) -> _ResidentCorpus:
     """Decode `dataset`'s `embedding_i8` column + PCA metadata into memory.
 
     `scan_in_order=True` is required, not incidental: `Dataset.take()`
@@ -170,22 +190,39 @@ def _load_resident_corpus(dataset: lance.LanceDataset) -> _ResidentCorpus:
     addresses them, silently mismatching every screened index against the
     wrong row's `vector_fp` -- see `tests/test_threshold_search.py`'s
     multi-fragment regression test.
+
+    `capture_row_ids=True` (hybrid mode) reads the screen column with
+    `with_row_id=True` so the row-id -> position map is captured for filter
+    pushdown, and skips the metadata `to_table` entirely (the metadata filter
+    arrays are not held in hybrid mode -- the predicate is pushed to Lance).
     """
     pca, scale = lance_writer.read_pca_metadata(dataset)
+    if capture_row_ids:
+        i8_table = dataset.to_table(
+            columns=[lance_writer.EMBEDDING_I8_COLUMN],
+            with_row_id=True, scan_in_order=True,
+        )
+        corpus_i8 = _fixed_size_list_matrix(i8_table, lance_writer.EMBEDDING_I8_COLUMN, np.int8)
+        # pylance 0.34 exposes the physical row id as `_rowid` (uint64).
+        row_ids = i8_table.column("_rowid").to_numpy().astype(np.int64)
+        _assert_ascending_row_ids(row_ids)
+        return _ResidentCorpus(
+            corpus_i8=corpus_i8, pca=pca, scale=scale,
+            eps=eps_bound.eps_cauchy_schwarz(scale),
+            vehicle=None, chunk_start_unix=None, run_uuid=None, row_ids=row_ids,
+        )
     i8_table = dataset.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True)
     corpus_i8 = _fixed_size_list_matrix(i8_table, lance_writer.EMBEDDING_I8_COLUMN, np.int8)
-    eps = eps_bound.eps_cauchy_schwarz(scale)
     meta_table = dataset.to_table(
         columns=["vehicle", "chunk_start_unix", "run_uuid"], scan_in_order=True
     )
     return _ResidentCorpus(
-        corpus_i8=corpus_i8,
-        pca=pca,
-        scale=scale,
-        eps=eps,
+        corpus_i8=corpus_i8, pca=pca, scale=scale,
+        eps=eps_bound.eps_cauchy_schwarz(scale),
         vehicle=np.array(meta_table.column("vehicle").to_pylist()),
         chunk_start_unix=np.array(meta_table.column("chunk_start_unix").to_pylist()),
         run_uuid=np.array(meta_table.column("run_uuid").to_pylist()),
+        row_ids=None,
     )
 
 
@@ -211,6 +248,75 @@ def _filter_mask(
     if run_uuids is not None:
         mask &= np.isin(resident.run_uuid, list(run_uuids))
     return mask
+
+
+def _lance_filter_sql(
+    vehicle: str | None,
+    date_range: tuple[int | None, int | None] | None,
+    run_uuids: "set[str] | None",
+) -> str | None:
+    """Build a Lance (DataFusion) SQL predicate mirroring `_filter_mask`.
+
+    Returns `None` (no filter) when no clause is given. Single-quotes in
+    string literals are doubled to escape them. NULL vehicles are excluded by
+    SQL `=`, matching the numpy object-array `==` mask (NULL != 'veh_a' on
+    both sides). Boundary inclusivity matches `_filter_mask`: `>= lo`, `< hi`.
+    """
+    if vehicle is None and date_range is None and run_uuids is None:
+        return None
+    clauses: list[str] = []
+    if vehicle is not None:
+        clauses.append(f"vehicle = '{vehicle.replace(chr(39), chr(39)*2)}'")
+    if date_range is not None:
+        lo, hi = date_range
+        if lo is not None:
+            clauses.append(f"chunk_start_unix >= {int(lo)}")
+        if hi is not None:
+            clauses.append(f"chunk_start_unix < {int(hi)}")
+    if run_uuids is not None:
+        escaped = ", ".join(f"'{r.replace(chr(39), chr(39)*2)}'" for r in sorted(run_uuids))
+        clauses.append(f"run_uuid IN ({escaped})")
+    return " AND ".join(clauses)
+
+
+def _hybrid_sub_idx(
+    dataset: lance.LanceDataset,
+    row_ids: np.ndarray,
+    vehicle: str | None,
+    date_range: tuple[int | None, int | None] | None,
+    run_uuids: "set[str] | None",
+) -> np.ndarray | None:
+    """Push the filter predicate to Lance's scalar indexes; return the matching
+    positions into the resident int8 screen (canonical scan order).
+
+    Returns `None` when there is no filter (screen the whole corpus). The
+    predicate is evaluated by Lance's BTREE/BITMAP indexes -- no data columns
+    are read for the filter. Matched row ids are sorted ascending (filtered-scan
+    output order is not guaranteed), mapped to positions via `searchsorted` over
+    the ascending `row_ids` captured at hydrate, and verified: the row ids at
+    those positions must equal the matched set, else the layout/version
+    assumption is violated and we raise rather than return wrong positions.
+    """
+    sql = _lance_filter_sql(vehicle, date_range, run_uuids)
+    if sql is None:
+        return None
+    matched_table = dataset.to_table(
+        filter=sql, columns=[], with_row_id=True, scan_in_order=True
+    )
+    matched = np.sort(matched_table.column("_rowid").to_numpy().astype(np.int64))
+    if matched.size == 0:
+        return np.empty(0, dtype=np.intp)
+    sub_idx = np.searchsorted(row_ids, matched)
+    # Per-query guard: the positions must point at exactly the matched row ids.
+    # Catches any fragment-layout skew or a matched id absent from `row_ids`
+    # (searchsorted would otherwise map it to a wrong neighbor).
+    if not np.array_equal(row_ids[sub_idx], matched):
+        raise ValueError(
+            "hybrid prefilter position mismatch -- filtered row ids do not map "
+            "back to resident positions; the dataset likely changed between "
+            "hydrate and query. Rebuild the ThresholdCorpus."
+        )
+    return sub_idx
 
 
 def _search_resident(
@@ -397,9 +503,28 @@ class ThresholdCorpus:
     shared `search_engine.load_corpus` (which never returns a
     `ThresholdCorpus`, so every existing `Corpus`-typed consumer keeps working
     unchanged).
+
+    `prefilter_mode` selects how filters narrow the resident screen:
+
+    - ``"resident"`` (default): decode the metadata columns (vehicle,
+      chunk_start_unix, run_uuid) resident and build a dense boolean mask per
+      query. The simplest path; holds the metadata arrays in memory.
+    - ``"hybrid"``: push the filter predicate to Lance's scalar indexes
+      (BTREE/BITMAP), receive the matching row ids, and map them to positions
+      into the already-resident int8 screen. Drops the metadata arrays (saves
+      RAM) and finally puts the writer's scalar indexes to use at query time.
+      Requires a stable dataset version between construction and query (a
+      read-only serving corpus satisfies this); the hydrate and per-query
+      guards raise if the row-id map is unsafe.
     """
 
-    def __init__(self, dataset: lance.LanceDataset) -> None:
+    def __init__(
+        self, dataset: lance.LanceDataset, *, prefilter_mode: str = "resident"
+    ) -> None:
+        if prefilter_mode not in ("resident", "hybrid"):
+            raise ValueError(
+                f"prefilter_mode must be 'resident' or 'hybrid', got {prefilter_mode!r}"
+            )
         if not lance_writer.is_exact_threshold_dataset(dataset):
             raise ValueError(
                 "ThresholdCorpus requires an exact-threshold Lance dataset "
@@ -407,7 +532,10 @@ class ThresholdCorpus:
                 f"'{lance_writer.MIN_DATA_STORAGE_VERSION}', PCA schema metadata present)"
             )
         self._dataset = dataset
-        self._resident = _load_resident_corpus(dataset)
+        self._prefilter_mode = prefilter_mode
+        self._resident = _load_resident_corpus(
+            dataset, capture_row_ids=(prefilter_mode == "hybrid")
+        )
 
     @property
     def num_rows(self) -> int:
@@ -420,8 +548,13 @@ class ThresholdCorpus:
         run_uuids: "set[str] | None" = None,
     ) -> list[ThresholdHit]:
         """Every row with re-rank score >= `tau`; see `threshold_search`."""
-        allowed = _filter_mask(self._resident, vehicle, date_range, run_uuids)
-        sub_idx = None if allowed is None else np.nonzero(allowed)[0]
+        if self._prefilter_mode == "hybrid":
+            sub_idx = _hybrid_sub_idx(
+                self._dataset, self._resident.row_ids, vehicle, date_range, run_uuids
+            )
+        else:
+            allowed = _filter_mask(self._resident, vehicle, date_range, run_uuids)
+            sub_idx = None if allowed is None else np.nonzero(allowed)[0]
         return _search_resident(
             query, tau, self._dataset, self._resident,
             fast_curation=fast_curation, sub_idx=sub_idx,

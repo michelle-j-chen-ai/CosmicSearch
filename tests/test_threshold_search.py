@@ -461,3 +461,163 @@ def test_prefilter_preserves_fast_curation_semantics() -> None:
                 assert abs(h.score - scores[h.row_id]) <= h.score_error_bound + 1e-6
             else:
                 assert np.isclose(h.score, scores[h.row_id], rtol=1e-9, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid prefilter path: Lance scalar-index predicate pushdown -> matching row
+# ids -> resident int8 screen subset. The screen + re-rank cascade is shared
+# with the resident path; only the source of `sub_idx` differs, so every test
+# here asserts hybrid == resident on the same dataset/filters.
+# ---------------------------------------------------------------------------
+
+
+def _build_null_vehicle_corpus(tmp: Path, *, n: int, seed: int) -> lance.LanceDataset:
+    """A threshold corpus whose `vehicle` column contains NULL rows.
+
+    `conftest.write_artifact` never emits NULL vehicles, so this builds the
+    artifact in place to pin Lance's SQL NULL semantics against the numpy
+    object-array mask empirically.
+    """
+    rng = np.random.default_rng(seed)
+    basis, _ = np.linalg.qr(rng.standard_normal((conftest.MODEL_DIM, conftest.D)))
+    pca = np.ascontiguousarray(basis.T.astype("float32"))
+    true_fp32 = (rng.standard_normal((n, conftest.D)) * rng.uniform(0.5, 3.0, size=conftest.D)).astype("float32")
+    scale = np.abs(true_fp32).max(axis=0).astype("float32")
+    corpus_i8 = np.clip(np.round(true_fp32 * 127.0 / scale), -127, 127).astype("int8")
+    artifact = tmp / "artifact"
+    artifact.mkdir(parents=True, exist_ok=True)
+    np.save(artifact / lance_writer.PCA_FILE, pca)
+    np.save(artifact / lance_writer.SCALE_FILE, scale)
+    np.save(artifact / lance_writer.CORPUS_INT8_FILE, corpus_i8)
+    np.save(artifact / lance_writer.PRE_QUANT_FP32_FILE, true_fp32)
+    chunk_start = rng.integers(1_700_000_000, 1_700_100_000, size=n).astype("int64")
+    vehicles = rng.choice(["veh_a", "veh_b"], size=n).tolist()
+    for i in range(0, n, 7):  # inject NULL vehicles (~1/7 of rows)
+        vehicles[i] = None
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    pq.write_table(
+        pa.table(
+            {
+                "run_uuid": [f"run-{i % 5}" for i in range(n)],
+                "chunk_start_unix": chunk_start,
+                "chunk_end_unix": chunk_start + 5,
+                "segment_id": [f"seg-{i}" for i in range(n)],
+                "vehicle": pa.array(vehicles, type=pa.string()),
+            }
+        ),
+        artifact / lance_writer.METADATA_FILE,
+    )
+    return lance_writer.build_dataset(artifact, str(tmp / "out.lance"))
+
+
+def test_hybrid_row_id_map_is_position_correct_multi_fragment(tmp_path: Path) -> None:
+    """A multi-fragment dataset's resident row_ids are ascending, and a hybrid
+    vehicle filter returns positions that index the resident screen correctly
+    (equal to the resident path's `sub_idx`)."""
+    ds = conftest.build_corpus(tmp_path, n=4_000, seed=21, pre_quant_fp32=True)
+    hybrid = ts.ThresholdCorpus(ds, prefilter_mode="hybrid")
+    row_ids = hybrid._resident.row_ids
+    assert row_ids is not None
+    assert np.all(np.diff(row_ids) > 0), "row_ids must be ascending at hydrate"
+
+    # resident path sub_idx for veh_a (a resident-mode corpus holds the
+    # metadata arrays; the hybrid corpus dropped them).
+    resident = ts.ThresholdCorpus(ds)
+    allowed = ts._filter_mask(resident._resident, "veh_a", None, None)
+    assert allowed is not None
+    resident_sub = np.nonzero(allowed)[0]
+
+    sub = ts._hybrid_sub_idx(ds, row_ids, "veh_a", None, None)
+    assert sub is not None
+    np.testing.assert_array_equal(sub, resident_sub)
+
+
+def test_hydrate_ascending_guard_raises_on_non_ascending_row_ids() -> None:
+    """The hydrate guard turns a non-ascending row-id array into a hard error
+    rather than letting searchsorted silently corrupt positions."""
+    bad = np.array([0, 1, 5, 3, 4], dtype=np.int64)
+    with pytest.raises(ValueError, match="ascending"):
+        ts._assert_ascending_row_ids(bad)
+    good = np.array([0, 1, 2, 3, 4], dtype=np.int64)
+    ts._assert_ascending_row_ids(good)  # no raise
+
+
+def test_hybrid_membership_equals_resident_across_filters(tmp_path: Path) -> None:
+    """For vehicle / date_range (both bounds + open bounds) / run_uuids / none,
+    hybrid membership equals the resident path equals a brute-force filtered
+    reference. Fixture includes NULL-vehicle rows to pin Lance NULL semantics."""
+    ds = _build_null_vehicle_corpus(tmp_path, n=3_000, seed=22)
+    query = conftest.unit_query(seed=22)
+    scores = conftest.exact_scores(ds, query)
+    tau = float(np.percentile(scores, 90.0))
+    resident = ts.ThresholdCorpus(ds)
+    hybrid = ts.ThresholdCorpus(ds, prefilter_mode="hybrid")
+
+    meta = ds.to_table(columns=["vehicle", "chunk_start_unix", "run_uuid"], scan_in_order=True)
+    veh = np.array(meta.column("vehicle").to_pylist(), dtype=object)
+    csu = np.array(meta.column("chunk_start_unix").to_pylist())
+    run = np.array(meta.column("run_uuid").to_pylist(), dtype=object)
+    lo, hi = int(np.percentile(csu, 25)), int(np.percentile(csu, 75))
+
+    cases = [
+        ("none", {}),
+        ("vehicle", {"vehicle": "veh_a"}),
+        ("date-range", {"date_range": (lo, hi)}),
+        ("date-open-lo", {"date_range": (lo, None)}),
+        ("date-open-hi", {"date_range": (None, hi)}),
+        ("run_uuids", {"run_uuids": {"run-1", "run-3"}}),
+    ]
+    for name, kw in cases:
+        ref_mask = np.ones(len(scores), dtype=bool)
+        if "vehicle" in kw:
+            ref_mask &= veh == kw["vehicle"]
+        if "date_range" in kw:
+            lo_, hi_ = kw["date_range"]
+            if lo_ is not None:
+                ref_mask &= csu >= lo_
+            if hi_ is not None:
+                ref_mask &= csu < hi_
+        if "run_uuids" in kw:
+            ref_mask &= np.isin(run, list(kw["run_uuids"]))
+        ref = set(np.nonzero(ref_mask & (scores >= tau))[0].tolist())
+
+        res_hits = {h.row_id for h in resident.threshold_search(query, tau, **kw)}
+        hyb_hits = {h.row_id for h in hybrid.threshold_search(query, tau, **kw)}
+        assert res_hits == ref, f"{name}: resident != brute-force ref, diff {res_hits ^ ref}"
+        assert hyb_hits == ref, f"{name}: hybrid != brute-force ref, diff {hyb_hits ^ ref}"
+
+
+def test_hybrid_no_filter_identical_to_resident_no_filter(tmp_path: Path) -> None:
+    """With no filter, hybrid and resident both screen the whole corpus, so the
+    result sets (row_ids + scores) are byte-identical."""
+    ds = conftest.build_corpus(tmp_path, n=2_000, seed=23, pre_quant_fp32=True)
+    query = conftest.unit_query(seed=23)
+    scores = conftest.exact_scores(ds, query)
+    tau = float(np.percentile(scores, 95.0))
+    resident = ts.ThresholdCorpus(ds)
+    hybrid = ts.ThresholdCorpus(ds, prefilter_mode="hybrid")
+    res = resident.threshold_search(query, tau)
+    hyb = hybrid.threshold_search(query, tau)
+    assert [h.row_id for h in hyb] == [h.row_id for h in res]
+    for hr, hb in zip(res, hyb):
+        assert np.isclose(hr.score, hb.score, rtol=1e-9, atol=1e-9)
+        assert hr.score_kind == hb.score_kind
+
+
+def test_lance_filter_sql_assembles_and_escapes() -> None:
+    """`_lance_filter_sql` AND-joins clauses, escapes quotes, and omits
+    None bounds. Pure unit test (no dataset)."""
+    # all None -> no filter
+    assert ts._lance_filter_sql(None, None, None) is None
+    # vehicle with an apostrophe + both date bounds + run set
+    sql = ts._lance_filter_sql("o'brien", (100, 200), {"a", "b"})
+    assert "o''brien" in sql
+    assert "chunk_start_unix >= 100" in sql
+    assert "chunk_start_unix < 200" in sql
+    assert "run_uuid IN ('a', 'b')" in sql or "run_uuid IN ('b', 'a')" in sql
+    # open bounds: only the present bound appears
+    sql_lo = ts._lance_filter_sql(None, (100, None), None)
+    assert "chunk_start_unix >= 100" in sql_lo and "chunk_start_unix <" not in sql_lo
+    sql_hi = ts._lance_filter_sql(None, (None, 200), None)
+    assert "chunk_start_unix < 200" in sql_hi and "chunk_start_unix >=" not in sql_hi
