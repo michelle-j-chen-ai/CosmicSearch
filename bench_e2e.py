@@ -249,6 +249,20 @@ def _filter_cells(corpus: search_engine.Corpus) -> list[dict]:
                 if s <= n * 0.25:
                     cells.append({"name": "date-7d", "vehicle": None,
                                   "date_range": (a, b), "run_uuids": None})
+        # A 14-day window sized to ~20% filter selectivity -- the tier between
+        # the narrow date-7d (~1-3%) and none (100%), so the sweep covers a
+        # realistic mid-selectivity date filter too. Pick the window whose
+        # selectivity is closest to 20%.
+        if hi - lo >= 2 * _WEEK_SECONDS:
+            step = max(_WEEK_SECONDS // 4, 3600)
+            cands = []
+            for a in range(lo, hi - 2 * _WEEK_SECONDS + 1, step):
+                b = a + 2 * _WEEK_SECONDS
+                cands.append(((a, b), int(((starts >= a) & (starts < b)).sum())))
+            if cands:
+                best = min(cands, key=lambda c: abs(c[1] / n - 0.20))
+                cells.append({"name": "date-14d", "vehicle": None,
+                              "date_range": best[0], "run_uuids": None})
 
     return cells
 
@@ -637,6 +651,10 @@ def run_synthetic(n: int, seed: int = 0, *, repeats: int = 3) -> dict:
         if hi - lo >= _WEEK_SECONDS:
             filters.append({"name": "date-7d", "vehicle": None,
                             "date_range": (mid, mid + _WEEK_SECONDS),
+                            "run_uuids": None})
+        if hi - lo >= 2 * _WEEK_SECONDS:
+            filters.append({"name": "date-14d", "vehicle": None,
+                            "date_range": (mid, mid + 2 * _WEEK_SECONDS),
                             "run_uuids": None})
         if runs:
             filters.append({"name": "run_uuids", "vehicle": None,
