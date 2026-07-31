@@ -185,21 +185,27 @@ def _load_master_corpus(master_uri: str) -> search_engine.Corpus:
 
 
 def _load_threshold_corpus(threshold_uri: str) -> ts.ThresholdCorpus:
-    """Open the threshold corpus (local dir or S3 URI)."""
-    if threshold_uri.startswith("s3://"):
-        return search_engine.load_threshold_corpus(threshold_uri)
-    ds = lance.dataset(threshold_uri)
+    """Open the threshold corpus (local dir or S3 URI).
+
+    S3 URIs are opened DIRECTLY (no local-cache download): the screen column
+    hydrates into RAM from S3 once, and every per-query ``take()`` re-rank and
+    hybrid filtered scan hits S3 live. That is the production shape for the
+    threshold path -- a cached local copy would hide the object-store latency
+    the benchmark exists to measure.
+    """
+    ds = _threshold_dataset(threshold_uri)
     if not lance_writer.is_exact_threshold_dataset(ds):
         raise ValueError(f"{threshold_uri!r} is not an exact-threshold dataset")
     return ts.ThresholdCorpus(ds)
 
 
 def _threshold_dataset(threshold_uri: str) -> lance.LanceDataset:
+    """A dataset handle for the threshold corpus -- direct S3 for s3:// URIs."""
     if threshold_uri.startswith("s3://"):
-        local_dir = search_engine.local_cache.ensure_corpus_local(
-            threshold_uri, search_engine.oci_s3.s3_client()
+        return lance.dataset(
+            threshold_uri,
+            storage_options=search_engine.oci_s3.lance_storage_options(),
         )
-        return lance.dataset(str(local_dir))
     return lance.dataset(threshold_uri)
 
 
