@@ -266,6 +266,7 @@ def _master_filter_mask(
 def _run_sweep(
     master_corpus: search_engine.Corpus,
     threshold_corpus: ts.ThresholdCorpus,
+    hybrid_corpus: ts.ThresholdCorpus,
     threshold_ds: lance.LanceDataset,
     query: np.ndarray,
     pca: np.ndarray,
@@ -336,6 +337,24 @@ def _run_sweep(
 
             pr3_ms, pr3_hits = _median_time(_pr3_query, repeats)
             pr3_ids = {h.segment_id for h in pr3_hits}
+
+            # --- hybrid path (timed: Lance index pushdown -> resident screen) ---
+            def _hybrid_query():
+                return hybrid_corpus.threshold_search(
+                    query, tau, fast_curation=True,
+                    vehicle=cell["vehicle"], date_range=date_range,
+                    run_uuids=ru,
+                )
+
+            hybrid_ms, hybrid_hits = _median_time(_hybrid_query, repeats)
+            hybrid_ids = {h.segment_id for h in hybrid_hits}
+            # The hybrid changes only the source of sub_idx, not the screen
+            # cascade, so its result set must equal the resident path's exactly.
+            if hybrid_ids != pr3_ids:
+                raise SystemExit(
+                    f"FAIL hybrid!=resident: tau={tau:.6f} filter={cell['name']} "
+                    f"sym_diff={len(hybrid_ids ^ pr3_ids)}"
+                )
 
             # --- membership gate (PCA-space reference vs PR3) ---
             membership_missing = len(ref_ids - pr3_ids)
@@ -413,6 +432,7 @@ def _run_sweep(
                 "matches": len(pr3_ids),
                 "master_ms": master_ms * 1e3,
                 "pr3_ms": pr3_ms * 1e3,
+                "hybrid_ms": hybrid_ms * 1e3,
                 "above": above,
                 "band": band,
                 "membership_missing": membership_missing,
@@ -448,6 +468,13 @@ def run(
 
     threshold_ds = _threshold_dataset(threshold_uri)
     pca, _scale = lance_writer.read_pca_metadata(threshold_ds)
+
+    # Hybrid corpus: same on-disk dataset, resident int8 screen held, metadata
+    # arrays dropped, predicate pushed to Lance's scalar indexes. Both handles
+    # read the same dataset version (nothing writes during the bench).
+    t0 = time.perf_counter()
+    hybrid_corpus = ts.ThresholdCorpus(threshold_ds, prefilter_mode="hybrid")
+    hybrid_hydrate_s = time.perf_counter() - t0
 
     # Query: unit-norm model-space, in the PCA row space (score-lossless
     # projection). Same convention as the old bench.
@@ -489,7 +516,7 @@ def run(
         filters = _filter_cells(master_corpus)
 
     cells = _run_sweep(
-        master_corpus, threshold_corpus, threshold_ds,
+        master_corpus, threshold_corpus, hybrid_corpus, threshold_ds,
         query, pca, pca_ref_scores, taus, filters, repeats=repeats,
     )
 
@@ -521,12 +548,23 @@ def run(
     }
     master_mem["total_mb"] = sum(master_mem.values())
 
+    hr = hybrid_corpus._resident
+    hybrid_mem = {
+        "screen_i8_mb": hr.corpus_i8.nbytes / 1e6,
+        "row_ids_mb": (hr.row_ids.nbytes if hr.row_ids is not None else 0.0) / 1e6,
+        "pca_mb": hr.pca.nbytes / 1e6,
+        "scale_mb": hr.scale.nbytes / 1e6,
+    }
+    hybrid_mem["total_mb"] = sum(hybrid_mem.values())
+
     return {
         "cells": cells,
         "master_load_s": master_load_s,
         "threshold_hydrate_s": threshold_hydrate_s,
+        "hybrid_hydrate_s": hybrid_hydrate_s,
         "master_mem": master_mem,
         "threshold_mem": threshold_mem,
+        "hybrid_mem": hybrid_mem,
     }
 
 
@@ -590,39 +628,50 @@ def run_synthetic(n: int, seed: int = 0, *, repeats: int = 3) -> dict:
 
 def _print_report(r: dict) -> None:
     print(f"\nmaster load: {r['master_load_s']:.2f}s")
-    print(f"threshold hydrate: {r['threshold_hydrate_s']:.2f}s\n")
+    print(f"threshold hydrate: {r['threshold_hydrate_s']:.2f}s")
+    print(f"hybrid hydrate: {r.get('hybrid_hydrate_s', 0.0):.2f}s\n")
 
-    # Memory breakdown
+    # Memory breakdown — 3-way: master / threshold (resident) / hybrid.
     mm = r.get("master_mem", {})
     tm = r.get("threshold_mem", {})
+    hm = r.get("hybrid_mem", {})
     print("memory (resident):")
-    print(f"  {'component':<28} {'master MB':>12} {'threshold MB':>14}")
-    print(f"  {'-'*56}")
-    all_keys = sorted(set(list(mm.keys()) + list(tm.keys())) - {"total_mb"})
+    print(f"  {'component':<28} {'master MB':>12} {'threshold MB':>14} {'hybrid MB':>12}")
+    print(f"  {'-'*70}")
+    all_keys = sorted(set(list(mm.keys()) + list(tm.keys()) + list(hm.keys())) - {"total_mb"})
     for k in all_keys:
-        mv = mm.get(k, None)
-        tv = tm.get(k, None)
+        mv = mm.get(k)
+        tv = tm.get(k)
+        hv = hm.get(k)
         ms = f"{mv:>12.1f}" if mv is not None else f"{'—':>12}"
         ts = f"{tv:>14.1f}" if tv is not None else f"{'—':>14}"
-        print(f"  {k:<28} {ms} {ts}")
-    print(f"  {'-'*56}")
-    print(f"  {'TOTAL':<28} {mm.get('total_mb', 0):>12.1f} {tm.get('total_mb', 0):>14.1f}")
+        hs = f"{hv:>12.1f}" if hv is not None else f"{'—':>12}"
+        print(f"  {k:<28} {ms} {ts} {hs}")
+    print(f"  {'-'*70}")
+    print(f"  {'TOTAL':<28} {mm.get('total_mb', 0):>12.1f} {tm.get('total_mb', 0):>14.1f} {hm.get('total_mb', 0):>12.1f}")
     if mm.get("total_mb") and tm.get("total_mb"):
-        print(f"  ratio: {mm['total_mb'] / tm['total_mb']:.1f}x less held by threshold\n")
+        print(f"  ratio: {mm['total_mb'] / tm['total_mb']:.1f}x less held by threshold "
+              f"(hybrid {mm['total_mb'] / hm.get('total_mb', 1):.1f}x)\n")
     else:
         print()
     hdr = (f"{'tau%':>6} {'filter':<12} {'sel':>7} {'matches':>8} "
-           f"{'master_ms':>10} {'pr3_ms':>8} {'above':>6} {'band':>6} "
-           f"{'xdiff':>6} {'xmaxdist':>10} {'gate':>6}")
+           f"{'master_ms':>10} {'pr3_ms':>8} {'hybrid_ms':>10} "
+           f"{'above':>6} {'band':>6} {'xdiff':>6} {'xmaxdist':>10} {'gate':>6}")
     print(hdr)
     print("-" * len(hdr))
     for c in r["cells"]:
         gate = "PASS" if (c["membership_missing"] == 0 and c["membership_extra"] == 0
                           and c["bound_violations"] == 0
                           and not c.get("xspace_bug", False)) else "FAIL"
+        # Bold the fastest latency across master / pr3 / hybrid per row.
+        times = {"m": c["master_ms"], "r": c["pr3_ms"], "h": c.get("hybrid_ms", float("inf"))}
+        best = min(times, key=times.get)
+        m_s = f"**{c['master_ms']:>8.2f}**" if best == "m" else f"{c['master_ms']:>10.2f}"
+        r_s = f"**{c['pr3_ms']:>6.2f}**" if best == "r" else f"{c['pr3_ms']:>8.2f}"
+        h_s = f"**{c.get('hybrid_ms', 0.0):>8.2f}**" if best == "h" else f"{c.get('hybrid_ms', 0.0):>10.2f}"
         print(f"{c['tau_percentile']:>6.2f} {c['filter']:<12} "
               f"{c['selectivity']:>7.4%} {c['matches']:>8} "
-              f"{c['master_ms']:>10.2f} {c['pr3_ms']:>8.2f} "
+              f"{m_s} {r_s} {h_s} "
               f"{c['above']:>6} {c['band']:>6} "
               f"{c['xspace_symdiff']:>6} {c['xspace_max_dist']:>10.2e} "
               f"{gate:>6}")
