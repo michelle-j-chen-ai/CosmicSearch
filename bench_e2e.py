@@ -227,12 +227,28 @@ def _filter_cells(corpus: search_engine.Corpus) -> list[dict]:
 
     starts = corpus.chunk_start_array()
     if starts.size:
+        # A realistic curation date filter is a single driving-week review, so
+        # pick a 7-day window at MEDIAN density. The corpus's date distribution
+        # is skewed (one dense week holds ~half the rows), so the densest window
+        # is a near-no-op filter (selects ~49%) and the sparsest is empty; the
+        # median window is representative of a real review week and narrows
+        # meaningfully. Only keep the cell if it actually narrows (selects
+        # <= 25% of the corpus).
         lo, hi = int(starts.min()), int(starts.max())
-        if hi - lo >= 4 * _WEEK_SECONDS:
-            mid = lo + (hi - lo) // 2
-            cells.append({"name": "date-medium", "vehicle": None,
-                          "date_range": (mid, mid + 4 * _WEEK_SECONDS),
-                          "run_uuids": None})
+        n = starts.size
+        if hi - lo >= _WEEK_SECONDS:
+            step = max(_WEEK_SECONDS // 4, 3600)
+            counts = []
+            for a in range(lo, hi - _WEEK_SECONDS + 1, step):
+                b = a + _WEEK_SECONDS
+                counts.append(((a, b), int(((starts >= a) & (starts < b)).sum())))
+            nonempty = [c for c in counts if c[1] > 0]
+            if nonempty:
+                nonempty.sort(key=lambda c: c[1])
+                (a, b), s = nonempty[len(nonempty) // 2]
+                if s <= n * 0.25:
+                    cells.append({"name": "date-7d", "vehicle": None,
+                                  "date_range": (a, b), "run_uuids": None})
 
     return cells
 
@@ -423,12 +439,21 @@ def _run_sweep(
 
             above = sum(1 for h in pr3_hits if h.score_kind == "bounded_approx")
             band = sum(1 for h in pr3_hits if h.score_kind == "exact")
-            selectivity = (len(pr3_ids) / master_corpus.num_rows) if master_corpus.num_rows else 0.0
+            n = master_corpus.num_rows or 1
+            # Two distinct rates: filter_sel is the fraction of corpus rows the
+            # filter selects BEFORE the tau cut -- it governs threshold-path
+            # latency (the screen runs over exactly those rows). match_rate is
+            # the fraction that survive tau. Conflating them is misleading: a
+            # near-no-op filter (high filter_sel) with a tight tau (low
+            # match_rate) is slow, not fast.
+            filter_sel = (float(mmask.sum()) / n) if mmask is not None else 1.0
+            match_rate = len(pr3_ids) / n
 
             cells.append({
                 "tau_percentile": float(tau_p),
                 "filter": cell["name"],
-                "selectivity": selectivity,
+                "filter_sel": filter_sel,
+                "match_rate": match_rate,
                 "matches": len(pr3_ids),
                 "master_ms": master_ms * 1e3,
                 "pr3_ms": pr3_ms * 1e3,
@@ -610,12 +635,8 @@ def run_synthetic(n: int, seed: int = 0, *, repeats: int = 3) -> dict:
              "run_uuids": None},
         ]
         if hi - lo >= _WEEK_SECONDS:
-            filters.append({"name": "date-narrow", "vehicle": None,
+            filters.append({"name": "date-7d", "vehicle": None,
                             "date_range": (mid, mid + _WEEK_SECONDS),
-                            "run_uuids": None})
-        if hi - lo >= 4 * _WEEK_SECONDS:
-            filters.append({"name": "date-medium", "vehicle": None,
-                            "date_range": (mid, mid + 4 * _WEEK_SECONDS),
                             "run_uuids": None})
         if runs:
             filters.append({"name": "run_uuids", "vehicle": None,
@@ -654,7 +675,7 @@ def _print_report(r: dict) -> None:
               f"(hybrid {mm['total_mb'] / hm.get('total_mb', 1):.1f}x)\n")
     else:
         print()
-    hdr = (f"{'tau%':>6} {'filter':<12} {'sel':>7} {'matches':>8} "
+    hdr = (f"{'tau%':>6} {'filter':<12} {'fltsel':>7} {'match%':>7} {'matches':>8} "
            f"{'master_ms':>10} {'pr3_ms':>8} {'hybrid_ms':>10} "
            f"{'above':>6} {'band':>6} {'xdiff':>6} {'xmaxdist':>10} {'gate':>6}")
     print(hdr)
@@ -670,7 +691,7 @@ def _print_report(r: dict) -> None:
         r_s = f"**{c['pr3_ms']:>6.2f}**" if best == "r" else f"{c['pr3_ms']:>8.2f}"
         h_s = f"**{c.get('hybrid_ms', 0.0):>8.2f}**" if best == "h" else f"{c.get('hybrid_ms', 0.0):>10.2f}"
         print(f"{c['tau_percentile']:>6.2f} {c['filter']:<12} "
-              f"{c['selectivity']:>7.4%} {c['matches']:>8} "
+              f"{c['filter_sel']:>7.2%} {c['match_rate']:>7.4%} {c['matches']:>8} "
               f"{m_s} {r_s} {h_s} "
               f"{c['above']:>6} {c['band']:>6} "
               f"{c['xspace_symdiff']:>6} {c['xspace_max_dist']:>10.2e} "
