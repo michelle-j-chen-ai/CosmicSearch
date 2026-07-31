@@ -216,11 +216,13 @@ def _filter_mask(
 def _search_resident(
     query: np.ndarray, tau: float, dataset: lance.LanceDataset, resident: _ResidentCorpus,
     *, fast_curation: bool = True,
-    vehicle: str | None = None,
-    date_range: tuple[int | None, int | None] | None = None,
-    run_uuids: "set[str] | None" = None,
+    sub_idx: np.ndarray | None = None,
 ) -> list[ThresholdHit]:
     """Screen+re-rank `query` against an already-decoded `_ResidentCorpus`.
+
+    `sub_idx` is the only filter input: the canonical positions to screen.
+    `None` screens the whole corpus. Callers resolve filters to `sub_idx`
+    (e.g. via `_filter_mask` + `np.nonzero`) before calling.
 
     When `fast_curation` is true, ABOVE rows keep their bounded screening score
     and skip `take()`; BAND rows are always re-ranked. Membership is identical
@@ -233,12 +235,9 @@ def _search_resident(
     query_pca = _project_query(query, resident.pca)
     w = (query_pca * (resident.scale.astype(np.float32) / np.float32(127.0))).astype(np.float32)
 
-    allowed = _filter_mask(resident, vehicle, date_range, run_uuids)
-    if allowed is None:
-        sub_idx = None  # unfiltered: screen everything as today
+    if sub_idx is None:
         corpus_i8 = np.ascontiguousarray(resident.corpus_i8)
     else:
-        sub_idx = np.nonzero(allowed)[0]  # canonical ids of survivors
         if sub_idx.size == 0:
             return []
         corpus_i8 = np.ascontiguousarray(resident.corpus_i8[sub_idx])
@@ -376,9 +375,10 @@ def threshold_search(
             f"'{lance_writer.MIN_DATA_STORAGE_VERSION}', PCA schema metadata present)"
         )
     resident = _load_resident_corpus(dataset)
+    allowed = _filter_mask(resident, vehicle, date_range, run_uuids)
+    sub_idx = None if allowed is None else np.nonzero(allowed)[0]
     return _search_resident(
-        query, tau, dataset, resident, fast_curation=fast_curation,
-        vehicle=vehicle, date_range=date_range, run_uuids=run_uuids,
+        query, tau, dataset, resident, fast_curation=fast_curation, sub_idx=sub_idx,
     )
 
 
@@ -420,7 +420,9 @@ class ThresholdCorpus:
         run_uuids: "set[str] | None" = None,
     ) -> list[ThresholdHit]:
         """Every row with re-rank score >= `tau`; see `threshold_search`."""
+        allowed = _filter_mask(self._resident, vehicle, date_range, run_uuids)
+        sub_idx = None if allowed is None else np.nonzero(allowed)[0]
         return _search_resident(
-            query, tau, self._dataset, self._resident, fast_curation=fast_curation,
-            vehicle=vehicle, date_range=date_range, run_uuids=run_uuids,
+            query, tau, self._dataset, self._resident,
+            fast_curation=fast_curation, sub_idx=sub_idx,
         )
