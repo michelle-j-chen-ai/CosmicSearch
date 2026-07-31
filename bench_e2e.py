@@ -279,11 +279,15 @@ def _run_sweep(
     ``pca_ref_scores`` is the master corpus scored in PCA-256 space (the gate
     reference); ``query`` is the model-space query. The master path's latency
     uses the real 768-d ``score_corpus``; its correctness reference uses
-    ``pca_ref_scores``.
+    ``pca_ref_scores``. A cross-space discrepancy report compares the master
+    path's real 768-d result set against the threshold path's set per cell.
     """
     # The master copy carries chunk_id (legacy shards have no segment_id); the
     # threshold corpus's segment_id IS chunk_id. Join + report on chunk_id.
     row_keys = np.asarray(master_corpus.chunk_id, dtype=object)
+
+    # Master path's real 768-d scores (untimed; for the cross-space report).
+    master_scores_768 = search_engine.score_corpus(query, master_corpus)
 
     cells: list[dict] = []
     for cell in filters:
@@ -341,6 +345,40 @@ def _run_sweep(
                     f"missing={membership_missing} extra={membership_extra}"
                 )
 
+            # --- cross-space discrepancy report (master 768-d vs threshold) ---
+            # The master path's real 768-d model-space result set vs the
+            # threshold path's set. Discrepancies are expected only for rows
+            # within the PCA reconstruction tolerance (~2e-4) of tau — a
+            # boundary flip, not a bug. Any discrepant row whose 768-d score
+            # is far from tau indicates an actual error.
+            keep_768 = master_scores_768 >= tau
+            if mmask is not None:
+                keep_768 &= mmask
+            master_768_ids = set(row_keys[keep_768].tolist())
+            xsym = master_768_ids ^ pr3_ids  # symmetric difference
+            # Max |768-d score - tau| among discrepant rows that are in the
+            # 768-d set (missing from PR3) — measures how far from the
+            # boundary the discrepancy is.
+            key_to_768_score = {}
+            for i, k in enumerate(row_keys):
+                if k not in key_to_768_score:
+                    key_to_768_score[k] = float(master_scores_768[i])
+            xdist_max = 0.0
+            for k in xsym:
+                s = key_to_768_score.get(k)
+                if s is not None:
+                    xdist_max = max(xdist_max, abs(s - tau))
+            # Principled gate: a discrepancy beyond the reconstruction
+            # tolerance + float slack is a real bug, not a boundary flip.
+            _RECON_TOL = 5e-4  # PCA-256 reconstruction score error bound
+            xbug = abs(xdist_max) > _RECON_TOL if xdist_max > 0 else False
+            if xbug:
+                raise SystemExit(
+                    f"FAIL cross-space: tau={tau:.6f} filter={cell['name']} "
+                    f"sym_diff={len(xsym)} max_dist={xdist_max:.2e} "
+                    f"(beyond recon tol {_RECON_TOL})"
+                )
+
             # --- eps gate (bounded_approx vs PR3's own exact re-rank) ---
             exact_hits = threshold_corpus.threshold_search(
                 query, tau, fast_curation=False,
@@ -379,6 +417,9 @@ def _run_sweep(
                 "membership_missing": membership_missing,
                 "membership_extra": membership_extra,
                 "bound_violations": bound_violations,
+                "xspace_symdiff": len(xsym),
+                "xspace_max_dist": xdist_max,
+                "xspace_bug": xbug,
             })
     return cells
 
@@ -525,16 +566,19 @@ def _print_report(r: dict) -> None:
           f"({r['threshold_resident_mb']:.0f} MB resident)\n")
     hdr = (f"{'tau%':>6} {'filter':<12} {'sel':>7} {'matches':>8} "
            f"{'master_ms':>10} {'pr3_ms':>8} {'above':>6} {'band':>6} "
-           f"{'gate':>6}")
+           f"{'xdiff':>6} {'xmaxdist':>10} {'gate':>6}")
     print(hdr)
     print("-" * len(hdr))
     for c in r["cells"]:
         gate = "PASS" if (c["membership_missing"] == 0 and c["membership_extra"] == 0
-                          and c["bound_violations"] == 0) else "FAIL"
+                          and c["bound_violations"] == 0
+                          and not c.get("xspace_bug", False)) else "FAIL"
         print(f"{c['tau_percentile']:>6.2f} {c['filter']:<12} "
               f"{c['selectivity']:>7.4%} {c['matches']:>8} "
               f"{c['master_ms']:>10.2f} {c['pr3_ms']:>8.2f} "
-              f"{c['above']:>6} {c['band']:>6} {gate:>6}")
+              f"{c['above']:>6} {c['band']:>6} "
+              f"{c['xspace_symdiff']:>6} {c['xspace_max_dist']:>10.2e} "
+              f"{gate:>6}")
 
 
 def main() -> int:
