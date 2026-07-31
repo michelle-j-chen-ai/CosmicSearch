@@ -275,11 +275,12 @@ def _lance_filter_sql(
         if hi is not None:
             clauses.append(f"chunk_start_unix < {int(hi)}")
     if run_uuids is not None:
-        # An empty set matches nothing (parity with np.isin(x, [])); signal
-        # that to the caller via None so it short-circuits to an empty result
-        # rather than emitting invalid `IN ()` SQL.
+        # An empty set matches nothing (parity with np.isin(x, [])); emit a
+        # literal false rather than invalid `IN ()` SQL. `_hybrid_sub_idx`
+        # short-circuits empty sets before calling here, so this is a
+        # defense-in-depth for any other caller.
         if not run_uuids:
-            return None
+            return "false"
         escaped = ", ".join(f"'{r.replace(chr(39), chr(39)*2)}'" for r in sorted(run_uuids))
         clauses.append(f"run_uuid IN ({escaped})")
     if not clauses:

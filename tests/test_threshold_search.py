@@ -629,8 +629,11 @@ def test_lance_filter_sql_assembles_and_escapes() -> None:
     assert ts._lance_filter_sql(None, None, None) is None
     # date_range=(None, None) -> no actual predicate -> None (not "")
     assert ts._lance_filter_sql(None, (None, None), None) is None
-    # empty run_uuids set -> no match -> None (not invalid `IN ()`)
-    assert ts._lance_filter_sql(None, None, set()) is None
+    # empty run_uuids set -> matches nothing -> literal false (not `IN ()`,
+    # and not None which would mean "no filter / screen all").
+    assert ts._lance_filter_sql(None, None, set()) == "false"
+    # a vehicle clause alongside an empty set still matches nothing.
+    assert ts._lance_filter_sql("veh_a", None, set()) == "false"
     # vehicle with an apostrophe + both date bounds + run set
     sql = ts._lance_filter_sql("o'brien", (100, 200), {"a", "b"})
     assert "o''brien" in sql
@@ -657,3 +660,7 @@ def test_hybrid_empty_set_filter_matches_nothing(tmp_path: Path) -> None:
     # date_range=(None, None) is a no-op in both modes
     assert {h.row_id for h in hybrid.threshold_search(query, tau, date_range=(None, None))} == \
            {h.row_id for h in resident.threshold_search(query, tau)}
+    # combined vehicle + empty run_uuids still matches nothing (the vehicle
+    # clause must not resurrect the empty set into a screen-all).
+    assert hybrid.threshold_search(query, tau, vehicle="veh_a", run_uuids=set()) == []
+    assert resident.threshold_search(query, tau, vehicle="veh_a", run_uuids=set()) == []
