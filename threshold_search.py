@@ -28,7 +28,7 @@ pieces together against a real `lance_writer.build_dataset` output:
      `vector_fp`, but the fastmath-fp32 screening kernel's own numeric error
      relative to that bound is empirically large yet formally unbounded -- the
      exact path exists precisely to measure that gap.
-  4. Return ABOVE union filtered-BAND, sorted by score descending, with each
+  4. Return ABOVE union filtered-BAND (the match set, in canonical row order),
      hit's scalar metadata (fetched via the same `take()` pass).
 
 `ThresholdCorpus` decodes and holds `embedding_i8` resident in memory once, at
@@ -308,35 +308,32 @@ def _search_resident(
     band_idx = band_idx[band_keep]
     band_scores = band_scores[band_keep]
 
+    # Results are returned in canonical row order (ABOVE then BAND), NOT
+    # sorted by score: the curation workload consumes the match SET, and a
+    # consumer that needs score order sorts the returned hits itself.
     all_idx = np.concatenate([above_idx, band_idx])
     all_scores = np.concatenate([above_scores, band_scores])
     all_kind = [above_kind] * above_idx.size + ["exact"] * band_idx.size
     all_bound = [above_bound] * above_idx.size + [0.0] * band_idx.size
 
-    order = np.argsort(-all_scores, kind="stable")
-    sorted_idx = all_idx[order]
-    sorted_scores = all_scores[order]
-    sorted_kind = [all_kind[i] for i in order]
-    sorted_bound = [all_bound[i] for i in order]
-
-    if sorted_idx.size == 0:
+    if all_idx.size == 0:
         return []
 
-    meta_rows = dataset.take(sorted_idx.tolist(), columns=list(_METADATA_COLUMNS))
+    meta_rows = dataset.take(all_idx.tolist(), columns=list(_METADATA_COLUMNS))
     meta = {name: meta_rows.column(name).to_pylist() for name in _METADATA_COLUMNS}
     return [
         ThresholdHit(
-            row_id=int(sorted_idx[i]),
-            score=float(sorted_scores[i]),
+            row_id=int(all_idx[i]),
+            score=float(all_scores[i]),
             run_uuid=meta["run_uuid"][i],
             segment_id=meta["segment_id"][i],
             chunk_start_unix=meta["chunk_start_unix"][i],
             chunk_end_unix=meta["chunk_end_unix"][i],
             vehicle=meta["vehicle"][i],
-            score_kind=sorted_kind[i],
-            score_error_bound=sorted_bound[i],
+            score_kind=all_kind[i],
+            score_error_bound=all_bound[i],
         )
-        for i in range(sorted_idx.size)
+        for i in range(all_idx.size)
     ]
 
 
@@ -358,8 +355,8 @@ def threshold_search(
     score): `eps_bound.eps_cauchy_schwarz` is a hard upper bound on the gap
     between the int8 screening score and `vector_fp`'s score for a unit-norm
     query, so screening at `tau - eps` can only ever produce extra rows to
-    re-rank (BAND), never drop a row whose exact score is >= tau. Sorted by
-    score descending.
+    re-rank (BAND), never drop a row whose exact score is >= tau. Results are
+    returned in canonical row order (the match set), not sorted by score.
 
     `fast_curation` is the shipped mode: ABOVE rows (provably above tau by the
     eps bound) keep their bounded int8 screening score and skip `take()`;

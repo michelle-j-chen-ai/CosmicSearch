@@ -27,8 +27,8 @@ def _taus(scores: np.ndarray) -> list[float]:
 def test_matches_a_brute_force_oracle_across_thresholds(n: int, seed: int) -> None:
     """The core property, against a full-column brute-force reference: the
     returned set is exactly the rows scoring >= tau, deduplicated, carrying
-    the oracle's own scores, sorted descending -- at several thresholds and
-    at a corpus size large enough to span many pages of the screen.
+    the oracle's own scores -- at several thresholds and at a corpus size
+    large enough to span many pages of the screen.
     """
     with tempfile.TemporaryDirectory() as tmp:
         ds = conftest.build_corpus(Path(tmp), n=n, seed=seed)
@@ -43,7 +43,6 @@ def test_matches_a_brute_force_oracle_across_thresholds(n: int, seed: int) -> No
             assert len(got) == len(set(got)), "returned duplicate rows"
             for h in hits:
                 assert np.isclose(h.score, scores[h.row_id], rtol=1e-9, atol=1e-9)
-            assert [h.score for h in hits] == sorted((h.score for h in hits), reverse=True)
 
 
 def test_zero_false_negatives_against_true_pre_quantization_score() -> None:

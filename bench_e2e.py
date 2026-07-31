@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -492,12 +493,40 @@ def run(
         query, pca, pca_ref_scores, taus, filters, repeats=repeats,
     )
 
+    # --- memory component breakdown ---
+    r = threshold_corpus._resident
+    threshold_mem = {
+        "screen_i8_mb": r.corpus_i8.nbytes / 1e6,
+        "pca_mb": r.pca.nbytes / 1e6,
+        "scale_mb": r.scale.nbytes / 1e6,
+        "filter_vehicle_mb": r.vehicle.nbytes / 1e6,
+        "filter_chunk_start_mb": r.chunk_start_unix.nbytes / 1e6,
+        "filter_run_uuid_mb": r.run_uuid.nbytes / 1e6,
+    }
+    threshold_mem["total_mb"] = sum(threshold_mem.values())
+
+    def _list_mb(lst):
+        if not lst:
+            return 0.0
+        # approximate: Python list of str/int overhead + content
+        return sum(sys.getsizeof(x) for x in lst) / 1e6
+
+    master_mem = {
+        "matrix_fp32_mb": master_corpus.matrix.nbytes / 1e6,
+        "chunk_id_mb": _list_mb(master_corpus.chunk_id),
+        "run_uuid_mb": _list_mb(master_corpus.run_uuid),
+        "chunk_start_mb": _list_mb(master_corpus.chunk_start_unix),
+        "source_media_uri_mb": _list_mb(master_corpus.source_media_uri),
+        "segment_id_mb": _list_mb(master_corpus.segment_id),
+    }
+    master_mem["total_mb"] = sum(master_mem.values())
+
     return {
         "cells": cells,
         "master_load_s": master_load_s,
         "threshold_hydrate_s": threshold_hydrate_s,
-        "master_resident_mb": master_corpus.matrix.nbytes / 1e6,
-        "threshold_resident_mb": threshold_corpus.num_rows * D / 1e6,
+        "master_mem": master_mem,
+        "threshold_mem": threshold_mem,
     }
 
 
@@ -560,10 +589,28 @@ def run_synthetic(n: int, seed: int = 0, *, repeats: int = 3) -> dict:
 
 
 def _print_report(r: dict) -> None:
-    print(f"\nmaster load: {r['master_load_s']:.2f}s  "
-          f"({r['master_resident_mb']:.0f} MB resident)")
-    print(f"threshold hydrate: {r['threshold_hydrate_s']:.2f}s  "
-          f"({r['threshold_resident_mb']:.0f} MB resident)\n")
+    print(f"\nmaster load: {r['master_load_s']:.2f}s")
+    print(f"threshold hydrate: {r['threshold_hydrate_s']:.2f}s\n")
+
+    # Memory breakdown
+    mm = r.get("master_mem", {})
+    tm = r.get("threshold_mem", {})
+    print("memory (resident):")
+    print(f"  {'component':<28} {'master MB':>12} {'threshold MB':>14}")
+    print(f"  {'-'*56}")
+    all_keys = sorted(set(list(mm.keys()) + list(tm.keys())) - {"total_mb"})
+    for k in all_keys:
+        mv = mm.get(k, None)
+        tv = tm.get(k, None)
+        ms = f"{mv:>12.1f}" if mv is not None else f"{'—':>12}"
+        ts = f"{tv:>14.1f}" if tv is not None else f"{'—':>14}"
+        print(f"  {k:<28} {ms} {ts}")
+    print(f"  {'-'*56}")
+    print(f"  {'TOTAL':<28} {mm.get('total_mb', 0):>12.1f} {tm.get('total_mb', 0):>14.1f}")
+    if mm.get("total_mb") and tm.get("total_mb"):
+        print(f"  ratio: {mm['total_mb'] / tm['total_mb']:.1f}x less held by threshold\n")
+    else:
+        print()
     hdr = (f"{'tau%':>6} {'filter':<12} {'sel':>7} {'matches':>8} "
            f"{'master_ms':>10} {'pr3_ms':>8} {'above':>6} {'band':>6} "
            f"{'xdiff':>6} {'xmaxdist':>10} {'gate':>6}")
