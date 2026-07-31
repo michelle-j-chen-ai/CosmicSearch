@@ -257,10 +257,11 @@ def _lance_filter_sql(
 ) -> str | None:
     """Build a Lance (DataFusion) SQL predicate mirroring `_filter_mask`.
 
-    Returns `None` (no filter) when no clause is given. Single-quotes in
-    string literals are doubled to escape them. NULL vehicles are excluded by
-    SQL `=`, matching the numpy object-array `==` mask (NULL != 'veh_a' on
-    both sides). Boundary inclusivity matches `_filter_mask`: `>= lo`, `< hi`.
+    Returns `None` (no filter / empty match) when no clause is given or a set
+    filter is empty. Single-quotes in string literals are doubled to escape
+    them. NULL vehicles are excluded by SQL `=`, matching the numpy
+    object-array `==` mask (NULL != 'veh_a' on both sides). Boundary
+    inclusivity matches `_filter_mask`: `>= lo`, `< hi`.
     """
     if vehicle is None and date_range is None and run_uuids is None:
         return None
@@ -274,8 +275,15 @@ def _lance_filter_sql(
         if hi is not None:
             clauses.append(f"chunk_start_unix < {int(hi)}")
     if run_uuids is not None:
+        # An empty set matches nothing (parity with np.isin(x, [])); signal
+        # that to the caller via None so it short-circuits to an empty result
+        # rather than emitting invalid `IN ()` SQL.
+        if not run_uuids:
+            return None
         escaped = ", ".join(f"'{r.replace(chr(39), chr(39)*2)}'" for r in sorted(run_uuids))
         clauses.append(f"run_uuid IN ({escaped})")
+    if not clauses:
+        return None  # e.g. date_range=(None, None) -> no actual predicate
     return " AND ".join(clauses)
 
 
@@ -297,6 +305,11 @@ def _hybrid_sub_idx(
     those positions must equal the matched set, else the layout/version
     assumption is violated and we raise rather than return wrong positions.
     """
+    # An empty run_uuids set matches nothing (parity with the resident path's
+    # np.isin(x, [])). Check before _lance_filter_sql, which collapses an empty
+    # set to None ("no filter") and would otherwise screen the whole corpus.
+    if run_uuids is not None and not run_uuids:
+        return np.empty(0, dtype=np.intp)
     sql = _lance_filter_sql(vehicle, date_range, run_uuids)
     if sql is None:
         return None
@@ -309,7 +322,15 @@ def _hybrid_sub_idx(
     sub_idx = np.searchsorted(row_ids, matched)
     # Per-query guard: the positions must point at exactly the matched row ids.
     # Catches any fragment-layout skew or a matched id absent from `row_ids`
-    # (searchsorted would otherwise map it to a wrong neighbor).
+    # (searchsorted would otherwise map it to a wrong neighbor, or return
+    # row_ids.size for an id past the end). Bounds-check before indexing so the
+    # diagnostic fires rather than an opaque IndexError.
+    if sub_idx.size != matched.size or np.any(sub_idx >= row_ids.size):
+        raise ValueError(
+            "hybrid prefilter position mismatch -- a filtered row id is absent "
+            "from the resident map; the dataset likely changed between hydrate "
+            "and query. Rebuild the ThresholdCorpus."
+        )
     if not np.array_equal(row_ids[sub_idx], matched):
         raise ValueError(
             "hybrid prefilter position mismatch -- filtered row ids do not map "
@@ -512,7 +533,7 @@ class ThresholdCorpus:
     - ``"hybrid"``: push the filter predicate to Lance's scalar indexes
       (BTREE/BITMAP), receive the matching row ids, and map them to positions
       into the already-resident int8 screen. Drops the metadata arrays (saves
-      RAM) and finally puts the writer's scalar indexes to use at query time.
+      RAM) and uses the writer's scalar indexes at query time.
       Requires a stable dataset version between construction and query (a
       read-only serving corpus satisfies this); the hydrate and per-query
       guards raise if the row-id map is unsafe.
@@ -549,8 +570,10 @@ class ThresholdCorpus:
     ) -> list[ThresholdHit]:
         """Every row with re-rank score >= `tau`; see `threshold_search`."""
         if self._prefilter_mode == "hybrid":
+            row_ids = self._resident.row_ids
+            assert row_ids is not None  # hybrid hydrate sets this or raises
             sub_idx = _hybrid_sub_idx(
-                self._dataset, self._resident.row_ids, vehicle, date_range, run_uuids
+                self._dataset, row_ids, vehicle, date_range, run_uuids
             )
         else:
             allowed = _filter_mask(self._resident, vehicle, date_range, run_uuids)

@@ -512,10 +512,27 @@ def _build_null_vehicle_corpus(tmp: Path, *, n: int, seed: int) -> lance.LanceDa
 
 
 def test_hybrid_row_id_map_is_position_correct_multi_fragment(tmp_path: Path) -> None:
-    """A multi-fragment dataset's resident row_ids are ascending, and a hybrid
-    vehicle filter returns positions that index the resident screen correctly
-    (equal to the resident path's `sub_idx`)."""
-    ds = conftest.build_corpus(tmp_path, n=4_000, seed=21, pre_quant_fp32=True)
+    """A genuinely multi-fragment dataset's resident row_ids are ascending, and
+    a hybrid vehicle filter returns positions that index the resident screen
+    correctly (equal to the resident path's `sub_idx`).
+
+    Built with a small `max_rows_per_file` (no compaction) so the fragment-id
+    encoding `(fragment_id << 32) | offset` is actually exercised -- the row-id
+    map is NOT an identity here, which is the whole point of the searchsorted
+    bridge. (`build_dataset` compacts to 1M-row fragments, which would make
+    this a single-fragment identity map and pass even for a broken impl that
+    assumed row_id == position.)
+    """
+    artifact_dir = conftest.write_artifact(tmp_path / "artifact", n=4_000, seed=21, pre_quant_fp32=True)
+    uri = str(tmp_path / "out.lance")
+    lance.write_dataset(
+        lance_writer.build_table(artifact_dir), uri,
+        mode="create", data_storage_version=lance_writer.DATA_STORAGE_VERSION,
+        max_rows_per_file=200,
+    )
+    ds = lance.dataset(uri)
+    assert len(ds.get_fragments()) > 1, "fixture bug: expected multiple fragments"
+
     hybrid = ts.ThresholdCorpus(ds, prefilter_mode="hybrid")
     row_ids = hybrid._resident.row_ids
     assert row_ids is not None
@@ -610,6 +627,10 @@ def test_lance_filter_sql_assembles_and_escapes() -> None:
     None bounds. Pure unit test (no dataset)."""
     # all None -> no filter
     assert ts._lance_filter_sql(None, None, None) is None
+    # date_range=(None, None) -> no actual predicate -> None (not "")
+    assert ts._lance_filter_sql(None, (None, None), None) is None
+    # empty run_uuids set -> no match -> None (not invalid `IN ()`)
+    assert ts._lance_filter_sql(None, None, set()) is None
     # vehicle with an apostrophe + both date bounds + run set
     sql = ts._lance_filter_sql("o'brien", (100, 200), {"a", "b"})
     assert "o''brien" in sql
@@ -621,3 +642,18 @@ def test_lance_filter_sql_assembles_and_escapes() -> None:
     assert "chunk_start_unix >= 100" in sql_lo and "chunk_start_unix <" not in sql_lo
     sql_hi = ts._lance_filter_sql(None, (None, 200), None)
     assert "chunk_start_unix < 200" in sql_hi and "chunk_start_unix >=" not in sql_hi
+
+
+def test_hybrid_empty_set_filter_matches_nothing(tmp_path: Path) -> None:
+    """An empty run_uuids set matches nothing in both modes (parity), neither
+    raising nor screening the whole corpus."""
+    ds = conftest.build_corpus(tmp_path, n=1_500, seed=24, pre_quant_fp32=True)
+    query = conftest.unit_query(seed=24)
+    tau = float(np.percentile(conftest.exact_scores(ds, query), 90.0))
+    resident = ts.ThresholdCorpus(ds)
+    hybrid = ts.ThresholdCorpus(ds, prefilter_mode="hybrid")
+    assert resident.threshold_search(query, tau, run_uuids=set()) == []
+    assert hybrid.threshold_search(query, tau, run_uuids=set()) == []
+    # date_range=(None, None) is a no-op in both modes
+    assert {h.row_id for h in hybrid.threshold_search(query, tau, date_range=(None, None))} == \
+           {h.row_id for h in resident.threshold_search(query, tau)}
