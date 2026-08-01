@@ -219,14 +219,33 @@ class _ResidentCorpus:
     pca: np.ndarray  # (D, model_dim) fp32
     scale: np.ndarray  # (D,) fp32
     eps: float
-    vehicle: np.ndarray | None  # (N,) object (str or None); None in hybrid mode
-    chunk_start_unix: np.ndarray | None  # (N,) int64; None in hybrid mode
-    run_uuid: np.ndarray | None  # (N,) object; None in hybrid mode
-    # Hit-only metadata (never filtered on), held so resident-mode queries
-    # build hits without any dataset metadata fetch; None in hybrid mode.
-    segment_id: list | None  # len N, str
-    chunk_end_unix: list | None  # len N, int or None
+    # Filterable metadata, dictionary-encoded: int32 codes into the paired
+    # uniques list, so `_filter_mask` compares integers (SIMD) instead of
+    # Python strings. Vehicle code -1 = NULL. All None in hybrid mode.
+    vehicle: np.ndarray | None  # (N,) int32 codes
+    vehicle_uniques: list | None  # code -> str
+    chunk_start_unix: np.ndarray | None  # (N,) int64
+    run_uuid: np.ndarray | None  # (N,) int32 codes
+    run_uuid_uniques: list | None  # code -> str
+    # Hit-only metadata (never filtered on), kept as Arrow arrays -- compact
+    # contiguous buffers, decoded per hit -- so resident-mode queries build
+    # hits without any dataset metadata fetch; None in hybrid mode.
+    segment_id: object | None  # pa.Array of str, len N
+    chunk_end_unix: object | None  # pa.Array of int64 (nullable), len N
     row_ids: np.ndarray | None  # (N,) int64 ascending; None in resident mode
+
+
+def _dictionary_codes(column: object) -> tuple[np.ndarray, list]:
+    """Dictionary-encode an Arrow string column: (int32 codes, uniques list).
+
+    NULL values encode as code -1, which never equals a real code, so an
+    equality filter excludes NULL rows the same way SQL `=` does.
+    """
+    import pyarrow.compute as pc
+
+    encoded = column.combine_chunks().dictionary_encode()
+    codes = pc.fill_null(encoded.indices, -1).to_numpy().astype(np.int32, copy=False)
+    return codes, encoded.dictionary.to_pylist()
 
 
 def _assert_ascending_row_ids(row_ids: np.ndarray) -> None:
@@ -279,20 +298,24 @@ def _load_resident_corpus(
         return _ResidentCorpus(
             corpus_i8=corpus_i8, pca=pca, scale=scale,
             eps=eps_bound.eps_cauchy_schwarz(scale),
-            vehicle=None, chunk_start_unix=None, run_uuid=None,
+            vehicle=None, vehicle_uniques=None, chunk_start_unix=None,
+            run_uuid=None, run_uuid_uniques=None,
             segment_id=None, chunk_end_unix=None, row_ids=row_ids,
         )
     i8_table = dataset.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True)
     corpus_i8 = _fixed_size_list_matrix(i8_table, lance_writer.EMBEDDING_I8_COLUMN, np.int8)
     meta_table = dataset.to_table(columns=list(_METADATA_COLUMNS), scan_in_order=True)
+    vehicle_codes, vehicle_uniques = _dictionary_codes(meta_table.column("vehicle"))
+    run_codes, run_uniques = _dictionary_codes(meta_table.column("run_uuid"))
     return _ResidentCorpus(
         corpus_i8=corpus_i8, pca=pca, scale=scale,
         eps=eps_bound.eps_cauchy_schwarz(scale),
-        vehicle=np.array(meta_table.column("vehicle").to_pylist()),
-        chunk_start_unix=np.array(meta_table.column("chunk_start_unix").to_pylist()),
-        run_uuid=np.array(meta_table.column("run_uuid").to_pylist()),
-        segment_id=meta_table.column("segment_id").to_pylist(),
-        chunk_end_unix=meta_table.column("chunk_end_unix").to_pylist(),
+        vehicle=vehicle_codes, vehicle_uniques=vehicle_uniques,
+        chunk_start_unix=meta_table.column("chunk_start_unix")
+        .combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64),
+        run_uuid=run_codes, run_uuid_uniques=run_uniques,
+        segment_id=meta_table.column("segment_id").combine_chunks(),
+        chunk_end_unix=meta_table.column("chunk_end_unix").combine_chunks(),
         row_ids=None,
     )
 
@@ -303,13 +326,22 @@ def _filter_mask(
     date_range: tuple[int | None, int | None] | None,
     run_uuids: "set[str] | None",
 ) -> np.ndarray | None:
-    """AND of the given filters over canonical order; None when no filter given."""
+    """AND of the given filters over canonical order; None when no filter given.
+
+    String filters compare int32 dictionary codes, not strings: a value
+    absent from the corpus maps to a code that matches nothing, and NULL
+    rows (code -1) never match an equality.
+    """
     if vehicle is None and date_range is None and run_uuids is None:
         return None
     n = resident.corpus_i8.shape[0]
     mask = np.ones(n, dtype=bool)
     if vehicle is not None:
-        mask &= resident.vehicle == vehicle
+        try:
+            code = resident.vehicle_uniques.index(vehicle)
+        except ValueError:
+            code = -2  # not in the corpus: matches nothing (NULL rows are -1)
+        mask &= resident.vehicle == code
     if date_range is not None:
         lo, hi = date_range
         if lo is not None:
@@ -317,7 +349,8 @@ def _filter_mask(
         if hi is not None:
             mask &= resident.chunk_start_unix < hi
     if run_uuids is not None:
-        mask &= np.isin(resident.run_uuid, list(run_uuids))
+        wanted = [c for c, u in enumerate(resident.run_uuid_uniques) if u in run_uuids]
+        mask &= np.isin(resident.run_uuid, wanted)
     return mask
 
 
@@ -412,37 +445,51 @@ def _hybrid_sub_idx(
     return sub_idx
 
 
-def _search_resident(
-    query: np.ndarray, tau: float, dataset: lance.LanceDataset, resident: _ResidentCorpus,
+def _search_resident_batch(
+    queries: "list[np.ndarray]", taus: "list[float]",
+    dataset: lance.LanceDataset, resident: _ResidentCorpus,
     *, fast_curation: bool = True,
     sub_idx: np.ndarray | None = None,
-) -> list[ThresholdHit]:
-    """Screen+re-rank `query` against an already-decoded `_ResidentCorpus`.
+) -> "list[list[ThresholdHit]]":
+    """Screen+re-rank Q queries against an already-decoded `_ResidentCorpus`.
 
-    `sub_idx` is the only filter input: the canonical positions to screen.
-    `None` screens the whole corpus. Callers resolve filters to `sub_idx`
-    (e.g. via `_filter_mask` + `np.nonzero`) before calling.
+    `sub_idx` is the only filter input: the canonical positions to screen,
+    shared by every query in the batch. `None` screens the whole corpus.
+    Callers resolve filters to `sub_idx` (e.g. via `_filter_mask` +
+    `np.nonzero`) before calling.
 
-    When `fast_curation` is true, ABOVE rows keep their bounded screening score
-    and skip `take()`; BAND rows are always re-ranked. Membership is identical
-    in both modes."""
-    _assert_unit_norm(query)
+    One corpus pass scores all Q queries (the int8 matrix is swept once, not
+    Q times -- each 256-byte row stays in cache across the per-query inner
+    loop), and ONE retrieval fetches the union of every query's needed rows.
+    Per-query taus; per-query eps (the bound scales with each projected
+    query's norm). When `fast_curation` is true, ABOVE rows keep their
+    bounded screening score and skip the exact re-rank; BAND rows are always
+    re-ranked. Membership per query is identical to a single-query call."""
+    q_n = len(queries)
+    for query in queries:
+        _assert_unit_norm(query)
     n = resident.corpus_i8.shape[0]
-    if n == 0:
-        return []
+    if n == 0 or (sub_idx is not None and sub_idx.size == 0):
+        return [[] for _ in range(q_n)]
 
-    query_pca = _project_query(query, resident.pca)
-    w = (query_pca * (resident.scale.astype(np.float32) / np.float32(127.0))).astype(np.float32)
+    queries_pca = np.stack([_project_query(q, resident.pca) for q in queries])
+    ws = (
+        queries_pca * (resident.scale.astype(np.float32) / np.float32(127.0))
+    ).astype(np.float32)
 
+    corpus_i8 = np.ascontiguousarray(resident.corpus_i8)
     if sub_idx is None:
-        corpus_i8 = np.ascontiguousarray(resident.corpus_i8)
+        screening = np.empty((q_n, n), dtype=np.float32)
+        if q_n == 1:
+            gpu_corpus._cpu_score_kernel()(corpus_i8, ws[0], screening[0])
+        else:
+            gpu_corpus._cpu_score_kernel_batch()(corpus_i8, ws, screening)
     else:
-        if sub_idx.size == 0:
-            return []
-        corpus_i8 = np.ascontiguousarray(resident.corpus_i8[sub_idx])
-
-    screening_scores = np.empty(corpus_i8.shape[0], dtype=np.float32)
-    gpu_corpus._cpu_score_kernel()(corpus_i8, w, screening_scores)
+        # The subset kernel gathers rows through `sub_idx` inside the scoring
+        # loop -- no filtered copy of the screen matrix is materialized.
+        idx64 = sub_idx.astype(np.int64, copy=False)
+        screening = np.empty((q_n, idx64.size), dtype=np.float32)
+        gpu_corpus._cpu_score_kernel_subset_batch()(corpus_i8, idx64, ws, screening)
 
     # Cauchy-Schwarz bounds the screening error by ||query_pca|| * ||e||, and
     # `resident.eps` is the ||e|| half. The scan happens in PCA space, so the
@@ -451,43 +498,52 @@ def _search_resident(
     # 1 and would leave an unscaled bound too small to be a bound at all. For
     # the orthonormal basis a real SVD produces this factor is <= 1, so the
     # window is also tighter than the corpus-wide constant.
-    eps = resident.eps * float(np.linalg.norm(query_pca))
-    above, band, _below = eps_bound.classify(screening_scores, tau, eps)
-    # SUBSET positions (index into screening_scores / corpus_i8), NOT canonical
-    # ids. Score lookups below use these; take()/row_id/metadata use canonical.
-    above_pos = np.nonzero(above)[0]
-    band_pos = np.nonzero(band)[0]
+    epss = resident.eps * np.linalg.norm(queries_pca, axis=1)
 
-    # fast_curation ABOVE acceptance reads the bounded score at SUBSET position.
-    # Remap to canonical ids AFTER all subset-position score lookups are done,
-    # so take()/row_id/metadata address the right rows.
-    if sub_idx is None:
-        above_idx = above_pos  # unfiltered: subset position == canonical id
-        band_idx = band_pos
-    else:
-        above_idx = sub_idx[above_pos]  # canonical ids for take()/metadata/row_id
-        band_idx = sub_idx[band_pos]
+    # Per-query classify. Positions are SUBSET positions (index into a
+    # screening row), NOT canonical ids; canonical ids are remapped through
+    # `sub_idx` for everything that addresses the dataset or resident
+    # metadata. Bounded-score lookups keep using subset positions.
+    per_above_pos: list = []
+    per_band_pos: list = []
+    per_above_idx: list = []
+    per_band_idx: list = []
+    for qi in range(q_n):
+        above, band, _below = eps_bound.classify(
+            screening[qi], float(taus[qi]), float(epss[qi])
+        )
+        above_pos = np.nonzero(above)[0]
+        band_pos = np.nonzero(band)[0]
+        if sub_idx is None:
+            above_idx, band_idx = above_pos, band_pos
+        else:
+            above_idx, band_idx = sub_idx[above_pos], sub_idx[band_pos]
+        per_above_pos.append(above_pos)
+        per_band_pos.append(band_pos)
+        per_above_idx.append(above_idx)
+        per_band_idx.append(band_idx)
 
-    # ONE row retrieval per query. `rows_needed` is every row that needs
-    # anything from the dataset: BAND always needs `vector_fp` for the exact
-    # re-rank; ABOVE needs it only in the exact path; metadata rides along in
-    # hybrid mode (resident mode holds it in memory). `_fetch_rows` picks
-    # point-take vs one contiguous window scan by predicted cost -- a
-    # broad-tau BAND is fetched as a single range read instead of thousands
-    # of per-row range-GETs. Refine cost is bounded by the needed-row count
-    # (a broad/low-tau query can still make this large; this module does not
-    # attempt to cap it).
+    # ONE row retrieval for the whole batch. `rows_needed` is the union over
+    # queries of every row that needs anything from the dataset: BAND always
+    # needs `vector_fp` for the exact re-rank; ABOVE needs it only in the
+    # exact path; metadata rides along in hybrid mode (resident mode holds it
+    # in memory). `_fetch_rows` picks point-take vs one contiguous window
+    # scan by predicted cost -- a broad-tau BAND is fetched as a single range
+    # read instead of thousands of per-row range-GETs. Refine cost is bounded
+    # by the needed-row count (a broad/low-tau query can still make this
+    # large; this module does not attempt to cap it).
     meta_resident = resident.segment_id is not None
     if fast_curation and meta_resident:
-        rows_needed = band_idx
+        needed_parts = per_band_idx
     else:
-        rows_needed = np.union1d(above_idx, band_idx)
+        needed_parts = per_above_idx + per_band_idx
+    rows_needed = np.unique(np.concatenate(needed_parts))
     fetch_columns = [lance_writer.VECTOR_FP_COLUMN] + (
         [] if meta_resident else list(_METADATA_COLUMNS)
     )
     fetched = _fetch_rows(dataset, rows_needed, fetch_columns) if rows_needed.size else None
 
-    def _exact_scores(idx: np.ndarray) -> np.ndarray:
+    def _exact_scores(idx: np.ndarray, query_pca: np.ndarray) -> np.ndarray:
         if idx.size == 0:
             return np.empty(0, dtype=np.float64)
         sel = np.searchsorted(rows_needed, idx)
@@ -501,66 +557,94 @@ def _search_resident(
         # accumulator at full precision, so scores are unchanged.
         return np.einsum("ij,j->i", fp, query_pca, dtype=np.float64)
 
-    if fast_curation:
-        # ABOVE rows are provable members (screen - eps >= tau): accept the
-        # int8 screening score as a bounded approximation, no exact re-rank.
-        above_scores = screening_scores[above_pos].astype(np.float64)
-        above_kind = "bounded_approx"
-        above_bound = eps
-    else:
-        above_scores = _exact_scores(above_idx)
-        above_keep = above_scores >= tau
-        above_idx = above_idx[above_keep]
-        above_scores = above_scores[above_keep]
-        above_kind = "exact"
-        above_bound = 0.0
+    results: "list[list[ThresholdHit]]" = []
+    for qi in range(q_n):
+        tau = float(taus[qi])
+        eps = float(epss[qi])
+        query_pca = queries_pca[qi]
+        above_pos, band_pos = per_above_pos[qi], per_band_pos[qi]
+        above_idx, band_idx = per_above_idx[qi], per_band_idx[qi]
 
-    # BAND rows are always re-ranked: the eps window alone does not decide
-    # membership, so the exact score is required to filter to >= tau.
-    band_scores = _exact_scores(band_idx)
-    band_keep = band_scores >= tau
-    band_idx = band_idx[band_keep]
-    band_scores = band_scores[band_keep]
+        if fast_curation:
+            # ABOVE rows are provable members (screen - eps >= tau): accept
+            # the int8 screening score as a bounded approximation, no exact
+            # re-rank.
+            above_scores = screening[qi][above_pos].astype(np.float64)
+            above_kind = "bounded_approx"
+            above_bound = eps
+        else:
+            above_scores = _exact_scores(above_idx, query_pca)
+            above_keep = above_scores >= tau
+            above_idx = above_idx[above_keep]
+            above_scores = above_scores[above_keep]
+            above_kind = "exact"
+            above_bound = 0.0
 
-    # Results are returned in canonical row order (ABOVE then BAND), NOT
-    # sorted by score: the curation workload consumes the match SET, and a
-    # consumer that needs score order sorts the returned hits itself.
-    all_idx = np.concatenate([above_idx, band_idx])
-    all_scores = np.concatenate([above_scores, band_scores])
-    all_kind = [above_kind] * above_idx.size + ["exact"] * band_idx.size
-    all_bound = [above_bound] * above_idx.size + [0.0] * band_idx.size
+        # BAND rows are always re-ranked: the eps window alone does not
+        # decide membership, so the exact score is required to filter to
+        # >= tau.
+        band_scores = _exact_scores(band_idx, query_pca)
+        band_keep = band_scores >= tau
+        band_idx = band_idx[band_keep]
+        band_scores = band_scores[band_keep]
 
-    if all_idx.size == 0:
-        return []
+        # Results are returned in canonical row order (ABOVE then BAND), NOT
+        # sorted by score: the curation workload consumes the match SET, and
+        # a consumer that needs score order sorts the returned hits itself.
+        all_idx = np.concatenate([above_idx, band_idx])
+        all_scores = np.concatenate([above_scores, band_scores])
+        all_kind = [above_kind] * above_idx.size + ["exact"] * band_idx.size
+        all_bound = [above_bound] * above_idx.size + [0.0] * band_idx.size
 
-    if meta_resident:
-        meta = {
-            "run_uuid": [resident.run_uuid[i] for i in all_idx],
-            "segment_id": [resident.segment_id[i] for i in all_idx],
-            "chunk_start_unix": [int(resident.chunk_start_unix[i]) for i in all_idx],
-            "chunk_end_unix": [resident.chunk_end_unix[i] for i in all_idx],
-            "vehicle": [resident.vehicle[i] for i in all_idx],
-        }
-    else:
-        # Hit rows are a subset of `rows_needed` (ABOVE ∪ BAND before the tau
-        # filter), so metadata comes from the same fetched table.
-        hit_sel = np.searchsorted(rows_needed, all_idx)
-        hit_rows = fetched.take(hit_sel)
-        meta = {name: hit_rows.column(name).to_pylist() for name in _METADATA_COLUMNS}
-    return [
-        ThresholdHit(
-            row_id=int(all_idx[i]),
-            score=float(all_scores[i]),
-            run_uuid=meta["run_uuid"][i],
-            segment_id=meta["segment_id"][i],
-            chunk_start_unix=meta["chunk_start_unix"][i],
-            chunk_end_unix=meta["chunk_end_unix"][i],
-            vehicle=meta["vehicle"][i],
-            score_kind=all_kind[i],
-            score_error_bound=all_bound[i],
-        )
-        for i in range(all_idx.size)
-    ]
+        if all_idx.size == 0:
+            results.append([])
+            continue
+
+        if meta_resident:
+            meta = {
+                "run_uuid": [resident.run_uuid_uniques[c] for c in resident.run_uuid[all_idx]],
+                "segment_id": [resident.segment_id[i].as_py() for i in all_idx],
+                "chunk_start_unix": [int(c) for c in resident.chunk_start_unix[all_idx]],
+                "chunk_end_unix": [resident.chunk_end_unix[i].as_py() for i in all_idx],
+                "vehicle": [
+                    resident.vehicle_uniques[c] if c >= 0 else None
+                    for c in resident.vehicle[all_idx]
+                ],
+            }
+        else:
+            # Hit rows are a subset of `rows_needed` (every query's ABOVE ∪
+            # BAND before the tau filter), so metadata comes from the same
+            # fetched table.
+            hit_sel = np.searchsorted(rows_needed, all_idx)
+            hit_rows = fetched.take(hit_sel)
+            meta = {name: hit_rows.column(name).to_pylist() for name in _METADATA_COLUMNS}
+        results.append([
+            ThresholdHit(
+                row_id=int(all_idx[i]),
+                score=float(all_scores[i]),
+                run_uuid=meta["run_uuid"][i],
+                segment_id=meta["segment_id"][i],
+                chunk_start_unix=meta["chunk_start_unix"][i],
+                chunk_end_unix=meta["chunk_end_unix"][i],
+                vehicle=meta["vehicle"][i],
+                score_kind=all_kind[i],
+                score_error_bound=all_bound[i],
+            )
+            for i in range(all_idx.size)
+        ])
+    return results
+
+
+def _search_resident(
+    query: np.ndarray, tau: float, dataset: lance.LanceDataset, resident: _ResidentCorpus,
+    *, fast_curation: bool = True,
+    sub_idx: np.ndarray | None = None,
+) -> list[ThresholdHit]:
+    """Screen+re-rank one query; the Q=1 case of `_search_resident_batch`."""
+    return _search_resident_batch(
+        [query], [tau], dataset, resident,
+        fast_curation=fast_curation, sub_idx=sub_idx,
+    )[0]
 
 
 def threshold_search(
@@ -663,6 +747,21 @@ class ThresholdCorpus:
     def num_rows(self) -> int:
         return self._resident.corpus_i8.shape[0]
 
+    def _resolve_sub_idx(
+        self,
+        vehicle: str | None,
+        date_range: tuple[int | None, int | None] | None,
+        run_uuids: "set[str] | None",
+    ) -> np.ndarray | None:
+        if self._prefilter_mode == "hybrid":
+            row_ids = self._resident.row_ids
+            assert row_ids is not None  # hybrid hydrate sets this or raises
+            return _hybrid_sub_idx(
+                self._dataset, row_ids, vehicle, date_range, run_uuids
+            )
+        allowed = _filter_mask(self._resident, vehicle, date_range, run_uuids)
+        return None if allowed is None else np.nonzero(allowed)[0]
+
     def threshold_search(
         self, query: np.ndarray, tau: float, *, fast_curation: bool = True,
         vehicle: str | None = None,
@@ -670,16 +769,36 @@ class ThresholdCorpus:
         run_uuids: "set[str] | None" = None,
     ) -> list[ThresholdHit]:
         """Every row with re-rank score >= `tau`; see `threshold_search`."""
-        if self._prefilter_mode == "hybrid":
-            row_ids = self._resident.row_ids
-            assert row_ids is not None  # hybrid hydrate sets this or raises
-            sub_idx = _hybrid_sub_idx(
-                self._dataset, row_ids, vehicle, date_range, run_uuids
-            )
-        else:
-            allowed = _filter_mask(self._resident, vehicle, date_range, run_uuids)
-            sub_idx = None if allowed is None else np.nonzero(allowed)[0]
+        sub_idx = self._resolve_sub_idx(vehicle, date_range, run_uuids)
         return _search_resident(
             query, tau, self._dataset, self._resident,
+            fast_curation=fast_curation, sub_idx=sub_idx,
+        )
+
+    def threshold_search_batch(
+        self, queries: "list[np.ndarray]", taus: "list[float]",
+        *, fast_curation: bool = True,
+        vehicle: str | None = None,
+        date_range: tuple[int | None, int | None] | None = None,
+        run_uuids: "set[str] | None" = None,
+    ) -> "list[list[ThresholdHit]]":
+        """Per-query match sets for Q queries sharing one filter scope.
+
+        The batch-curation shape: many tag queries scan the same corpus
+        scope, each with its own tau. One screen pass scores every query
+        (the resident int8 matrix is swept once, not Q times), the filter is
+        resolved once, and one retrieval fetches the union of every query's
+        needed rows. Results are per query, each identical to what a
+        single `threshold_search` call with the same arguments returns.
+        """
+        if len(queries) != len(taus):
+            raise ValueError(
+                f"queries/taus length mismatch: {len(queries)} != {len(taus)}"
+            )
+        if not len(queries):
+            raise ValueError("empty batch: queries must be non-empty")
+        sub_idx = self._resolve_sub_idx(vehicle, date_range, run_uuids)
+        return _search_resident_batch(
+            queries, taus, self._dataset, self._resident,
             fast_curation=fast_curation, sub_idx=sub_idx,
         )

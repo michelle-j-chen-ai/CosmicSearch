@@ -299,6 +299,52 @@ def _master_filter_mask(
 # ---------------------------------------------------------------------------
 # Core sweep.
 # ---------------------------------------------------------------------------
+def _batch_case(
+    threshold_corpus: ts.ThresholdCorpus,
+    hybrid_corpus: ts.ThresholdCorpus,
+    query: np.ndarray,
+    tau: float,
+    *,
+    q_batch: int = 8,
+    repeats: int = 3,
+) -> dict:
+    """Time Q queries issued sequentially vs as one batch, per prefilter mode.
+
+    The batch path sweeps the resident screen once for all Q queries and
+    issues one shared retrieval; the sequential path pays both per query.
+    Hard equality gate: the batch's per-query hits must equal the
+    sequential calls' hits exactly.
+    """
+    import dataclasses
+
+    rng = np.random.default_rng(1234)
+    queries = [query]
+    for _ in range(q_batch - 1):
+        q = rng.standard_normal(query.shape[0]).astype(np.float32)
+        queries.append(q / np.linalg.norm(q))
+    taus = [tau] * q_batch
+
+    out: dict = {"q_batch": q_batch}
+    for label, corpus in (("resident", threshold_corpus), ("hybrid", hybrid_corpus)):
+        seq_s, seq_hits = _median_time(
+            lambda c=corpus: [c.threshold_search(q, t) for q, t in zip(queries, taus)],
+            repeats,
+        )
+        bat_s, bat_hits = _median_time(
+            lambda c=corpus: c.threshold_search_batch(queries, taus), repeats
+        )
+        equal = all(
+            [dataclasses.astuple(h) for h in got] == [dataclasses.astuple(h) for h in want]
+            for got, want in zip(bat_hits, seq_hits)
+        )
+        out[label] = {
+            "seq_ms": seq_s * 1e3,
+            "batch_ms": bat_s * 1e3,
+            "equal": equal,
+        }
+    return out
+
+
 def _run_sweep(
     master_corpus: search_engine.Corpus,
     threshold_corpus: ts.ThresholdCorpus,
@@ -565,11 +611,16 @@ def run(
         query, pca, pca_ref_scores, taus, filters, repeats=repeats,
     )
 
+    batch = _batch_case(threshold_corpus, hybrid_corpus, query, taus[1])
+
     def _list_mb(lst):
         if not lst:
             return 0.0
         # approximate: Python list of str/int overhead + content
         return sum(sys.getsizeof(x) for x in lst) / 1e6
+
+    def _arrow_mb(arr):
+        return sum(b.size for b in arr.buffers() if b is not None) / 1e6
 
     # --- memory component breakdown ---
     r = threshold_corpus._resident
@@ -577,11 +628,13 @@ def run(
         "screen_i8_mb": r.corpus_i8.nbytes / 1e6,
         "pca_mb": r.pca.nbytes / 1e6,
         "scale_mb": r.scale.nbytes / 1e6,
-        "filter_vehicle_mb": r.vehicle.nbytes / 1e6,
+        # int32 dictionary codes + their uniques lists
+        "filter_vehicle_mb": r.vehicle.nbytes / 1e6 + _list_mb(r.vehicle_uniques),
         "filter_chunk_start_mb": r.chunk_start_unix.nbytes / 1e6,
-        "filter_run_uuid_mb": r.run_uuid.nbytes / 1e6,
-        "meta_segment_id_mb": _list_mb(r.segment_id),
-        "meta_chunk_end_mb": _list_mb(r.chunk_end_unix),
+        "filter_run_uuid_mb": r.run_uuid.nbytes / 1e6 + _list_mb(r.run_uuid_uniques),
+        # Arrow buffer bytes (validity + offsets + data)
+        "meta_segment_id_mb": _arrow_mb(r.segment_id),
+        "meta_chunk_end_mb": _arrow_mb(r.chunk_end_unix),
     }
     threshold_mem["total_mb"] = sum(threshold_mem.values())
 
@@ -606,6 +659,7 @@ def run(
 
     return {
         "cells": cells,
+        "batch": batch,
         "master_load_s": master_load_s,
         "threshold_hydrate_s": threshold_hydrate_s,
         "hybrid_hydrate_s": hybrid_hydrate_s,
@@ -722,6 +776,17 @@ def _print_report(r: dict) -> None:
               f"{c['above']:>6} {c['band']:>6} "
               f"{c['xspace_symdiff']:>6} {c['xspace_max_dist']:>10.2e} "
               f"{gate:>6}")
+
+    b = r.get("batch")
+    if b:
+        print(f"\nbatched screen (Q={b['q_batch']} queries, no filter, tau=p99.9; "
+              f"one screen pass + one retrieval vs Q of each):")
+        for label in ("resident", "hybrid"):
+            e = b[label]
+            gate = "PASS" if e["equal"] else "FAIL"
+            speedup = e["seq_ms"] / max(e["batch_ms"], 1e-9)
+            print(f"  {label:<9} sequential {e['seq_ms']:>10.1f} ms   "
+                  f"batch {e['batch_ms']:>10.1f} ms   ({speedup:.1f}x)   equality {gate}")
 
 
 def main() -> int:

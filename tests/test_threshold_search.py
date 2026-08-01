@@ -851,3 +851,69 @@ def test_window_scan_arm_returns_identical_hits(tmp_path: Path, monkeypatch) -> 
             assert [dataclasses.astuple(h) for h in forced] == [
                 dataclasses.astuple(h) for h in base
             ], f"{mode}/fast={fast}: window-scan arm diverged from take arm"
+
+
+# ---------------------------------------------------------------------------
+# Batched multi-query search.
+# ---------------------------------------------------------------------------
+
+
+def test_threshold_search_batch_matches_per_query_results() -> None:
+    """A batch call returns exactly the per-query results, hit for hit --
+    across prefilter modes, curation modes, and a shared filter, with
+    per-query taus. The batch shares one screen pass and one retrieval, so
+    equality here is the whole correctness contract."""
+    import dataclasses
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=3, pre_quant_fp32=True)
+        queries = [conftest.unit_query(seed=s) for s in (3, 17, 29, 41)]
+        base_scores = conftest.exact_scores(ds, queries[0])
+        taus = [
+            float(np.percentile(conftest.exact_scores(ds, q), p))
+            for q, p in zip(queries, (99.0, 99.9, 95.0, 99.0))
+        ]
+        assert base_scores.size  # fixture sanity
+
+        for mode in ("resident", "hybrid"):
+            corpus = ts.ThresholdCorpus(ds, prefilter_mode=mode)
+            for fast in (True, False):
+                for kwargs in ({}, {"vehicle": "veh_a"}):
+                    batch = corpus.threshold_search_batch(
+                        queries, taus, fast_curation=fast, **kwargs
+                    )
+                    single = [
+                        corpus.threshold_search(q, t, fast_curation=fast, **kwargs)
+                        for q, t in zip(queries, taus)
+                    ]
+                    assert len(batch) == len(single) == len(queries)
+                    for got, want in zip(batch, single):
+                        assert [dataclasses.astuple(h) for h in got] == [
+                            dataclasses.astuple(h) for h in want
+                        ], (mode, fast, kwargs)
+
+
+def test_threshold_search_batch_single_retrieval_and_validation() -> None:
+    """The whole batch issues at most ONE row retrieval (shared union fetch),
+    and mismatched queries/taus lengths are rejected."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=3, pre_quant_fp32=True)
+        queries = [conftest.unit_query(seed=s) for s in (3, 17, 29)]
+        taus = [
+            float(np.percentile(conftest.exact_scores(ds, q), 99.0)) for q in queries
+        ]
+        corpus = ts.ThresholdCorpus(ds)
+
+        records: list = []
+        originals = _install_fetch_spy(records)
+        try:
+            batch = corpus.threshold_search_batch(queries, taus)
+        finally:
+            _restore_fetch_spy(originals)
+        assert any(batch), "expected matches in at least one query"
+        assert len(_row_fetches(records)) <= 1, _row_fetches(records)
+
+        with pytest.raises(ValueError, match="length"):
+            corpus.threshold_search_batch(queries, taus[:2])
+        with pytest.raises(ValueError, match="empty"):
+            corpus.threshold_search_batch([], [])

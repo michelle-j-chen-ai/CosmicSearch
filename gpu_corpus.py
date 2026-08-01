@@ -89,6 +89,60 @@ def _cpu_score_kernel():
     return _CPU_KERNEL
 
 
+# Multi-query and subset variants of the int8 kernel. One corpus pass scores
+# Q queries (each 256-byte row stays in L1 across the inner query loop, so the
+# memory sweep is amortized Q-fold), and the subset variant gathers rows
+# through an index array instead of requiring the caller to materialize a
+# filtered copy of the corpus. The single-query full-corpus path stays on
+# `_cpu_score_kernel` above.
+_CPU_KERNEL_BATCH = None
+_CPU_KERNEL_SUBSET_BATCH = None
+
+
+def _cpu_score_kernel_batch():
+    global _CPU_KERNEL_BATCH
+    if _CPU_KERNEL_BATCH is None:
+        from numba import njit, prange  # lazy: only the CPU path needs numba
+
+        @njit(parallel=True, fastmath=True, cache=True)
+        def _score_i8_batch(ci, ws, out):  # ci:(N,D) i8, ws:(Q,D) f32, out:(Q,N) f32
+            n, d = ci.shape
+            q_n = ws.shape[0]
+            for i in prange(n):
+                row = ci[i]
+                for q in range(q_n):
+                    acc = np.float32(0.0)
+                    for j in range(d):
+                        acc += np.float32(row[j]) * ws[q, j]
+                    out[q, i] = acc
+
+        _CPU_KERNEL_BATCH = _score_i8_batch
+    return _CPU_KERNEL_BATCH
+
+
+def _cpu_score_kernel_subset_batch():
+    global _CPU_KERNEL_SUBSET_BATCH
+    if _CPU_KERNEL_SUBSET_BATCH is None:
+        from numba import njit, prange  # lazy: only the CPU path needs numba
+
+        @njit(parallel=True, fastmath=True, cache=True)
+        def _score_i8_subset_batch(ci, idx, ws, out):
+            # ci:(N,D) i8, idx:(K,) i64, ws:(Q,D) f32, out:(Q,K) f32
+            k_n = idx.shape[0]
+            d = ci.shape[1]
+            q_n = ws.shape[0]
+            for k in prange(k_n):
+                row = ci[idx[k]]
+                for q in range(q_n):
+                    acc = np.float32(0.0)
+                    for j in range(d):
+                        acc += np.float32(row[j]) * ws[q, j]
+                    out[q, k] = acc
+
+        _CPU_KERNEL_SUBSET_BATCH = _score_i8_subset_batch
+    return _CPU_KERNEL_SUBSET_BATCH
+
+
 def is_gpu_artifact(local_dir: Path) -> bool:
     """True if `local_dir` holds an int8 PCA GPU corpus (vs npy/Lance)."""
     return (local_dir / CORPUS_INT8_FILE).exists() and (local_dir / PCA_FILE).exists()
