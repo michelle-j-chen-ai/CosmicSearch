@@ -198,3 +198,35 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 - **Encoder throughput**: a single CPU encode is ~40ms, so one warm instance
   handles ~25 queries/s/core. Raise `max_instances` for more concurrent users;
   the model is stateless across requests.
+
+## End-to-end master-vs-threshold benchmark
+
+`bench_e2e.py` compares two retrieval paths over the same query, filters, and
+threshold (`tau`):
+
+- **master path** — score the resident 768-d model-space matrix
+  (`score_corpus`), apply the real-app filter masks (vehicle / run / date
+  window), cut at `tau`.
+- **PR3 path** — `ThresholdCorpus.threshold_search` (prefilter + screen +
+  re-rank) in the shipped `fast_curation` default.
+
+Two hard-fail correctness gates (the script exits non-zero on violation):
+
+- **membership** — the master path's PCA-256-space reference set and the PR3
+  path's result set must be equal at the same `tau`.
+- **eps bound** — every `bounded_approx` hit's screening score must satisfy
+  `|fast_score - exact_score| <= score_error_bound + CROSS_SPACE_TOL`, where
+  `exact_score` is the PR3 path's own exact re-rank score.
+
+```bash
+# synthetic mode (default): generates two legacy shards locally, converts to
+# both corpora, runs the full sweep — no model, no credentials, no network.
+python bench_e2e.py --source synthetic --rows 20000
+
+# pre-built corpora (local dirs or s3:// URIs)
+python bench_e2e.py --master-uri <dir|uri> --threshold-uri <dir|uri> [--repeats N]
+```
+
+The sweep covers filter cells: none; vehicle; date-window narrow (1 week) and
+medium (4 weeks); run_uuids (one drive). A cell whose corpus lacks values for
+its filter is skipped gracefully.
