@@ -119,10 +119,11 @@ def test_eps_is_what_prevents_false_negatives() -> None:
             eps_bound.eps_cauchy_schwarz = original
 
 
-def test_vector_fp_is_only_ever_read_by_take_on_a_small_row_set() -> None:
-    """The cost model: `vector_fp` must never be materialized by a scan, only
-    fetched by `take()` for the match set. A regression here turns every query
-    into a full fp32 column read.
+def test_vector_fp_is_only_ever_read_for_the_needed_rows() -> None:
+    """The cost model: `vector_fp` must never be materialized by an unbounded
+    scan -- only fetched for the needed rows, by `take()` or by a range read
+    bounded by their span. A regression here turns every query into a full
+    fp32 column read.
     """
     with tempfile.TemporaryDirectory() as tmp:
         n = 20_000
@@ -130,29 +131,36 @@ def test_vector_fp_is_only_ever_read_by_take_on_a_small_row_set() -> None:
         query = conftest.unit_query(seed=111)
         tau = _taus(conftest.exact_scores(ds, query))[1]
 
-        scanned: list[object] = []
+        scanned: list[tuple[object, object]] = []
         taken: list[tuple[int, object]] = []
-        orig_to_table, orig_take = lance.LanceDataset.to_table, lance.LanceDataset.take
+        orig_scanner, orig_take = lance.LanceDataset.scanner, lance.LanceDataset.take
 
-        def spy_to_table(self, *args, **kwargs):
-            scanned.append(kwargs.get("columns", args[0] if args else None))
-            return orig_to_table(self, *args, **kwargs)
+        def spy_scanner(self, *args, **kwargs):
+            cols = kwargs.get("columns") or (args[0] if args else None)
+            scanned.append((cols, kwargs.get("limit")))
+            return orig_scanner(self, *args, **kwargs)
 
         def spy_take(self, indices, columns=None):
             taken.append((len(indices), columns))
             return orig_take(self, indices, columns)
 
-        lance.LanceDataset.to_table, lance.LanceDataset.take = spy_to_table, spy_take
+        lance.LanceDataset.scanner, lance.LanceDataset.take = spy_scanner, spy_take
         try:
             hits = ts.threshold_search(query, tau, ds)
         finally:
-            lance.LanceDataset.to_table, lance.LanceDataset.take = orig_to_table, orig_take
+            lance.LanceDataset.scanner, lance.LanceDataset.take = orig_scanner, orig_take
 
         assert hits, "test tau should produce at least one match"
-        for columns in scanned:
-            assert columns and lance_writer.VECTOR_FP_COLUMN not in columns, columns
+        for columns, limit in scanned:
+            if columns and lance_writer.VECTOR_FP_COLUMN in columns:
+                assert limit is not None and limit < n, (
+                    f"unbounded vector_fp scan: columns={columns} limit={limit}"
+                )
         fp_takes = [c for c, cols in taken if cols and lance_writer.VECTOR_FP_COLUMN in cols]
-        assert fp_takes, "expected at least one take() for vector_fp"
+        fp_scans = [
+            lim for cols, lim in scanned if cols and lance_writer.VECTOR_FP_COLUMN in cols
+        ]
+        assert fp_takes or fp_scans, "expected a vector_fp fetch"
         assert all(count < n * 0.2 for count in fp_takes), (fp_takes, n)
 
 
@@ -664,3 +672,182 @@ def test_hybrid_empty_set_filter_matches_nothing(tmp_path: Path) -> None:
     # clause must not resurrect the empty set into a screen-all).
     assert hybrid.threshold_search(query, tau, vehicle="veh_a", run_uuids=set()) == []
     assert resident.threshold_search(query, tau, vehicle="veh_a", run_uuids=set()) == []
+
+
+# ---------------------------------------------------------------------------
+# Read-path cost model: single union retrieval + take-vs-window-scan crossover.
+# ---------------------------------------------------------------------------
+
+
+def _install_fetch_spy(records: list) -> tuple:
+    """Record every `take()` and `scanner()` call as (kind, size, columns, offset).
+
+    `to_table` routes through `scanner`, so patching `take` + `scanner` sees
+    every dataset read. Callers filter to row fetches via `_row_fetches`.
+    """
+    orig_take, orig_scanner = lance.LanceDataset.take, lance.LanceDataset.scanner
+
+    def spy_take(self, indices, columns=None):
+        records.append(("take", len(indices), tuple(columns or ()), None))
+        return orig_take(self, indices, columns)
+
+    def spy_scanner(self, *args, **kwargs):
+        cols = kwargs.get("columns") or (args[0] if args else None)
+        records.append(("scan", kwargs.get("limit"), tuple(cols or ()), kwargs.get("offset")))
+        return orig_scanner(self, *args, **kwargs)
+
+    lance.LanceDataset.take, lance.LanceDataset.scanner = spy_take, spy_scanner
+    return orig_take, orig_scanner
+
+
+def _restore_fetch_spy(originals: tuple) -> None:
+    lance.LanceDataset.take, lance.LanceDataset.scanner = originals
+
+
+def _row_fetches(records: list) -> list:
+    """The subset of spy records that fetch row data (vector_fp / metadata),
+    as opposed to filter-only scans (empty projection) or screen hydrate."""
+    row_cols = {lance_writer.VECTOR_FP_COLUMN, *ts._METADATA_COLUMNS}
+    return [r for r in records if r[2] and (set(r[2]) & row_cols)]
+
+
+def test_resident_mode_builds_metadata_without_a_metadata_take() -> None:
+    """Resident mode holds all five metadata columns from hydrate, so a query
+    fetches only `vector_fp` -- and the hit metadata must still be exactly the
+    dataset's rows."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=3, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=3)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 99.0))
+        corpus = ts.ThresholdCorpus(ds)
+
+        records: list = []
+        originals = _install_fetch_spy(records)
+        try:
+            hits = corpus.threshold_search(query, tau)
+        finally:
+            _restore_fetch_spy(originals)
+
+        assert hits, "expected matches at p99"
+        for r in _row_fetches(records):
+            assert set(r[2]) == {lance_writer.VECTOR_FP_COLUMN}, (
+                f"resident-mode query fetched metadata columns from the dataset: {r}"
+            )
+        meta = ds.to_table(columns=list(ts._METADATA_COLUMNS), scan_in_order=True)
+        cols = {name: meta.column(name).to_pylist() for name in ts._METADATA_COLUMNS}
+        for h in hits:
+            assert h.run_uuid == cols["run_uuid"][h.row_id]
+            assert h.segment_id == cols["segment_id"][h.row_id]
+            assert h.chunk_start_unix == cols["chunk_start_unix"][h.row_id]
+            assert h.chunk_end_unix == cols["chunk_end_unix"][h.row_id]
+            assert h.vehicle == cols["vehicle"][h.row_id]
+
+
+def test_single_row_retrieval_per_query_across_modes() -> None:
+    """Every mode combination issues AT MOST one row retrieval per query
+    (resident metadata / union fetch), with both ABOVE and BAND nonempty so
+    the union actually merges two populations."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ds = conftest.build_corpus(Path(tmp), n=2_000, seed=3, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=3)
+        scores = conftest.exact_scores(ds, query)
+        tau = float(np.percentile(scores, 99.0))
+        resident = ts.ThresholdCorpus(ds)
+        hybrid = ts.ThresholdCorpus(ds, prefilter_mode="hybrid")
+
+        kinds = {h.score_kind for h in resident.threshold_search(query, tau)}
+        assert kinds == {"bounded_approx", "exact"}, (
+            f"fixture must produce ABOVE and BAND at this tau, got {kinds}"
+        )
+
+        cases = [
+            (resident, {"fast_curation": True}),
+            (resident, {"fast_curation": False}),
+            (hybrid, {"fast_curation": True}),
+            (hybrid, {"fast_curation": False}),
+            (hybrid, {"fast_curation": True, "vehicle": "veh_a"}),
+        ]
+        for corpus, kwargs in cases:
+            records: list = []
+            originals = _install_fetch_spy(records)
+            try:
+                hits = corpus.threshold_search(query, tau, **kwargs)
+            finally:
+                _restore_fetch_spy(originals)
+            assert hits, kwargs
+            fetches = _row_fetches(records)
+            assert len(fetches) == 1, (kwargs, fetches)
+
+
+def test_no_retrieval_when_meta_resident_and_band_empty() -> None:
+    """A tau below every screening score minus eps makes every row ABOVE:
+    resident fast_curation then needs nothing from the dataset at query time."""
+    with tempfile.TemporaryDirectory() as tmp:
+        n = 500
+        ds = conftest.build_corpus(Path(tmp), n=n, seed=21, pre_quant_fp32=True)
+        query = conftest.unit_query(seed=121)
+        pca, scale = lance_writer.read_pca_metadata(ds)
+        corpus_i8 = ts._fixed_size_list_matrix(
+            ds.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True),
+            lance_writer.EMBEDDING_I8_COLUMN,
+            np.int8,
+        )
+        query_pca = ts._project_query(query, pca)
+        screening = np.empty(n, dtype=np.float32)
+        ts.gpu_corpus._cpu_score_kernel()(
+            np.ascontiguousarray(corpus_i8),
+            (query_pca * (scale.astype(np.float32) / 127.0)).astype(np.float32),
+            screening,
+        )
+        eps = eps_bound.eps_cauchy_schwarz(scale) * float(np.linalg.norm(query_pca))
+        tau = float(screening.min()) - 2.0 * eps
+
+        corpus = ts.ThresholdCorpus(ds)
+        records: list = []
+        originals = _install_fetch_spy(records)
+        try:
+            hits = corpus.threshold_search(query, tau)
+        finally:
+            _restore_fetch_spy(originals)
+
+        assert len(hits) == n
+        assert all(h.score_kind == "bounded_approx" for h in hits)
+        assert _row_fetches(records) == [], _row_fetches(records)
+
+
+def test_window_scan_arm_returns_identical_hits(tmp_path: Path, monkeypatch) -> None:
+    """Forcing the crossover to the window-scan arm must return hits identical
+    to the take arm -- scores bitwise, metadata equal -- on a genuinely
+    multi-fragment dataset (the offset window crosses file boundaries), in
+    both prefilter modes and both curation modes."""
+    import dataclasses
+
+    artifact = conftest.write_artifact(tmp_path / "a", n=1_000, seed=9, pre_quant_fp32=True)
+    ds = lance_writer.build_dataset(artifact, str(tmp_path / "out.lance"), max_rows_per_file=200)
+    query = conftest.unit_query(seed=9)
+    scores = conftest.exact_scores(ds, query)
+    tau = float(np.percentile(scores, 90.0))
+
+    for mode in ("resident", "hybrid"):
+        corpus = ts.ThresholdCorpus(ds, prefilter_mode=mode)
+        for fast in (True, False):
+            base = corpus.threshold_search(query, tau, fast_curation=fast)
+            assert base, (mode, fast)
+
+            records: list = []
+            originals = _install_fetch_spy(records)
+            monkeypatch.setattr(ts, "_TAKE_FLOOR_S", 1e9)
+            try:
+                forced = corpus.threshold_search(query, tau, fast_curation=fast)
+            finally:
+                _restore_fetch_spy(originals)
+                monkeypatch.undo()
+
+            scans = [r for r in _row_fetches(records) if r[0] == "scan"]
+            assert scans and all(r[1] is not None for r in scans), (
+                f"{mode}/fast={fast}: expected a bounded window scan, got {records}"
+            )
+            assert [dataclasses.astuple(h) for h in forced] == [
+                dataclasses.astuple(h) for h in base
+            ], f"{mode}/fast={fast}: window-scan arm diverged from take arm"

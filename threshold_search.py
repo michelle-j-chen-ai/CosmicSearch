@@ -17,19 +17,25 @@ pieces together against a real `lance_writer.build_dataset` output:
      `lance_writer.py`'s module docstring for what it holds and when it is a
      true pre-quantization signal vs a fallback dequantized-int8 value). The
      shipped default (`fast_curation=True`) accepts ABOVE rows with their
-     bounded int8 screening score and no `take()` re-rank -- membership is
+     bounded int8 screening score and no exact re-rank -- membership is
      proven by the eps bound (`screen - eps >= tau`), so the screen score is a
      bounded approximation, not an exact value. BAND rows are always re-ranked
-     from `vector_fp` via `Dataset.take()` (one IOP per row, never a full-column
-     read) and filtered to `score >= tau`, because the eps window alone does
-     not decide their membership. The exact path (`fast_curation=False`)
+     from `vector_fp` and filtered to `score >= tau`, because the eps window
+     alone does not decide their membership. Everything a query needs from the
+     dataset (`vector_fp`, plus metadata when it is not resident) is fetched
+     in ONE retrieval of the needed rows, via `_fetch_rows`'s cost model:
+     point `take()` (one IOP per row) for small or scattered sets, or one
+     contiguous range scan sliced to the needed rows when they are dense or
+     corpus-wide (a broad-tau BAND), where per-row range-GETs would hit the
+     object store's request throttle. The exact path (`fast_curation=False`)
      re-ranks ABOVE too and filters it to `score >= tau`; it is the internal
      reference used for benchmark comparison. The eps bound is proven against
      `vector_fp`, but the fastmath-fp32 screening kernel's own numeric error
      relative to that bound is empirically large yet formally unbounded -- the
      exact path exists precisely to measure that gap.
   4. Return ABOVE union filtered-BAND (the match set, in canonical row order),
-     hit's scalar metadata (fetched via the same `take()` pass).
+     hit's scalar metadata (from the resident metadata arrays in resident
+     prefilter mode; from the same single retrieval in hybrid mode).
 
 `ThresholdCorpus` decodes and holds `embedding_i8` resident in memory once, at
 construction, so repeated `.threshold_search()` calls scan an in-memory array
@@ -67,12 +73,31 @@ import eps_bound
 import gpu_corpus
 import lance_writer
 
-# Scalar columns fetched alongside the exact re-rank score so a ThresholdHit
-# can be resolved to a clip without a second pass over the dataset.
+# Scalar columns a ThresholdHit carries so it can be resolved to a clip
+# without a second pass over the dataset. Resident prefilter mode holds all of
+# them in memory; hybrid mode fetches them with the re-rank retrieval.
 _METADATA_COLUMNS = ("run_uuid", "segment_id", "chunk_start_unix", "chunk_end_unix", "vehicle")
 
 # Tolerance for treating a model-space query as unit-norm (see _assert_unit_norm).
 _UNIT_NORM_TOLERANCE = 1e-3
+
+# Object-storage cost model for `_fetch_rows`: choose between point `take()`
+# and one contiguous range scan by predicted latency. Constants measured
+# against OCI S3 (LANCE_IO_THREADS=64): an isolated take costs a ~0.33s
+# request floor plus ~0.5ms/row until the provider's throttle onset
+# (observed between ~0.5k and ~2.6k range-GETs), beyond which sustained
+# takes degrade to ~450 rows/s; a range scan streams at ~83 MB/s after a
+# ~0.35s floor. On local storage both arms are cheap, so miscalibration
+# there is harmless.
+_TAKE_FLOOR_S = 0.33
+_TAKE_S_PER_ROW = 5e-4
+_TAKE_THROTTLE_ONSET_ROWS = 2_000
+_TAKE_THROTTLED_ROWS_PER_S = 450.0
+_SCAN_FLOOR_S = 0.35
+_SCAN_BYTES_PER_S = 83e6
+# On-wire row-size estimates (fp32-256 FSL values + scalar metadata).
+_VECTOR_FP_ROW_BYTES = 1028
+_METADATA_ROW_BYTES = 120
 
 
 @dataclasses.dataclass(frozen=True)
@@ -108,6 +133,47 @@ def _fixed_size_list_matrix(table: object, column: str, dtype: np.dtype) -> np.n
     d = col.type.list_size
     flat = np.asarray(col.values.to_numpy(zero_copy_only=False), dtype=dtype)
     return flat.reshape(n, d)
+
+
+def _predicted_take_s(k: int) -> float:
+    """Modeled latency of `dataset.take` for `k` rows (see constants above)."""
+    if k <= _TAKE_THROTTLE_ONSET_ROWS:
+        return _TAKE_FLOOR_S + k * _TAKE_S_PER_ROW
+    return k / _TAKE_THROTTLED_ROWS_PER_S
+
+
+def _predicted_scan_s(window_rows: int, row_bytes: int) -> float:
+    """Modeled latency of one contiguous `window_rows`-row range scan."""
+    return _SCAN_FLOOR_S + window_rows * row_bytes / _SCAN_BYTES_PER_S
+
+
+def _fetch_rows(dataset: lance.LanceDataset, idx: np.ndarray, columns: list) -> object:
+    """Rows at ascending canonical positions `idx`, as an Arrow table in `idx`
+    order.
+
+    Two arms, chosen by the cost model: point `take()` (cheap for small or
+    scattered sets), or one contiguous `scanner(offset, limit)` range read
+    covering `[idx[0], idx[-1]]` sliced down to the requested rows (cheap when
+    the needed rows are dense or corpus-wide -- a broad-tau BAND -- where
+    per-row range-GETs would hit the object store's request throttle). The
+    span-based window degrades safely: a scattered `idx` makes the window
+    huge, so the model picks the take arm.
+    """
+    lo, hi = int(idx[0]), int(idx[-1]) + 1
+    row_bytes = _VECTOR_FP_ROW_BYTES + (
+        _METADATA_ROW_BYTES if len(columns) > 1 else 0
+    )
+    if _predicted_take_s(idx.size) <= _predicted_scan_s(hi - lo, row_bytes):
+        return dataset.take(idx.tolist(), columns=columns)
+    window = dataset.scanner(
+        columns=columns, offset=lo, limit=hi - lo, scan_in_order=True
+    ).to_table()
+    if window.num_rows != hi - lo:
+        raise ValueError(
+            f"window scan returned {window.num_rows} rows for range "
+            f"[{lo}, {hi}) -- the dataset changed between hydrate and query"
+        )
+    return window.take(idx - lo)
 
 
 def _project_query(query: np.ndarray, pca: np.ndarray) -> np.ndarray:
@@ -156,6 +222,10 @@ class _ResidentCorpus:
     vehicle: np.ndarray | None  # (N,) object (str or None); None in hybrid mode
     chunk_start_unix: np.ndarray | None  # (N,) int64; None in hybrid mode
     run_uuid: np.ndarray | None  # (N,) object; None in hybrid mode
+    # Hit-only metadata (never filtered on), held so resident-mode queries
+    # build hits without any dataset metadata fetch; None in hybrid mode.
+    segment_id: list | None  # len N, str
+    chunk_end_unix: list | None  # len N, int or None
     row_ids: np.ndarray | None  # (N,) int64 ascending; None in resident mode
 
 
@@ -209,19 +279,20 @@ def _load_resident_corpus(
         return _ResidentCorpus(
             corpus_i8=corpus_i8, pca=pca, scale=scale,
             eps=eps_bound.eps_cauchy_schwarz(scale),
-            vehicle=None, chunk_start_unix=None, run_uuid=None, row_ids=row_ids,
+            vehicle=None, chunk_start_unix=None, run_uuid=None,
+            segment_id=None, chunk_end_unix=None, row_ids=row_ids,
         )
     i8_table = dataset.to_table(columns=[lance_writer.EMBEDDING_I8_COLUMN], scan_in_order=True)
     corpus_i8 = _fixed_size_list_matrix(i8_table, lance_writer.EMBEDDING_I8_COLUMN, np.int8)
-    meta_table = dataset.to_table(
-        columns=["vehicle", "chunk_start_unix", "run_uuid"], scan_in_order=True
-    )
+    meta_table = dataset.to_table(columns=list(_METADATA_COLUMNS), scan_in_order=True)
     return _ResidentCorpus(
         corpus_i8=corpus_i8, pca=pca, scale=scale,
         eps=eps_bound.eps_cauchy_schwarz(scale),
         vehicle=np.array(meta_table.column("vehicle").to_pylist()),
         chunk_start_unix=np.array(meta_table.column("chunk_start_unix").to_pylist()),
         run_uuid=np.array(meta_table.column("run_uuid").to_pylist()),
+        segment_id=meta_table.column("segment_id").to_pylist(),
+        chunk_end_unix=meta_table.column("chunk_end_unix").to_pylist(),
         row_ids=None,
     )
 
@@ -397,18 +468,34 @@ def _search_resident(
         above_idx = sub_idx[above_pos]  # canonical ids for take()/metadata/row_id
         band_idx = sub_idx[band_pos]
 
-    # Exact re-rank via take() on vector_fp -- 1 IOP/row, never a full column
-    # read. ABOVE and BAND are each typically a tiny fraction of the corpus
-    # for a selective query, so this is bounded by the match count, not
-    # corpus size (a broad/low-tau query can still make this large; this
-    # module does not attempt to cap refine cost).
+    # ONE row retrieval per query. `rows_needed` is every row that needs
+    # anything from the dataset: BAND always needs `vector_fp` for the exact
+    # re-rank; ABOVE needs it only in the exact path; metadata rides along in
+    # hybrid mode (resident mode holds it in memory). `_fetch_rows` picks
+    # point-take vs one contiguous window scan by predicted cost -- a
+    # broad-tau BAND is fetched as a single range read instead of thousands
+    # of per-row range-GETs. Refine cost is bounded by the needed-row count
+    # (a broad/low-tau query can still make this large; this module does not
+    # attempt to cap it).
+    meta_resident = resident.segment_id is not None
+    if fast_curation and meta_resident:
+        rows_needed = band_idx
+    else:
+        rows_needed = np.union1d(above_idx, band_idx)
+    fetch_columns = [lance_writer.VECTOR_FP_COLUMN] + (
+        [] if meta_resident else list(_METADATA_COLUMNS)
+    )
+    fetched = _fetch_rows(dataset, rows_needed, fetch_columns) if rows_needed.size else None
+
     def _exact_scores(idx: np.ndarray) -> np.ndarray:
         if idx.size == 0:
             return np.empty(0, dtype=np.float64)
-        rows = dataset.take(idx.tolist(), columns=[lance_writer.VECTOR_FP_COLUMN])
-        fp = _fixed_size_list_matrix(rows, lance_writer.VECTOR_FP_COLUMN, np.float32)
+        sel = np.searchsorted(rows_needed, idx)
+        fp = _fixed_size_list_matrix(
+            fetched.take(sel), lance_writer.VECTOR_FP_COLUMN, np.float32
+        )
         # Accumulate in float64 without materializing a float64 copy of the
-        # take() result. Reading the column as float64 instead costs more in
+        # fetched rows. Reading the column as float64 instead costs more in
         # the upcast than the dot product itself, and dominates this stage
         # once a query matches thousands of rows; `dtype` keeps the
         # accumulator at full precision, so scores are unchanged.
@@ -416,7 +503,7 @@ def _search_resident(
 
     if fast_curation:
         # ABOVE rows are provable members (screen - eps >= tau): accept the
-        # int8 screening score as a bounded approximation, no take() re-rank.
+        # int8 screening score as a bounded approximation, no exact re-rank.
         above_scores = screening_scores[above_pos].astype(np.float64)
         above_kind = "bounded_approx"
         above_bound = eps
@@ -446,8 +533,20 @@ def _search_resident(
     if all_idx.size == 0:
         return []
 
-    meta_rows = dataset.take(all_idx.tolist(), columns=list(_METADATA_COLUMNS))
-    meta = {name: meta_rows.column(name).to_pylist() for name in _METADATA_COLUMNS}
+    if meta_resident:
+        meta = {
+            "run_uuid": [resident.run_uuid[i] for i in all_idx],
+            "segment_id": [resident.segment_id[i] for i in all_idx],
+            "chunk_start_unix": [int(resident.chunk_start_unix[i]) for i in all_idx],
+            "chunk_end_unix": [resident.chunk_end_unix[i] for i in all_idx],
+            "vehicle": [resident.vehicle[i] for i in all_idx],
+        }
+    else:
+        # Hit rows are a subset of `rows_needed` (ABOVE ∪ BAND before the tau
+        # filter), so metadata comes from the same fetched table.
+        hit_sel = np.searchsorted(rows_needed, all_idx)
+        hit_rows = fetched.take(hit_sel)
+        meta = {name: hit_rows.column(name).to_pylist() for name in _METADATA_COLUMNS}
     return [
         ThresholdHit(
             row_id=int(all_idx[i]),
@@ -528,9 +627,10 @@ class ThresholdCorpus:
 
     `prefilter_mode` selects how filters narrow the resident screen:
 
-    - ``"resident"`` (default): decode the metadata columns (vehicle,
-      chunk_start_unix, run_uuid) resident and build a dense boolean mask per
-      query. The simplest path; holds the metadata arrays in memory.
+    - ``"resident"`` (default): decode all metadata columns resident and
+      build a dense boolean mask per query from the filterable ones. The
+      simplest path; holds the metadata arrays in memory, so hits are built
+      without any per-query metadata fetch.
     - ``"hybrid"``: push the filter predicate to Lance's scalar indexes
       (BTREE/BITMAP), receive the matching row ids, and map them to positions
       into the already-resident int8 screen. Drops the metadata arrays (saves

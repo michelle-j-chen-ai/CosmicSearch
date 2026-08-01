@@ -565,6 +565,12 @@ def run(
         query, pca, pca_ref_scores, taus, filters, repeats=repeats,
     )
 
+    def _list_mb(lst):
+        if not lst:
+            return 0.0
+        # approximate: Python list of str/int overhead + content
+        return sum(sys.getsizeof(x) for x in lst) / 1e6
+
     # --- memory component breakdown ---
     r = threshold_corpus._resident
     threshold_mem = {
@@ -574,14 +580,10 @@ def run(
         "filter_vehicle_mb": r.vehicle.nbytes / 1e6,
         "filter_chunk_start_mb": r.chunk_start_unix.nbytes / 1e6,
         "filter_run_uuid_mb": r.run_uuid.nbytes / 1e6,
+        "meta_segment_id_mb": _list_mb(r.segment_id),
+        "meta_chunk_end_mb": _list_mb(r.chunk_end_unix),
     }
     threshold_mem["total_mb"] = sum(threshold_mem.values())
-
-    def _list_mb(lst):
-        if not lst:
-            return 0.0
-        # approximate: Python list of str/int overhead + content
-        return sum(sys.getsizeof(x) for x in lst) / 1e6
 
     master_mem = {
         "matrix_fp32_mb": master_corpus.matrix.nbytes / 1e6,
