@@ -838,6 +838,7 @@ def test_window_scan_arm_returns_identical_hits(tmp_path: Path, monkeypatch) -> 
             records: list = []
             originals = _install_fetch_spy(records)
             monkeypatch.setattr(ts, "_TAKE_FLOOR_S", 1e9)
+            monkeypatch.setattr(ts, "_LOCAL_TAKE_FLOOR_S", 1e9)
             try:
                 forced = corpus.threshold_search(query, tau, fast_curation=fast)
             finally:

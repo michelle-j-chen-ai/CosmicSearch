@@ -200,12 +200,18 @@ def _load_threshold_corpus(threshold_uri: str) -> ts.ThresholdCorpus:
 
 
 def _threshold_dataset(threshold_uri: str) -> lance.LanceDataset:
-    """A dataset handle for the threshold corpus -- direct S3 for s3:// URIs."""
+    """A dataset handle for the threshold corpus.
+
+    s3:// URIs go through the local corpus cache (download once, serve from
+    local disk) -- the same path `search_engine.load_threshold_corpus` uses,
+    so the bench measures the production serving shape: hydrate and every
+    per-query retrieval read the cached local dataset.
+    """
     if threshold_uri.startswith("s3://"):
-        return lance.dataset(
-            threshold_uri,
-            storage_options=search_engine.oci_s3.lance_storage_options(),
+        local_dir = search_engine.local_cache.ensure_corpus_local(
+            threshold_uri, search_engine.oci_s3.s3_client()
         )
+        return lance.dataset(str(local_dir))
     return lance.dataset(threshold_uri)
 
 

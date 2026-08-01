@@ -81,20 +81,30 @@ _METADATA_COLUMNS = ("run_uuid", "segment_id", "chunk_start_unix", "chunk_end_un
 # Tolerance for treating a model-space query as unit-norm (see _assert_unit_norm).
 _UNIT_NORM_TOLERANCE = 1e-3
 
-# Object-storage cost model for `_fetch_rows`: choose between point `take()`
-# and one contiguous range scan by predicted latency. Constants measured
-# against OCI S3 (LANCE_IO_THREADS=64): an isolated take costs a ~0.33s
-# request floor plus ~0.5ms/row until the provider's throttle onset
-# (observed between ~0.5k and ~2.6k range-GETs), beyond which sustained
-# takes degrade to ~450 rows/s; a range scan streams at ~83 MB/s after a
-# ~0.35s floor. On local storage both arms are cheap, so miscalibration
-# there is harmless.
+# Cost model for `_fetch_rows`: choose between point `take()` and one
+# contiguous range scan by predicted latency, with per-substrate constants
+# picked by the dataset's URI scheme.
+#
+# Object storage (measured against OCI S3, LANCE_IO_THREADS=64): an isolated
+# take costs a ~0.33s request floor plus ~0.5ms/row until the provider's
+# throttle onset (observed between ~0.5k and ~2.6k range-GETs), beyond which
+# sustained takes degrade to ~450 rows/s; a range scan streams at ~83 MB/s
+# after a ~0.35s floor.
 _TAKE_FLOOR_S = 0.33
 _TAKE_S_PER_ROW = 5e-4
 _TAKE_THROTTLE_ONSET_ROWS = 2_000
 _TAKE_THROTTLED_ROWS_PER_S = 450.0
 _SCAN_FLOOR_S = 0.35
 _SCAN_BYTES_PER_S = 83e6
+# Local storage: full-zip take() is ~1 IOP/row against the page cache with
+# no request throttle, so point reads stay cheaper than a covering scan
+# until the needed set is enormous.
+_LOCAL_TAKE_FLOOR_S = 2e-3
+_LOCAL_TAKE_S_PER_ROW = 2e-5
+_LOCAL_SCAN_FLOOR_S = 5e-3
+_LOCAL_SCAN_BYTES_PER_S = 1.5e9
+# URI schemes that mean object storage; anything else is a local path.
+_REMOTE_SCHEMES = ("s3://", "gs://", "az://")
 # On-wire row-size estimates (fp32-256 FSL values + scalar metadata).
 _VECTOR_FP_ROW_BYTES = 1028
 _METADATA_ROW_BYTES = 120
@@ -135,15 +145,19 @@ def _fixed_size_list_matrix(table: object, column: str, dtype: np.dtype) -> np.n
     return flat.reshape(n, d)
 
 
-def _predicted_take_s(k: int) -> float:
+def _predicted_take_s(k: int, remote: bool) -> float:
     """Modeled latency of `dataset.take` for `k` rows (see constants above)."""
+    if not remote:
+        return _LOCAL_TAKE_FLOOR_S + k * _LOCAL_TAKE_S_PER_ROW
     if k <= _TAKE_THROTTLE_ONSET_ROWS:
         return _TAKE_FLOOR_S + k * _TAKE_S_PER_ROW
     return k / _TAKE_THROTTLED_ROWS_PER_S
 
 
-def _predicted_scan_s(window_rows: int, row_bytes: int) -> float:
+def _predicted_scan_s(window_rows: int, row_bytes: int, remote: bool) -> float:
     """Modeled latency of one contiguous `window_rows`-row range scan."""
+    if not remote:
+        return _LOCAL_SCAN_FLOOR_S + window_rows * row_bytes / _LOCAL_SCAN_BYTES_PER_S
     return _SCAN_FLOOR_S + window_rows * row_bytes / _SCAN_BYTES_PER_S
 
 
@@ -163,7 +177,8 @@ def _fetch_rows(dataset: lance.LanceDataset, idx: np.ndarray, columns: list) -> 
     row_bytes = _VECTOR_FP_ROW_BYTES + (
         _METADATA_ROW_BYTES if len(columns) > 1 else 0
     )
-    if _predicted_take_s(idx.size) <= _predicted_scan_s(hi - lo, row_bytes):
+    remote = dataset.uri.startswith(_REMOTE_SCHEMES)
+    if _predicted_take_s(idx.size, remote) <= _predicted_scan_s(hi - lo, row_bytes, remote):
         return dataset.take(idx.tolist(), columns=columns)
     window = dataset.scanner(
         columns=columns, offset=lo, limit=hi - lo, scan_in_order=True
