@@ -25,10 +25,12 @@ the slice builder. ``vehicle`` is not present in the black-dwarf source (neither
 the content-hash shard path nor ``metadata_json`` carries it), so it is left null
 here; recovering it is an Ursa ``run_uuid`` join, a follow-up.
 
-NOTE on scale: ``lance_writer.build_dataset`` assembles and sorts the whole table
-in RAM (``vector_fp`` alone is ~35 GB at 34.4M rows). Validate on a slice on a
-normal box; the full corpus needs a high-memory node (or a chunked-write variant
-of build_dataset).
+NOTE on memory: ``lance_writer.build_dataset`` assembles and sorts the whole table
+in RAM (``vector_fp`` alone is ~35 GB at 34.4M rows), so it does not fit the full
+corpus on a normal box. This module instead uses ``build_dataset_chunked`` below,
+which writes the identical exact-threshold layout in sorted blocks (peak RAM ~1.5
+GB) -- verified equivalent to ``build_dataset`` on a slice -- so the full corpus
+builds on an ordinary node and writes local or s3:// directly.
 
 USAGE::
 
@@ -212,32 +214,63 @@ def main() -> None:
     write_artifacts(workdir, basis, scale, proj, cids, ruuids, starts)
     print(f"artifacts written in {time.time() - t0:.1f}s; building dataset...", flush=True)
 
-    # build_dataset writes/compacts/indexes a LOCAL dataset (no storage_options).
-    # For an s3:// dest, build locally then upload the dataset directory.
-    if args.dest.startswith("s3://"):
-        local = str(workdir / "_dataset" / "corpus.lance")
-        lance_writer.build_dataset(workdir, local)
-        print(f"built local dataset {local}; uploading to {args.dest}...", flush=True)
-        _upload_dir(local, args.dest)
-    else:
-        lance_writer.build_dataset(workdir, args.dest)
+    so_out = so if args.dest.startswith("s3://") else None
+    build_dataset_chunked(workdir, args.dest, so_out)
     print(f"threshold dataset built at {args.dest} in {time.time() - t0:.1f}s", flush=True)
 
 
-def _upload_dir(local_dir: str, dest_uri: str) -> None:
-    """Sync a local Lance dataset directory up to an s3:// dest (OCI endpoint)."""
-    import subprocess
+def build_dataset_chunked(artifact_dir, out_uri, storage_options, block=1_000_000):
+    """Memory-safe equivalent of lance_writer.build_dataset for the full corpus.
 
-    env = {
-        **os.environ,
-        "AWS_ENDPOINT_URL_S3": ENDPOINT,
-        "AWS_DEFAULT_REGION": REGION,
-        "AWS_REQUEST_CHECKSUM_CALCULATION": "WHEN_REQUIRED",
+    ``build_dataset`` assembles and sorts the whole table in RAM (``vector_fp``
+    is ~35 GB at 34.4M rows). This writes the identical exact-threshold layout in
+    sorted blocks: argsort ``chunk_start_unix`` once (int64, ~1 GB), then for each
+    block gather its rows from the on-disk memmaps and append. Peak RAM is one
+    block (~1.5 GB). Produces the same schema (PCA basis/scales in schema
+    metadata), the same physical sort, and the same four scalar indexes; writes a
+    local path or s3:// directly (no staging copy).
+    """
+    artifact_dir = Path(artifact_dir)
+    pca = np.load(artifact_dir / lance_writer.PCA_FILE).astype("float32")
+    scale = np.load(artifact_dir / lance_writer.SCALE_FILE).astype("float32")
+    corpus_i8 = np.load(artifact_dir / lance_writer.CORPUS_INT8_FILE, mmap_mode="r")
+    N = corpus_i8.shape[0]
+    proj_path = artifact_dir / lance_writer.PRE_QUANT_FP32_FILE
+    vecfp = np.load(proj_path, mmap_mode="r") if proj_path.exists() else None
+    scalars = lance_writer._read_metadata_table(artifact_dir / lance_writer.METADATA_FILE, N)
+    # Physical sort key matches build_table: (chunk_start_unix, vehicle). vehicle
+    # is null here, so chunk_start_unix alone fixes the order.
+    order = np.argsort(scalars.column("chunk_start_unix").to_numpy(), kind="stable")
+    schema_meta = {
+        lance_writer.META_KEY_PCA_COMPONENTS: lance_writer._encode_array(pca),
+        lance_writer.META_KEY_QUANT_SCALES: lance_writer._encode_array(scale),
     }
-    subprocess.run(
-        ["aws", "s3", "sync", local_dir.rstrip("/"), dest_uri.rstrip("/")],
-        env=env, check=True,
-    )
+    for s in range(0, N, block):
+        idx = order[s:s + block]
+        sc = scalars.take(pa.array(idx))
+        i8 = np.ascontiguousarray(corpus_i8[idx])
+        fp = (np.ascontiguousarray(vecfp[idx]) if vecfp is not None
+              else i8.astype("float32") * (scale / np.float32(127.0)))
+        tbl = sc.append_column(
+            lance_writer.EMBEDDING_I8_COLUMN, lance_writer._fixed_size_list(i8, pa.int8())
+        ).append_column(
+            lance_writer.VECTOR_FP_COLUMN, lance_writer._fixed_size_list(fp, pa.float32())
+        )
+        tbl = tbl.replace_schema_metadata({**(tbl.schema.metadata or {}), **schema_meta})
+        lance.write_dataset(
+            tbl, out_uri,
+            mode="create" if s == 0 else "append",
+            data_storage_version=lance_writer.DATA_STORAGE_VERSION,
+            max_rows_per_file=block,
+            storage_options=storage_options,
+        )
+        print(f"  wrote sorted block {s:,}..{min(s + block, N):,}", flush=True)
+    ds = lance.dataset(out_uri, storage_options=storage_options)
+    ds.create_scalar_index("chunk_start_unix", "BTREE")
+    ds.create_scalar_index("segment_id", "BTREE")
+    ds.create_scalar_index("vehicle", "BITMAP")
+    ds.create_scalar_index("run_uuid", "BTREE")
+    return ds
 
 
 if __name__ == "__main__":
