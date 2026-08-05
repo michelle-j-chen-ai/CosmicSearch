@@ -198,6 +198,12 @@ def main() -> None:
     if "sibogeng/" in args.dest:
         raise SystemExit("refusing to write under sibogeng/ (prod source namespace)")
 
+    # Scalar-index creation sorts each column through a fixed ~150 MB DataFusion
+    # pool whose merge phase cannot spill, so a BTREE over tens of millions of
+    # strings (segment_id, run_uuid) exhausts it regardless of free RAM. Bypass
+    # spilling -> in-memory sort, which the host RAM covers. Tested on pylance 9.0.
+    os.environ.setdefault("LANCE_BYPASS_SPILLING", "true")
+
     so = storage_options()
     workdir = Path(args.workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -266,10 +272,12 @@ def build_dataset_chunked(artifact_dir, out_uri, storage_options, block=1_000_00
         )
         print(f"  wrote sorted block {s:,}..{min(s + block, N):,}", flush=True)
     ds = lance.dataset(out_uri, storage_options=storage_options)
-    ds.create_scalar_index("chunk_start_unix", "BTREE")
-    ds.create_scalar_index("segment_id", "BTREE")
-    ds.create_scalar_index("vehicle", "BITMAP")
-    ds.create_scalar_index("run_uuid", "BTREE")
+    # Idempotent: skip indexes already built (so a partial failure re-runs cleanly).
+    have = {f for i in ds.list_indices() for f in i.get("fields", [])}
+    for col, typ in (("chunk_start_unix", "BTREE"), ("segment_id", "BTREE"),
+                     ("vehicle", "BITMAP"), ("run_uuid", "BTREE")):
+        if col not in have:
+            ds.create_scalar_index(col, typ)
     return ds
 
 
