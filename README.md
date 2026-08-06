@@ -192,8 +192,8 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 
 A separate Cloud Run service, **[vlm-embedding-atlas](https://vlm-embedding-atlas.experimental.apps.applied.dev/)**,
 renders the same black-dwarf corpus as a 2D map instead of a ranked list. Source
-lives in core-stack at
-`onroad/tools/offboard/common/auto_labeling/vlm/embedding_atlas/`.
+is in [`embedding_atlas/`](embedding_atlas/) -- a self-contained app with its own
+`Dockerfile` and `project.toml`, built and deployed independently of NLS.
 
 Where NLS answers "which clips match this query", the atlas answers "what is in
 this corpus and how is it organized". Click a point to play the clip and see its
