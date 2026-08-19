@@ -1905,39 +1905,15 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
     return {"tag": tag, "dim": len(vec)}
 
 
-def _scan_idem_key(
-    req: "SegmentScanRequest", tags: list[str], model_uri: str, scan_uri: str,
-    client_key: str = "",
-) -> str:
-    """Stable dedup key for a segment-scan launch.
+def _scan_idem_key(client_key: str) -> str:
+    """Dedup key for a segment-scan launch, derived from a client Idempotency-Key.
 
-    A client-supplied Idempotency-Key wins (lets a Spark job coalesce its own
-    retries); otherwise hash the canonicalized, output-determining request fields
-    so two identical scans share one workload. Excludes purely cosmetic fields
-    (segment_set_name) that don't change the produced Lance."""
-    if client_key.strip():
-        return hashlib.sha256(("ck:" + client_key.strip()).encode()).hexdigest()
-    canon = json.dumps(
-        {
-            "tags": sorted(tags),
-            "thresholds": {k: float(v) for k, v in sorted((req.thresholds or {}).items())},
-            "default_threshold": float(req.default_threshold),
-            "model_uri": model_uri or "",
-            "scan_embeddings_uri": scan_uri or "",
-            "filter_lance_uri": req.filter_lance_uri or "",
-            "from": req.from_date or "",
-            "to": req.to_date or "",
-            "segment_set_uuid": req.segment_set_uuid or "",
-            "vehicle": req.vehicle or "",
-            "drive_id": req.drive_id or "",
-            "merge_intervals": bool(req.merge_intervals),
-            "register_segset": bool(req.create_segment_set),
-            "top_k": int(req.top_k) if req.top_k else 0,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canon.encode()).hexdigest()
+    Dedup is opt-in (see launch_segment_scan): only a caller that deliberately sends
+    the header gets coalescing, so it alone decides which submissions are "the same
+    scan". Namespaced before hashing so the key can never collide with an unrelated
+    digest stored in the same column.
+    """
+    return hashlib.sha256(("ck:" + client_key.strip()).encode()).hexdigest()
 
 
 class _SingleFlightCall:
@@ -2018,13 +1994,22 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
     except (ValueError, botocore.exceptions.ClientError) as exc:
         raise HTTPException(400, f"could not load corpus: {exc}")
 
-    # Server-side launch dedup. Identical concurrent requests -- e.g. a Spark stage
-    # firing the same scan from every executor -- must coalesce to ONE Lilypad
-    # workload. Prefer a client-supplied Idempotency-Key header (so a job's retries
-    # across stages coalesce too), else hash the output-determining request fields.
-    # A deterministic scan_id from the key keeps the output Lance path stable.
+    # Launch dedup is OPT-IN, via an Idempotency-Key header. A caller that fans the
+    # same scan out from many workers (e.g. a Spark stage) sends one key and its
+    # duplicates coalesce to a single Lilypad workload.
+    #
+    # Without that header every request launches. Relaunching a tag must always be
+    # possible: hashing the request fields instead made an identical resubmit a
+    # permanent dedup hit, and because the FAILED check below only frees the key for
+    # workloads that did NOT succeed, a scan that SUCCEEDED with 0 segments could
+    # never be rerun -- the caller just got the same empty result back, reported as a
+    # fresh launch. The random key also keeps each run's output_dir/scan_id distinct,
+    # so concurrent reruns cannot overwrite one another's segments.lance.
     client_key = request.headers.get("Idempotency-Key", "")
-    idem = _scan_idem_key(req, tags, cfg.model_artifact_uri, cfg.scan_embeddings_uri, client_key)
+    if client_key.strip():
+        idem = _scan_idem_key(client_key)
+    else:
+        idem = uuid.uuid4().hex + uuid.uuid4().hex
     scan_id = idem[:32]
     output_dir = f"s3://{cfg.scan_output_bucket}/{cfg.scan_output_prefix.rstrip('/')}"
     user_email = _current_user(request)

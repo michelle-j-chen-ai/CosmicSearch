@@ -978,9 +978,12 @@ async function launchScan() {
       ...(topK ? { top_k: topK } : {}),
     }) });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
-    const { execution_id, url } = await r.json();
-    js.innerHTML = `<span>job <b><a href="${url}" target="_blank" rel="noopener">${escapeHtml(execution_id)}</a></b> launched</span><span>polling…</span>`;
-    showToast("Scan launched — see Recent scans");
+    const { execution_id, url, deduplicated } = await r.json();
+    // A dedup hit launches nothing and returns an existing workload; say so rather
+    // than reporting it as a fresh launch (only possible with an Idempotency-Key).
+    const verb = deduplicated ? "reused (nothing relaunched)" : "launched";
+    js.innerHTML = `<span>job <b><a href="${url}" target="_blank" rel="noopener">${escapeHtml(execution_id)}</a></b> ${verb}</span><span>polling…</span>`;
+    showToast(deduplicated ? "Reused an existing scan — see Recent scans" : "Scan launched — see Recent scans");
     loadScanJobs();
     pollScan(execution_id, url);
   } catch (e) { js.innerHTML = `<span style="color:var(--neg)">launch failed: ${escapeHtml(e.message)}</span>`; }
