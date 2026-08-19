@@ -1,4 +1,10 @@
 name = "vlm-nls-search"
+# Who can reach the app through IAP. The FTE group keeps the existing employee
+# audience; the contractor group is added so platform contractors can reach it.
+allowed_usergroups = [
+  "okta-team-applied-fte@applied.co",
+  "apps-platform-contractor-deployers@applied.co",
+]
 enable_filestore = false
 # GCS-fuse mount at /gcs backs the Lance + model download cache, so the corpus
 # is downloaded once ever and shared across users and instances (not re-paid
