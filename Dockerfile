@@ -28,24 +28,14 @@ FROM deps AS runtime
 # import-closure it actually needs is already covered by requirements.lock. Its bundled
 # `adp.services.lilypad` protos merge with the DORA `adp` vendored below (namespace pkgs).
 COPY vendor ./vendor
+COPY scripts/retag_pure_wheel.py ./scripts/
 # The vendored wheel is tagged cp310-cp310-linux_x86_64, so an installer on this
-# 3.13 base rejects it on the tag alone. It ships NO compiled extensions -- every
-# entry sits under `.data/purelib` -- so it is pure Python and imports unmodified
-# on 3.13. Retag it to py3-none-any and install that; the payload is copied byte
-# for byte, only the WHEEL tag line differs.
-RUN python - <<'RETAG' && uv pip install --no-deps ./vendor/lilypad_py-2.26.0-py3-none-any.whl
-import glob, zipfile
-src = glob.glob("vendor/lilypad_py-*-cp*.whl")[0]
-zin = zipfile.ZipFile(src)
-with zipfile.ZipFile("vendor/lilypad_py-2.26.0-py3-none-any.whl", "w",
-                     zipfile.ZIP_DEFLATED) as zout:
-    for info in zin.infolist():
-        data = zin.read(info.filename)
-        if info.filename.endswith(".dist-info/WHEEL"):
-            data = (b"Wheel-Version: 1.0\nGenerator: retag\n"
-                    b"Root-Is-Purelib: false\nTag: py3-none-any\n")
-        zout.writestr(info, data)
-RETAG
+# 3.13 base rejects it on the tag alone. It ships no compiled extensions, so it
+# is pure Python and imports unmodified; the script retags it py3-none-any and
+# refuses to do so if it ever does gain an extension module. Kept as a script
+# rather than an inline heredoc so the build does not depend on BuildKit.
+RUN python scripts/retag_pure_wheel.py "vendor/lilypad_py-*-cp*.whl" \
+    && uv pip install --no-deps ./vendor/lilypad_py-2.26.0-py3-none-any.whl
 
 # DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
 # image builds on a plain Cloud Build with NO internal pip index / BuildKit
