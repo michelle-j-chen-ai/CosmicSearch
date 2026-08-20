@@ -534,6 +534,38 @@ function _renderFullPage(page) {
   renderQueryStrip(buf.data);
   renderGrid();
   renderPager();
+  rescoreVisible();
+}
+
+// The page renders from quantized scores, which are bounded but not comparable
+// to thresholds calibrated on the float corpus. Fetch the real 768-d cosine for
+// the rows on screen and swap them in. Fired after render, never awaited: it is
+// one S3 round trip with a ~1.65s floor, so blocking on it would undo the 190ms
+// search for a number the user has not looked at yet.
+async function rescoreVisible() {
+  const rows = (state.hits || []).map((h) => h.row).filter((r) => r != null && r >= 0);
+  if (!rows.length || !state.query) return;
+  let data;
+  try {
+    data = await fetch("/api/full_rescore", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: state.query, rows }),
+    }).then((r) => (r.ok ? r.json() : null));
+  } catch (e) { return; }
+  if (!data || !data.scores) return;
+  const byRow = new Map(data.scores.map((s) => [s.row, s.score]));
+  let changed = 0;
+  for (const h of state.hits) {
+    const exact = byRow.get(h.row);
+    if (exact != null && exact !== h.score) { h.score = exact; changed++; }
+    if (exact != null) h.score_kind = "exact";
+  }
+  if (!changed) return;
+  // Exact scores can reorder rows that sat within the error bound of each other.
+  state.hits.sort((a, b) => b.score - a.score);
+  renderGrid();
+  const el = $("resultCountText");
+  if (el) el.textContent = el.textContent.replace(/\(approximate\)/, "(exact)");
 }
 async function _issue(endpoint, body) {
   const seq = ++_issueSeq;
