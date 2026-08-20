@@ -497,12 +497,27 @@ function _renderFullPage(page) {
   state.label = buf.data.label || state.query;
   state.scoreHi = buf.data.score_hi || 0.4;
   $("vectorChip").textContent = `vector: text "${state.query}"`;
+  // State plainly what was searched and what the filters did. "full corpus" is
+  // otherwise an unverifiable claim, and a filter that silently matched nothing
+  // is indistinguishable from a filter that was never applied -- which is the
+  // failure that went unnoticed for a week.
+  const d = buf.data;
+  const f = d.filters_applied || {};
+  const active = Object.entries(f).filter(([, v]) => v && v.length).map(([k, v]) => `${k}=${v}`);
+  const filtLine = active.length
+    ? ` · filters ${active.join(", ")} narrowed to ${fmtInt(d.candidates_after_filters)}`
+    : " · no filters";
   $("resultCountText").textContent = buf.hits.length
-    ? `top ${fmtInt(buf.hits.length)} of ${fmtInt(buf.data.candidates || buf.data.total)} matching · `
-      + `${fmtInt(buf.data.num_rows_searched)} clips searched in ${buf.data.elapsed_ms} ms · `
-      + `similarity ${buf.data.score_lo}–${buf.data.score_hi} (approximate)`
-    : "no clips match the current query + filters";
-  $("gridStatus").textContent = buf.hits.length ? "" : "Try widening the date range or filters.";
+    ? `searched ALL ${fmtInt(d.num_rows_searched)} clips in ${d.elapsed_ms} ms${filtLine}`
+      + ` · showing top ${fmtInt(buf.hits.length)}`
+      + ` · similarity ${d.score_lo}–${d.score_hi} ±${d.score_error_bound} (approximate)`
+    : `searched ALL ${fmtInt(d.num_rows_searched)} clips${filtLine} · nothing matched`;
+  const prov = d.corpus_loaded_utc
+    ? `corpus ${String(d.corpus_uri || "").split("/").slice(-2).join("/")}`
+      + (d.corpus_version != null ? ` v${d.corpus_version}` : "")
+      + ` · ${fmtInt(d.num_rows_searched)} rows · loaded ${d.corpus_loaded_utc}`
+    : "";
+  $("gridStatus").textContent = buf.hits.length ? prov : "Try widening the date range or filters. " + prov;
   renderQueryStrip(buf.data);
   renderGrid();
   renderPager();

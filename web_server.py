@@ -4066,5 +4066,18 @@ def full_search(req: FullSearchRequest) -> dict:
         "funnel": {"corpus_total": corpus.num_rows},
         "full_corpus": True,
         "score_kind": "bounded_approx",
+        # Provenance, so the UI can state what was actually searched instead of
+        # asking the user to trust that "full corpus" means the whole table.
         "num_rows_searched": corpus.num_rows,
+        "candidates_after_filters": candidates,
+        "score_error_bound": round(float(hits[0].score_error_bound), 4) if hits else 0.0,
+        "corpus_uri": corpus.corpus_uri,
+        "corpus_version": corpus.dataset_version,
+        "corpus_loaded_utc": _utc(int(corpus.loaded_at)) if corpus.loaded_at else "",
+        "filters_applied": {
+            "vehicle": sorted(_parse_vehicles(req.vehicle)) or None,
+            "drive_id": sorted(_parse_drive_ids(req.drive_id)) or None,
+            "from_date": req.from_date or None,
+            "to_date": req.to_date or None,
+        },
     }
