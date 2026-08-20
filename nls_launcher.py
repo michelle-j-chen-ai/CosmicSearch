@@ -56,7 +56,7 @@ _SEGMENT_FN = "tools.offboard.common.auto_labeling.vlm.nls_scan.nls_segment_scan
 # and was accepted by the backend until it began enforcing the five-part shape,
 # at which point every launch failed with INVALID_ARGUMENT and the app returned
 # 502 with no server-side log of why.
-_MODEL_IDENTIFIER = "vlm_embedding.inference.cosmos_embed1_448p.nls_segment_scan.v1"
+_MODEL_IDENTIFIER = "vlm_embedding.search.black-dwarf.default.v1"
 
 
 class LauncherUnavailable(RuntimeError):
