@@ -149,6 +149,15 @@ def _warm_engine() -> None:
             # A bad/slow default corpus must not wedge the app -- users can still
             # load another corpus by URI now that the model is up.
             LOGGER.warning("default corpus pre-warm failed: %s", exc)
+        # Full-corpus search is the default, so start its load here rather than
+        # waiting for someone to search: the read and decode take minutes, and
+        # paying that on a user's first query reads as a hang. Runs on its own
+        # thread and never gates readiness -- browse works throughout.
+        try:
+            _full_corpus_begin_load()
+            LOGGER.info("full corpus load started in the background")
+        except Exception as exc:  # noqa: BLE001 -- warm-up must not wedge startup
+            LOGGER.warning("full corpus pre-warm could not start: %s", exc)
         _state["ready"] = True
     except Exception as exc:  # noqa: BLE001 -- warmup must record failure, not vanish
         _state["load_error"] = str(exc)
