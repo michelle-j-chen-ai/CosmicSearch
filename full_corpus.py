@@ -20,9 +20,12 @@ it wrong.
 
 The consolidated table stores one column family per encoder
 (`embedding_i8_<model>`), so it can carry several models side by side; the
-active one is `CORPUS_MODEL`. The PCA basis + quantization scales live in the
-schema metadata of a sibling carrier table (`PCA_BASIS_URI`) rather than on the
-corpus itself, so they are read from there.
+active one is `CORPUS_MODEL`. Its PCA basis and quantization scales live on the
+FIELD metadata of that family's float column, alongside the encoder identity, so
+they are read from the corpus itself. A sibling table carries a copy, but two
+copies can drift: projecting a query through a basis that no longer matches the
+vectors it is scored against still returns a confident ranked list, just a
+meaningless one, and nothing errors.
 """
 
 from __future__ import annotations
@@ -44,6 +47,9 @@ LOGGER = logging.getLogger(__name__)
 CORPUS_TABLE_URI = (
     "s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/video_embeddings.lance"
 )
+# Kept for reference only. The basis is read from the corpus's own field
+# metadata; this sibling table holds a copy that is verified to match today but
+# is not the source of truth.
 PCA_BASIS_URI = (
     "s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/pca_basis.lance"
 )
@@ -78,6 +84,36 @@ def embedding_column(model: str = CORPUS_MODEL) -> str:
 
 def vector_fp_column(model: str = CORPUS_MODEL) -> str:
     return f"vector_fp_{model}"
+
+
+def _read_field_pca(
+    dataset: "lance.LanceDataset", model: str
+) -> "tuple[np.ndarray, np.ndarray, str]":
+    """(pca, scales, model_id) from the float column's FIELD metadata.
+
+    `lance_writer.read_pca_metadata` looks at SCHEMA-level metadata, where this
+    table carries only `embedding_dim`/`pca_dim`. The basis itself sits on the
+    field, which is the copy that travels with the vectors it describes, and it
+    brings the encoder identity with it -- so a corpus built by a different model
+    can be rejected rather than silently scored against.
+    """
+    column = vector_full_column(model)
+    field = dataset.schema.field(column)
+    meta = field.metadata or {}
+    missing = [
+        k.decode()
+        for k in (lance_writer.META_KEY_PCA_COMPONENTS, lance_writer.META_KEY_QUANT_SCALES)
+        if k not in meta
+    ]
+    if missing:
+        raise ValueError(
+            f"{column} field metadata is missing {missing}; the basis must travel "
+            "with the vectors it describes"
+        )
+    pca = lance_writer.decode_array(meta[lance_writer.META_KEY_PCA_COMPONENTS])
+    scale = lance_writer.decode_array(meta[lance_writer.META_KEY_QUANT_SCALES])
+    model_id = (meta.get(b"nls.model_id") or b"").decode()
+    return pca, scale, model_id
 
 
 def vector_full_column(model: str = CORPUS_MODEL) -> str:
@@ -158,6 +194,9 @@ class FullCorpus:
         # grows daily, so reopening it per request would let positions drift onto
         # different clips with nothing to signal it.
         self.dataset = None
+        # Encoder identity recorded next to the basis, so a mismatched corpus is
+        # detectable rather than assumed from a constant.
+        self.model_id = ""
 
     @property
     def num_rows(self) -> int:
@@ -431,9 +470,7 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
             f"{CORPUS_TABLE_URI} has no column {i8_col!r} "
             f"(available: {sorted(n for n in ds.schema.names if 'embedding' in n)})"
         )
-    pca, scale = lance_writer.read_pca_metadata(
-        lance.dataset(PCA_BASIS_URI, storage_options=so)
-    )
+    pca, scale, model_id = _read_field_pca(ds, model)
 
     # Decoded batch by batch into one preallocated array rather than via
     # to_table. Materializing the whole column as Arrow and then copying it to
@@ -508,6 +545,11 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     LOGGER.info("full corpus metadata: %d vehicles, %d runs, %d dates",
                 len(veh_uniques), len(run_uniques), len(dt_uniques))
     corpus = FullCorpus(corpus_i8, pca, scale, meta)
+    LOGGER.info(
+        "pca basis from %s field metadata: %s, encoder %s",
+        vector_full_column(model), "x".join(str(d) for d in pca.shape), model_id or "?",
+    )
+    corpus.model_id = model_id
     corpus.dataset = ds
     corpus.corpus_uri = CORPUS_TABLE_URI
     corpus.dataset_version = getattr(ds, "version", None)
