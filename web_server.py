@@ -2120,6 +2120,10 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
                 top_k=req.top_k,
             )
         except nls_launcher.LauncherUnavailable as exc:
+            # Logged as well as returned: the HTTPException body reaches the
+            # browser but never the service logs, so a launch failure was only
+            # diagnosable by asking the user to read their screen.
+            LOGGER.error("segment scan launch failed: %s", exc, exc_info=True)
             raise HTTPException(502, f"could not launch segment scan: {exc}")
         LOGGER.info(
             "launched per-segment scan %s for %d tags (%d reused, %d encoded)",
