@@ -3880,9 +3880,16 @@ def _full_corpus_begin_load() -> str:
     return "loading"
 
 
+# How deep full-corpus paging goes. Selection cost grows with depth, and a
+# ranked list is not a useful way to read past a few thousand rows -- narrow the
+# filters or use an export instead.
+_FULL_MAX_DEPTH = 5000
+
+
 class FullSearchRequest(BaseModel):
     query: str
     limit: int = 50
+    page: int = 0
     from_date: str | None = None
     to_date: str | None = None
     # Same comma/space-separated forms the resident search accepts. Unlike the
@@ -3930,6 +3937,15 @@ def full_search(req: FullSearchRequest) -> dict:
         raise HTTPException(400, "query must not be empty")
     if req.limit <= 0 or req.limit > 1000:
         raise HTTPException(400, "limit must be between 1 and 1000")
+    if req.page < 0:
+        raise HTTPException(400, "page must not be negative")
+    offset = req.page * req.limit
+    if offset + req.limit > _FULL_MAX_DEPTH:
+        raise HTTPException(
+            400,
+            f"full-corpus paging stops at {_FULL_MAX_DEPTH:,} results; "
+            "narrow the filters or export instead",
+        )
     if not _state.get("model_ready"):
         raise HTTPException(503, "model still loading")
 
@@ -3949,9 +3965,10 @@ def full_search(req: FullSearchRequest) -> dict:
         query, _state["processor"], _state["model"], _state["cfg"].device
     )
     t0 = time.perf_counter()
-    hits = corpus.search(
+    hits, candidates = corpus.search(
         vec,
         limit=req.limit,
+        offset=offset,
         vehicles=set(_parse_vehicles(req.vehicle)) or None,
         run_uuids=set(_parse_drive_ids(req.drive_id)) or None,
         date_range=(start_unix, end_unix) if (start_unix or end_unix) else None,
@@ -3987,8 +4004,12 @@ def full_search(req: FullSearchRequest) -> dict:
     ]
     return {
         "hits": payload,
-        "total": len(payload),
-        "page": 0,
+        # What the pager can reach, not the match count: every filtered row is
+        # ranked, but only the first _FULL_MAX_DEPTH are reachable by paging.
+        # `candidates` carries the real number.
+        "total": min(candidates, _FULL_MAX_DEPTH),
+        "candidates": candidates,
+        "page": req.page,
         "page_size": req.limit,
         "elapsed_ms": took_ms,
         "label": query,

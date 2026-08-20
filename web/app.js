@@ -286,7 +286,7 @@ async function runSearch(startOpts) {
   // different endpoint because that corpus is loaded on demand and has no paging
   // or refine; the response envelope is identical, so the grid is unchanged.
   if (_fullCorpusOn()) {
-    await _issueFullCorpus(q);
+    await _issueFullCorpus(q, (startOpts && startOpts.page) || 0);
     return;
   }
   await _issue("/api/search", { query: q, ...(startOpts || {}), ..._searchFilters() });
@@ -423,13 +423,15 @@ function wireFullCorpusToggles() {
   const sync = (from, to) => { if (from && to) from.addEventListener("change", () => { to.checked = from.checked; }); };
   sync(a, b); sync(b, a);
 }
-async function _issueFullCorpus(q) {
+async function _issueFullCorpus(q, page) {
   // The corpus is read and decoded on first use (minutes, ~12GB), so the server
   // answers 503 until it is resident. Kick the load, tell the user where it is
   // up to, and poll rather than leaving the grid on "Searching...".
   $("emptyState").style.display = "none";
   $("resultsState").style.display = "block";
   const status = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+  // Paging hits this same path; when the corpus is already resident the poll
+  // below is skipped and the request goes straight out.
   if (!status || status.status !== "ready") {
     await fetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
     $("gridStatus").textContent =
@@ -445,6 +447,7 @@ async function _issueFullCorpus(q) {
   }
   await _issue("/api/full_search", {
     query: q,
+    page: page || 0,
     limit: state.pageSize || 24,
     from_date: $("sf-dateFrom").value || null,
     to_date: $("sf-dateTo").value || null,
