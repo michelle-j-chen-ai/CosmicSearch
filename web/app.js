@@ -281,6 +281,13 @@ async function runSearch(startOpts) {
   if (!q) { showToast("Type a query first"); return; }
   $("searchInput2").value = q;
   state.query = q; state.mode = "search";
+  // Full-corpus mode ranks all ~34M clips instead of the loaded corpus. It is a
+  // different endpoint because that corpus is loaded on demand and has no paging
+  // or refine; the response envelope is identical, so the grid is unchanged.
+  if ($("fullCorpus") && $("fullCorpus").checked) {
+    await _issueFullCorpus(q);
+    return;
+  }
   await _issue("/api/search", { query: q, ...(startOpts || {}), ..._searchFilters() });
 }
 async function runRefine(startOpts) {
@@ -403,6 +410,35 @@ function reload(startOpts) {
   return runSearch(startOpts);
 }
 
+async function _issueFullCorpus(q) {
+  // The corpus is read and decoded on first use (minutes, ~12GB), so the server
+  // answers 503 until it is resident. Kick the load, tell the user where it is
+  // up to, and poll rather than leaving the grid on "Searching...".
+  $("emptyState").style.display = "none";
+  $("resultsState").style.display = "block";
+  const status = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+  if (!status || status.status !== "ready") {
+    await fetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
+    $("gridStatus").textContent =
+      "Loading the full corpus (first use, a few minutes) — this search will start automatically.";
+    for (let i = 0; i < 60; i++) {
+      await new Promise((res) => setTimeout(res, 10000));
+      const s = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+      if (!s) continue;
+      if (s.status === "error") { $("gridStatus").textContent = "Full corpus failed to load: " + s.error; return; }
+      if (s.status === "ready") break;
+      $("gridStatus").textContent = `Loading the full corpus… ${Math.round(s.elapsed_s || 0)}s`;
+    }
+  }
+  await _issue("/api/full_search", {
+    query: q,
+    limit: state.pageSize || 24,
+    from_date: $("sf-dateFrom").value || null,
+    to_date: $("sf-dateTo").value || null,
+    vehicle: _splitList($("sf-vehicle").value),
+    drive_id: _splitList($("sf-drive").value),
+  });
+}
 async function _issue(endpoint, body) {
   const seq = ++_issueSeq;
   $("emptyState").style.display = "none";
