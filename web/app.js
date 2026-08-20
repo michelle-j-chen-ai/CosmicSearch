@@ -418,12 +418,8 @@ function reload(startOpts) {
   return runSearch(startOpts);
 }
 
-// The toggle exists twice: once on the landing page and once in the results
-// toolbar, which does not exist until results are on screen. Either one counts,
-// and checking one updates the other so they never disagree.
 // Show the corpus the next search will actually use, not the resident one.
 async function refreshCorpusPill() {
-  if (!_fullCorpusOn()) return;
   let st = null;
   try { st = await fetch("/api/full_corpus_status").then((r) => r.json()); } catch (e) { return; }
   if (!st) return;
@@ -438,18 +434,11 @@ async function refreshCorpusPill() {
   }
 }
 
-function _fullCorpusOn() {
-  const a = $("fullCorpus"), b = $("fullCorpusHome");
-  return !!((a && a.checked) || (b && b.checked));
-}
-function wireFullCorpusToggles() {
-  const a = $("fullCorpus"), b = $("fullCorpusHome");
-  const sync = (from, to) => {
-    if (from && to) from.addEventListener("change", () => { to.checked = from.checked; refreshCorpusPill(); });
-  };
-  sync(a, b); sync(b, a);
-  refreshCorpusPill();
-}
+// Search always covers the whole corpus. There is no toggle: offering the ~2M
+// resident subset as a choice meant users could silently search 6% of the data
+// and read the result as complete.
+function _fullCorpusOn() { return true; }
+function wireFullCorpusToggles() { refreshCorpusPill(); }
 async function _issueFullCorpus(q, page) {
   // The corpus is read and decoded on first use (minutes, ~12GB), so the server
   // answers 503 until it is resident. Kick the load, tell the user where it is
