@@ -50,7 +50,13 @@ _SEGMENT_FN = "tools.offboard.common.auto_labeling.vlm.nls_scan.nls_segment_scan
 # Lilypad model identifier (mandatory: the backend rejects launches without one).
 # This CPU workload scores query embeddings against the precomputed VLM (Cosmos-Embed)
 # corpus, so it uses the `vlm_embedding` category.
-_MODEL_IDENTIFIER = "vlm_embedding"
+#
+# Must be the full <category>.<mode>.<model_id>.<variant>.<version>. The bare
+# category passed the SDK's client-side check (alphanumeric + `-_.`, <=100 chars)
+# and was accepted by the backend until it began enforcing the five-part shape,
+# at which point every launch failed with INVALID_ARGUMENT and the app returned
+# 502 with no server-side log of why.
+_MODEL_IDENTIFIER = "vlm_embedding.inference.cosmos_embed1_448p.nls_segment_scan.v1"
 
 
 class LauncherUnavailable(RuntimeError):
