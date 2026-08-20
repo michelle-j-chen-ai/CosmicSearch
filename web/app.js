@@ -72,6 +72,10 @@ function applyCorpus(c) {
   state.embeddingsUri = c.embeddings_uri;
   state.scoreHi = 0.4;
   $("corpusPill").innerHTML = `🗂 <b>${fmtInt(c.num_rows)} clips</b> · ${escapeHtml(c.model || "model")}`;
+  // The pill reported the resident browse corpus even while searches ran against
+  // the full one, so it read as though the app only held ~2M clips. Correct it
+  // whenever full-corpus mode is the active path.
+  refreshCorpusPill();
   if ($("embeddings-uri")) $("embeddings-uri").value = c.embeddings_uri || "";
   if ($("model-uri") && c.model_uri !== undefined) $("model-uri").value = c.model_uri || "";
   // Search filters track the LOADED (in-app browse) corpus -- you're searching it, so
@@ -417,14 +421,34 @@ function reload(startOpts) {
 // The toggle exists twice: once on the landing page and once in the results
 // toolbar, which does not exist until results are on screen. Either one counts,
 // and checking one updates the other so they never disagree.
+// Show the corpus the next search will actually use, not the resident one.
+async function refreshCorpusPill() {
+  if (!_fullCorpusOn()) return;
+  let st = null;
+  try { st = await fetch("/api/full_corpus_status").then((r) => r.json()); } catch (e) { return; }
+  if (!st) return;
+  const model = (state.corpus && state.corpus.model) || st.model || "model";
+  if (st.status === "ready" && st.num_rows) {
+    $("corpusPill").innerHTML = `🗂 <b>${fmtInt(st.num_rows)} clips</b> · full corpus · ${escapeHtml(model)}`;
+  } else if (st.status === "loading") {
+    $("corpusPill").innerHTML = `🗂 <b>full corpus loading…</b> ${Math.round(st.elapsed_s || 0)}s · ${escapeHtml(model)}`;
+    setTimeout(refreshCorpusPill, 10000);
+  } else if (st.status === "error") {
+    $("corpusPill").innerHTML = `🗂 <b>full corpus failed</b> · ${escapeHtml(model)}`;
+  }
+}
+
 function _fullCorpusOn() {
   const a = $("fullCorpus"), b = $("fullCorpusHome");
   return !!((a && a.checked) || (b && b.checked));
 }
 function wireFullCorpusToggles() {
   const a = $("fullCorpus"), b = $("fullCorpusHome");
-  const sync = (from, to) => { if (from && to) from.addEventListener("change", () => { to.checked = from.checked; }); };
+  const sync = (from, to) => {
+    if (from && to) from.addEventListener("change", () => { to.checked = from.checked; refreshCorpusPill(); });
+  };
   sync(a, b); sync(b, a);
+  refreshCorpusPill();
 }
 async function _issueFullCorpus(q, page) {
   // The corpus is read and decoded on first use (minutes, ~12GB), so the server
