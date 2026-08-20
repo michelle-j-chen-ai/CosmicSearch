@@ -3905,6 +3905,50 @@ def _full_corpus_begin_load() -> str:
 _FULL_MAX_DEPTH = 5000
 
 
+def _full_refresh_worker() -> None:
+    """Drop the resident corpus, then load the current one.
+
+    Dropping FIRST is not a style choice: the process already holds ~24GB (model,
+    browse matrix, full corpus) against a 32Gi ceiling, so building a replacement
+    beside the old one needs ~37GB and is killed part-way. The cost is that
+    full-corpus search is unavailable for the length of the reload; browse is
+    unaffected, and searches in that window get the same 503-and-poll they get
+    before the first load.
+    """
+    import gc
+
+    with _FULL_LOCK:
+        previous = _FULL["corpus"]
+        _FULL["corpus"] = None
+        _FULL["status"] = "loading"
+        _FULL["error"] = ""
+        _FULL["started"] = time.time()
+    del previous
+    gc.collect()
+    _full_load_worker()
+
+
+@app.post("/api/full_corpus_refresh")
+def full_corpus_refresh() -> dict:
+    """Reload the full corpus from the current Lance, picking up new rows.
+
+    Intended for a scheduler: the corpus grows daily and a resident copy is a
+    snapshot. Returns immediately; the reload runs on a background thread and is
+    observable through /api/full_corpus_status.
+
+    A refresh already in flight is not restarted -- a second trigger would drop a
+    half-built corpus and start over, which is strictly worse than letting the
+    first finish.
+    """
+    with _FULL_LOCK:
+        if _FULL["status"] == "loading":
+            return {"status": "loading", "note": "refresh already in progress"}
+    threading.Thread(
+        target=_full_refresh_worker, name="full-corpus-refresh", daemon=True
+    ).start()
+    return {"status": "refreshing"}
+
+
 class FullSearchRequest(BaseModel):
     query: str
     limit: int = 50
