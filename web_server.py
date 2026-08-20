@@ -3976,27 +3976,41 @@ def full_search(req: FullSearchRequest) -> dict:
         "full search %r -> %d hits over %d rows in %.1fms",
         query, len(hits), corpus.num_rows, took_ms,
     )
+    # Same envelope /api/search returns, so the existing grid renders these with
+    # no special-casing. `index` is the corpus row position, carried for parity
+    # with the resident path; full-corpus refine is not wired, so marks made here
+    # cannot be re-ranked yet.
+    scores = [float(h.score) for h in hits]
+    payload = [
+        {
+            "rank": h.rank,
+            "score": round(float(h.score), 4),
+            "score_error_bound": round(float(h.score_error_bound), 4),
+            "chunk_id": h.chunk_id,
+            "run_uuid": h.run_uuid,
+            "segment_id": h.segment_id,
+            "start_timestamp_ns": _ns(h.chunk_start_unix),
+            "end_timestamp_ns": _ns(h.chunk_end_unix),
+            "start_utc": _utc(h.chunk_start_unix),
+            "end_utc": _utc(h.chunk_end_unix),
+            "source_media_uri": h.source_media_uri,
+            "vehicle": h.vehicle,
+            "dx_internal_id": h.dx_internal_id,
+            "index": -1,
+        }
+        for h in hits
+    ]
     return {
-        "query": query,
-        "num_rows_searched": corpus.num_rows,
-        "took_ms": took_ms,
+        "hits": payload,
+        "total": len(payload),
+        "page": 0,
+        "page_size": req.limit,
+        "elapsed_ms": took_ms,
+        "label": query,
+        "score_lo": round(min(scores), 4) if scores else 0.0,
+        "score_hi": round(max(scores), 4) if scores else 0.0,
+        "funnel": {"corpus_total": corpus.num_rows},
+        "full_corpus": True,
         "score_kind": "bounded_approx",
-        "results": [
-            {
-                "rank": h.rank,
-                "score": round(float(h.score), 4),
-                "score_error_bound": round(float(h.score_error_bound), 4),
-                "chunk_id": h.chunk_id,
-                "run_uuid": h.run_uuid,
-                "segment_id": h.segment_id,
-                "start_timestamp_ns": _ns(h.chunk_start_unix),
-                "end_timestamp_ns": _ns(h.chunk_end_unix),
-                "start_utc": _utc(h.chunk_start_unix),
-                "end_utc": _utc(h.chunk_end_unix),
-                "source_media_uri": h.source_media_uri,
-                "vehicle": h.vehicle,
-                "dx_internal_id": h.dx_internal_id,
-            }
-            for h in hits
-        ],
+        "num_rows_searched": corpus.num_rows,
     }
