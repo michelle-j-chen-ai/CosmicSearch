@@ -28,7 +28,24 @@ FROM deps AS runtime
 # import-closure it actually needs is already covered by requirements.lock. Its bundled
 # `adp.services.lilypad` protos merge with the DORA `adp` vendored below (namespace pkgs).
 COPY vendor ./vendor
-RUN uv pip install --no-deps ./vendor/lilypad_py-*.whl
+# The vendored wheel is tagged cp310-cp310-linux_x86_64, so an installer on this
+# 3.13 base rejects it on the tag alone. It ships NO compiled extensions -- every
+# entry sits under `.data/purelib` -- so it is pure Python and imports unmodified
+# on 3.13. Retag it to py3-none-any and install that; the payload is copied byte
+# for byte, only the WHEEL tag line differs.
+RUN python - <<'RETAG' && uv pip install --no-deps ./vendor/lilypad_py-2.26.0-py3-none-any.whl
+import glob, zipfile
+src = glob.glob("vendor/lilypad_py-*-cp*.whl")[0]
+zin = zipfile.ZipFile(src)
+with zipfile.ZipFile("vendor/lilypad_py-2.26.0-py3-none-any.whl", "w",
+                     zipfile.ZIP_DEFLATED) as zout:
+    for info in zin.infolist():
+        data = zin.read(info.filename)
+        if info.filename.endswith(".dist-info/WHEEL"):
+            data = (b"Wheel-Version: 1.0\nGenerator: retag\n"
+                    b"Root-Is-Purelib: false\nTag: py3-none-any\n")
+        zout.writestr(info, data)
+RETAG
 
 # DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
 # image builds on a plain Cloud Build with NO internal pip index / BuildKit
@@ -46,6 +63,12 @@ COPY adp/ ./adp/
 COPY config.py oci_s3.py local_cache.py interval_core.py search_engine.py analytics.py app.py ./
 # int8 PCA corpus backend (very large embedding sets); dispatched by search_engine.
 COPY gpu_corpus.py ./
+# Full-corpus search: full_corpus.py holds the consolidated corpus's int8/PCA
+# screen resident and ranks it; threshold_search/lance_writer/eps_bound are the
+# exact-threshold retrieval path it shares (PCA metadata reader + error bound).
+# search_engine imports threshold_search lazily, so a missing file here fails at
+# call time rather than at build -- hence copying them explicitly.
+COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
 COPY web_server.py dora_client.py db.py machine_auth.py nls_launcher.py ./
 COPY web ./web

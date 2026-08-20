@@ -3847,3 +3847,156 @@ def fmtint(n) -> str:
         return f"{int(n):,}"
     except (TypeError, ValueError):
         return str(n)
+
+
+# ===================== full-corpus (on-demand) search =======================
+# The resident browse corpus is a few million clips. This path searches the
+# WHOLE corpus (34.4M) by holding its int8/PCA-256 screen in memory instead of
+# fp32 vectors: 8.8GB rather than the ~105GB the same rows would cost as fp32,
+# swept in ~180ms on this instance's 8 cores.
+#
+# Loaded ON DEMAND, never at startup: the read+decode costs ~2 minutes and
+# ~12GB, which nobody should pay unless they ask for full-corpus search. The
+# load runs on a background thread so the request that triggers it returns
+# immediately and the UI can poll `/api/full_corpus_status`.
+_FULL_LOCK = threading.Lock()
+_FULL: dict = {"corpus": None, "status": "idle", "error": "", "started": 0.0}
+
+
+def _full_load_worker() -> None:
+    import full_corpus
+
+    try:
+        corpus = full_corpus.load()
+        with _FULL_LOCK:
+            _FULL["corpus"] = corpus
+            _FULL["status"] = "ready"
+            _FULL["error"] = ""
+        LOGGER.info("full corpus ready: %d rows", corpus.num_rows)
+    except Exception as exc:  # noqa: BLE001 -- surfaced through the status endpoint
+        LOGGER.exception("full corpus load failed")
+        with _FULL_LOCK:
+            _FULL["corpus"] = None
+            _FULL["status"] = "error"
+            _FULL["error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _full_corpus_begin_load() -> str:
+    """Start the background load if it is not already running/ready."""
+    with _FULL_LOCK:
+        if _FULL["status"] in ("loading", "ready"):
+            return _FULL["status"]
+        _FULL["status"] = "loading"
+        _FULL["error"] = ""
+        _FULL["started"] = time.time()
+    threading.Thread(
+        target=_full_load_worker, name="full-corpus-load", daemon=True
+    ).start()
+    return "loading"
+
+
+class FullSearchRequest(BaseModel):
+    query: str
+    limit: int = 50
+    from_date: str | None = None
+    to_date: str | None = None
+    # Same comma/space-separated forms the resident search accepts. Unlike the
+    # resident path, MULTIPLE vehicles are honoured here.
+    vehicle: str | None = None
+    drive_id: str | None = None
+
+
+@app.get("/api/full_corpus_status")
+def full_corpus_status() -> dict:
+    import full_corpus
+
+    with _FULL_LOCK:
+        status, error, started = _FULL["status"], _FULL["error"], _FULL["started"]
+        corpus = _FULL["corpus"]
+    out = {
+        "status": status,
+        "error": error,
+        "corpus_uri": full_corpus.CORPUS_TABLE_URI,
+        "model": full_corpus.CORPUS_MODEL,
+        "num_rows": corpus.num_rows if corpus is not None else 0,
+    }
+    if status == "loading":
+        out["elapsed_s"] = round(time.time() - started, 1)
+    return out
+
+
+@app.post("/api/full_corpus_load")
+def full_corpus_load() -> dict:
+    """Begin (or report) the on-demand load. Returns immediately."""
+    return {"status": _full_corpus_begin_load()}
+
+
+@app.post("/api/full_search")
+def full_search(req: FullSearchRequest) -> dict:
+    """Top-`limit` clips over the ENTIRE corpus. No S3 access per query.
+
+    Scores are int8 screening scores: the exact PCA score of each hit lies
+    within +/- `score_error_bound`. They are NOT comparable to the resident
+    corpus's fp32 scores, so a threshold calibrated there does not transfer --
+    hence `score_kind` on every row.
+    """
+    query = (req.query or "").strip()
+    if not query:
+        raise HTTPException(400, "query must not be empty")
+    if req.limit <= 0 or req.limit > 1000:
+        raise HTTPException(400, "limit must be between 1 and 1000")
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+
+    with _FULL_LOCK:
+        corpus, status, error = _FULL["corpus"], _FULL["status"], _FULL["error"]
+    if corpus is None:
+        if status == "error":
+            raise HTTPException(503, f"full corpus load failed: {error}")
+        _full_corpus_begin_load()
+        raise HTTPException(
+            503,
+            "full corpus is loading (~2 min); poll /api/full_corpus_status and retry",
+        )
+
+    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
+    vec = search_engine.encode_query(
+        query, _state["processor"], _state["model"], _state["cfg"].device
+    )
+    t0 = time.perf_counter()
+    hits = corpus.search(
+        vec,
+        limit=req.limit,
+        vehicles=set(_parse_vehicles(req.vehicle)) or None,
+        run_uuids=set(_parse_drive_ids(req.drive_id)) or None,
+        date_range=(start_unix, end_unix) if (start_unix or end_unix) else None,
+    )
+    took_ms = round((time.perf_counter() - t0) * 1000, 1)
+    LOGGER.info(
+        "full search %r -> %d hits over %d rows in %.1fms",
+        query, len(hits), corpus.num_rows, took_ms,
+    )
+    return {
+        "query": query,
+        "num_rows_searched": corpus.num_rows,
+        "took_ms": took_ms,
+        "score_kind": "bounded_approx",
+        "results": [
+            {
+                "rank": h.rank,
+                "score": round(float(h.score), 4),
+                "score_error_bound": round(float(h.score_error_bound), 4),
+                "chunk_id": h.chunk_id,
+                "run_uuid": h.run_uuid,
+                "segment_id": h.segment_id,
+                "start_timestamp_ns": _ns(h.chunk_start_unix),
+                "end_timestamp_ns": _ns(h.chunk_end_unix),
+                "start_utc": _utc(h.chunk_start_unix),
+                "end_utc": _utc(h.chunk_end_unix),
+                "source_media_uri": h.source_media_uri,
+                "vehicle": h.vehicle,
+                "dx_internal_id": h.dx_internal_id,
+            }
+            for h in hits
+        ],
+    }
