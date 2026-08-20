@@ -187,6 +187,30 @@ class FullCorpus:
         gpu_corpus._cpu_score_kernel()(self.corpus_i8, w, out)
         return out, err
 
+    def warm(self) -> None:
+        """Compile the scoring kernel before any request can hit it.
+
+        The kernel is numba-jitted on first call, and compiling it took ~85s on
+        the deployed service -- paid by whoever ran the first search after a
+        load, who sees an apparently hung request. Compiling here against a
+        small slice moves that cost into the load, which is already asynchronous
+        and reports progress. Cheap to get wrong silently, so failure is logged
+        rather than raised: a warm-up that fails only restores the old behaviour.
+        """
+        try:
+            import gpu_corpus
+
+            t0 = time.perf_counter()
+            probe = np.ascontiguousarray(self.corpus_i8[: min(1024, self.num_rows)])
+            out = np.empty(probe.shape[0], dtype=np.float32)
+            gpu_corpus._cpu_score_kernel()(
+                probe, np.zeros(probe.shape[1], dtype=np.float32), out
+            )
+            LOGGER.info("scoring kernel warm in %.1fs", time.perf_counter() - t0)
+        except Exception as exc:  # noqa: BLE001 -- warm-up is an optimization
+            LOGGER.warning("scoring kernel warm-up failed (%s); the first search "
+                           "will pay the compile", exc)
+
     # ---- filtering -----------------------------------------------------
 
     def filter_mask(
@@ -257,25 +281,43 @@ class FullCorpus:
         query: np.ndarray,
         limit: int = 50,
         *,
+        offset: int = 0,
         vehicles: "set[str] | None" = None,
         date_range: "tuple[int | None, int | None] | None" = None,
         run_uuids: "set[str] | None" = None,
-    ) -> list[Hit]:
-        """Top-`limit` rows for `query`, best first. No S3 access."""
+    ) -> "tuple[list[Hit], int]":
+        """`(hits, candidates)`: rows `offset`..`offset+limit`, best first.
+
+        Paging selects the top `offset + limit` and returns the tail slice.
+        Every score is already resident, so a deeper page costs one more
+        selection pass rather than another scan -- there is no cursor to keep
+        and no state between requests. `candidates` is how many rows survived
+        the filters, which is what the caller needs to size a pager.
+        """
         if limit <= 0:
             raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must not be negative")
         scores, err = self.score(query)
         mask = self.filter_mask(vehicles, date_range, run_uuids)
+        depth = offset + limit
         if mask is None:
-            order = self._top_k(scores, min(limit, self.num_rows))
+            candidates = self.num_rows
+            order = self._top_k(scores, min(depth, candidates))
         else:
             allowed = np.nonzero(mask)[0]
-            if allowed.size == 0:
-                return []
-            sub_scores = scores[allowed]
-            order = allowed[self._top_k(sub_scores, min(limit, allowed.size))]
-        return [self._hit(int(i), rank, float(scores[i]), err)
-                for rank, i in enumerate(order, start=1)]
+            candidates = int(allowed.size)
+            if candidates == 0:
+                return [], 0
+            order = allowed[self._top_k(scores[allowed], min(depth, candidates))]
+        page = order[offset:]
+        return (
+            [
+                self._hit(int(i), offset + rank, float(scores[i]), err)
+                for rank, i in enumerate(page, start=1)
+            ],
+            candidates,
+        )
 
     def _hit(self, i: int, rank: int, score: float, err: float) -> Hit:
         m = self._meta
@@ -394,4 +436,6 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     del meta_table
     LOGGER.info("full corpus metadata: %d vehicles, %d runs, %d dates",
                 len(veh_uniques), len(run_uniques), len(dt_uniques))
-    return FullCorpus(corpus_i8, pca, scale, meta)
+    corpus = FullCorpus(corpus_i8, pca, scale, meta)
+    corpus.warm()
+    return corpus
