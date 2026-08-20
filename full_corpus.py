@@ -322,32 +322,61 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
         lance.dataset(PCA_BASIS_URI, storage_options=so)
     )
 
+    # Decoded batch by batch into one preallocated array rather than via
+    # to_table. Materializing the whole column as Arrow and then copying it to
+    # numpy holds both at once: ~18GB peak for an 8.8GB result, measured. This
+    # process already holds the resident browse matrix (~6GB) and the model
+    # (~5GB), so that peak does not fit in the container and the load is killed
+    # partway through. Streaming keeps the extra cost to a single batch.
     t0 = time.perf_counter()
-    i8_table = ds.to_table(columns=[i8_col], scan_in_order=True)
-    child = i8_table.column(i8_col).combine_chunks().values
-    # A null embedding value decodes to NaN via to_numpy, and casting NaN to int8
-    # is undefined -- the row would score on garbage rather than fail. Fill with
-    # zero instead: a zero vector scores exactly 0 against any query, so such a
-    # row is inert and can never outrank a real match.
-    if child.null_count:
+    n_rows = ds.count_rows()
+    dim = ds.schema.field(i8_col).type.list_size
+    corpus_i8 = np.empty((n_rows, dim), dtype=np.int8)
+    nulls = 0
+    at = 0
+    for batch in ds.to_batches(columns=[i8_col], scan_in_order=True):
+        child = batch.column(i8_col).values
+        # A null embedding value decodes to NaN, and casting NaN to int8 is
+        # undefined -- the row would score on garbage rather than fail. Zero
+        # scores exactly 0 against any query, so the row is inert instead.
+        if child.null_count:
+            nulls += child.null_count
+            child = child.fill_null(0)
+        block = np.asarray(child.to_numpy(zero_copy_only=False), dtype=np.int8)
+        rows = batch.num_rows
+        corpus_i8[at : at + rows] = block.reshape(rows, dim)
+        at += rows
+    if at != n_rows:
+        raise ValueError(f"decoded {at} rows, expected {n_rows}")
+    if nulls:
         LOGGER.warning(
-            "%s: %d null values filled with 0 (those rows score 0)",
-            i8_col, child.null_count,
+            "%s: %d null values filled with 0 (those rows score 0)", i8_col, nulls
         )
-        child = child.fill_null(0)
-    flat = np.asarray(child.to_numpy(zero_copy_only=False), dtype=np.int8)
-    corpus_i8 = np.ascontiguousarray(flat.reshape(i8_table.num_rows, -1))
-    del i8_table, child, flat
     LOGGER.info(
         "full corpus screen: %d rows x %d dim (%.2fGB) in %.1fs",
         corpus_i8.shape[0], corpus_i8.shape[1],
         corpus_i8.nbytes / 1e9, time.perf_counter() - t0,
     )
 
-    meta_table = ds.to_table(columns=list(_METADATA_COLUMNS), scan_in_order=True)
-    veh_codes, veh_uniques = _dictionary_codes(meta_table.column("vehicle"))
-    run_codes, run_uniques = _dictionary_codes(meta_table.column("run_uuid"))
-    dt_codes, dt_uniques = _dictionary_codes(meta_table.column("dt"))
+    # One column at a time, for the same reason as the screen above: reading all
+    # seven together holds every raw string buffer (run_uuid, segment_id, dt) in
+    # memory alongside the compact arrays replacing them. Each column is released
+    # before the next is read.
+    def _column(name):
+        return ds.to_table(columns=[name], scan_in_order=True).column(name)
+
+    veh_codes, veh_uniques = _dictionary_codes(_column("vehicle"))
+    run_codes, run_uniques = _dictionary_codes(_column("run_uuid"))
+    dt_codes, dt_uniques = _dictionary_codes(_column("dt"))
+
+    class _Lazy:
+        """Reads a column on attribute access so the dict below stays one-at-a-time."""
+
+        @staticmethod
+        def column(name):
+            return _column(name)
+
+    meta_table = _Lazy()
     meta = {
         "vehicle": veh_codes, "vehicle_uniques": veh_uniques,
         "run_uuid": run_codes, "run_uuid_uniques": run_uniques,
@@ -362,10 +391,6 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
         .combine_chunks().fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64),
         "segment_id": meta_table.column("segment_id").combine_chunks(),
     }
-    # Drop the Arrow table now the resident arrays exist: it still holds the
-    # raw run_uuid/dt/vehicle string buffers (several GB at this row count),
-    # which the dictionary codes above have replaced. segment_id is kept, so
-    # its buffer survives via the combined array referenced in `meta`.
     del meta_table
     LOGGER.info("full corpus metadata: %d vehicles, %d runs, %d dates",
                 len(veh_uniques), len(run_uniques), len(dt_uniques))
