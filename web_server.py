@@ -3943,6 +3943,61 @@ def full_corpus_refresh() -> dict:
     return {"status": "refreshing"}
 
 
+class FullRescoreRequest(BaseModel):
+    query: str
+    rows: list[int]
+
+
+@app.post("/api/full_rescore")
+def full_rescore(req: FullRescoreRequest) -> dict:
+    """Exact 768-d cosine for rows already returned by /api/full_search.
+
+    The search answers from a quantized, PCA-reduced screen, so its scores carry
+    a +/-eps bound and are not comparable to thresholds calibrated on the float
+    corpus. This reads the original embeddings for the rows on screen and returns
+    the real cosine.
+
+    Separate from the search because it is one S3 round trip with a ~1.65s floor
+    whatever the row count: folding it in would turn a 190ms search into nearly
+    two seconds for every caller, including those who never look at the score.
+    """
+    if not req.rows:
+        raise HTTPException(400, "rows must not be empty")
+    if len(req.rows) > 1000:
+        raise HTTPException(400, "at most 1000 rows per rescore")
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+    with _FULL_LOCK:
+        corpus = _FULL["corpus"]
+    if corpus is None:
+        raise HTTPException(503, "full corpus is not resident; run a search first")
+    vec = search_engine.encode_query(
+        (req.query or "").strip(), _state["processor"], _state["model"],
+        _state["cfg"].device,
+    )
+    t0 = time.perf_counter()
+    try:
+        exact = corpus.rescore(req.rows, vec)
+    except RuntimeError as exc:
+        # Raised when a row no longer resolves to the clip the search reported,
+        # i.e. the snapshot moved. Better a 409 than a confident wrong number.
+        raise HTTPException(409, str(exc))
+    took_ms = round((time.perf_counter() - t0) * 1000, 1)
+    LOGGER.info("full rescore: %d rows in %.1fms", len(exact), took_ms)
+    return {
+        "took_ms": took_ms,
+        "score_kind": "exact",
+        "source_column": full_corpus_module().vector_full_column(),
+        "scores": [{"row": r, "score": round(sc, 4)} for r, sc in exact.items()],
+    }
+
+
+def full_corpus_module():
+    import full_corpus
+
+    return full_corpus
+
+
 class FullSearchRequest(BaseModel):
     query: str
     limit: int = 50
@@ -4055,6 +4110,8 @@ def full_search(req: FullSearchRequest) -> dict:
             "source_media_uri": h.source_media_uri,
             "vehicle": h.vehicle,
             "dx_internal_id": h.dx_internal_id,
+            # Dataset row position, so /api/full_rescore can address these rows.
+            "row": h.row,
             "index": -1,
         }
         for h in hits

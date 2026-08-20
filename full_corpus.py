@@ -80,11 +80,23 @@ def vector_fp_column(model: str = CORPUS_MODEL) -> str:
     return f"vector_fp_{model}"
 
 
+def vector_full_column(model: str = CORPUS_MODEL) -> str:
+    """The original pre-PCA embedding. Exact scores come from here rather than
+    `vector_fp`, which is full precision but still PCA-reduced: only this column
+    yields a cosine comparable to the app's float corpus."""
+    return f"vector_{model}"
+
+
 @dataclasses.dataclass(frozen=True)
 class Hit:
     """One ranked result. `score` is the int8 screening score: the exact PCA
-    score lies within +/- `score_error_bound` of it."""
+    score lies within +/- `score_error_bound` of it, until `rescore` replaces it
+    with the true 768-d cosine."""
 
+    # Position in the dataset's canonical scan order. This is how the next tier
+    # is addressed -- `take()` works by position, not by id -- and it is only
+    # valid against the dataset version this corpus was loaded from.
+    row: int
     rank: int
     score: float
     score_error_bound: float
@@ -142,6 +154,10 @@ class FullCorpus:
         self.corpus_uri = CORPUS_TABLE_URI
         self.dataset_version = None
         self.loaded_at = 0.0
+        # Held open from load time. Row positions address THIS version; the table
+        # grows daily, so reopening it per request would let positions drift onto
+        # different clips with nothing to signal it.
+        self.dataset = None
 
     @property
     def num_rows(self) -> int:
@@ -326,6 +342,53 @@ class FullCorpus:
             candidates,
         )
 
+    def rescore(self, rows: "list[int]", query: np.ndarray) -> "dict[int, float]":
+        """True 768-d cosine for `rows`, read from the original embeddings.
+
+        The screen answers with a quantized, PCA-reduced score. This reads the
+        column those were derived from, so the number is the same one the app's
+        float corpus produces -- which is what makes a threshold calibrated
+        elsewhere mean anything here.
+
+        Deliberately NOT part of `search`: this is a single S3 round trip with a
+        ~1.65s floor regardless of row count, so folding it in would take a 190ms
+        search to nearly two seconds. Callers fetch a page fast, then sharpen the
+        rows on screen.
+
+        `chunk_id` is fetched alongside and checked against the resident
+        metadata. Row positions are only valid against the loaded dataset
+        version, so a drift shows up as an error rather than as a plausible score
+        attached to the wrong clip.
+        """
+        if self.dataset is None:
+            raise RuntimeError("corpus has no dataset handle; rescore unavailable")
+        idx = np.asarray(sorted(set(int(r) for r in rows)), dtype=np.int64)
+        if idx.size == 0:
+            return {}
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        if q.shape[0] != self.dim:
+            raise ValueError(f"query must be {self.dim}-d, got {q.shape[0]}")
+        norm = float(np.linalg.norm(q))
+        if norm == 0.0:
+            raise ValueError("query vector is all zeros")
+        q = q / norm
+
+        col = vector_full_column(CORPUS_MODEL)
+        tbl = self.dataset.take(idx, columns=[col, "chunk_id"])
+        got = tbl.column("chunk_id").to_pylist()
+        for pos, row in enumerate(idx):
+            expect = f"{self._meta['run_uuid_uniques'][self._meta['run_uuid'][row]]}" \
+                     f"#t{int(self._meta['chunk_start_unix'][row])}"
+            if got[pos] != expect:
+                raise RuntimeError(
+                    f"row {row} resolved to {got[pos]!r}, expected {expect!r}: the "
+                    "dataset changed under the loaded snapshot"
+                )
+        flat = tbl.column(col).combine_chunks().values.to_numpy(zero_copy_only=False)
+        mat = np.asarray(flat, dtype=np.float32).reshape(idx.size, -1)
+        scores = np.einsum("ij,j->i", mat, q, dtype=np.float64)
+        return {int(r): float(sc) for r, sc in zip(idx, scores)}
+
     def _hit(self, i: int, rank: int, score: float, err: float) -> Hit:
         m = self._meta
         run_uuid = m["run_uuid_uniques"][m["run_uuid"][i]]
@@ -337,6 +400,7 @@ class FullCorpus:
         dx = m["dx_internal_id"][i]
         seg = m["segment_id"][i].as_py() if m["segment_id"] is not None else None
         return Hit(
+            row=i,
             rank=rank,
             score=score,
             score_error_bound=err,
@@ -444,6 +508,7 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     LOGGER.info("full corpus metadata: %d vehicles, %d runs, %d dates",
                 len(veh_uniques), len(run_uniques), len(dt_uniques))
     corpus = FullCorpus(corpus_i8, pca, scale, meta)
+    corpus.dataset = ds
     corpus.corpus_uri = CORPUS_TABLE_URI
     corpus.dataset_version = getattr(ds, "version", None)
     corpus.loaded_at = time.time()
