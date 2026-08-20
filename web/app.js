@@ -286,7 +286,10 @@ async function runSearch(startOpts) {
   // different endpoint because that corpus is loaded on demand and has no paging
   // or refine; the response envelope is identical, so the grid is unchanged.
   if (_fullCorpusOn()) {
-    await _issueFullCorpus(q, (startOpts && startOpts.page) || 0);
+    const page = (startOpts && startOpts.page) || 0;
+    // Same query and filters as the buffer we already hold -> page locally.
+    if (state.fullBuf && state.fullBuf.key === _fullKey(q)) { _renderFullPage(page); return; }
+    await _issueFullCorpus(q, page);
     return;
   }
   await _issue("/api/search", { query: q, ...(startOpts || {}), ..._searchFilters() });
@@ -445,15 +448,64 @@ async function _issueFullCorpus(q, page) {
       $("gridStatus").textContent = `Loading the full corpus… ${Math.round(s.elapsed_s || 0)}s`;
     }
   }
-  await _issue("/api/full_search", {
+  // Fetch one batch and page through it locally. A page is a slice of scores
+  // that are already in memory server-side, so re-requesting per page would be
+  // a fresh 34M-row scan for results we already hold. One batch also means the
+  // exact-score round trip can cover every page in a single fetch.
+  const body = {
     query: q,
-    page: page || 0,
-    limit: state.pageSize || 24,
+    page: 0,
+    limit: FULL_BATCH,
     from_date: $("sf-dateFrom").value || null,
     to_date: $("sf-dateTo").value || null,
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
-  });
+  };
+  $("gridStatus").textContent = "Searching all clips…";
+  let data;
+  try {
+    data = await fetch("/api/full_search", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => {
+      if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); });
+      return r.json();
+    });
+  } catch (e) {
+    $("gridStatus").textContent = "Search failed: " + e.message;
+    return;
+  }
+  state.fullBuf = { key: _fullKey(q), data, hits: data.hits || [] };
+  _renderFullPage(page || 0);
+}
+
+// One request covers this many results; the pager slices them client-side.
+const FULL_BATCH = 200;
+
+function _fullKey(q) {
+  return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
+          $("sf-vehicle").value, $("sf-drive").value].join("|");
+}
+
+function _renderFullPage(page) {
+  const buf = state.fullBuf;
+  const ps = state.pageSize || 24;
+  const pages = Math.max(1, Math.ceil(buf.hits.length / ps));
+  state.page = Math.min(Math.max(0, page), pages - 1);
+  state.hits = buf.hits.slice(state.page * ps, (state.page + 1) * ps);
+  state.total = buf.hits.length;
+  state.label = buf.data.label || state.query;
+  state.scoreHi = buf.data.score_hi || 0.4;
+  $("vectorChip").textContent = `vector: text "${state.query}"`;
+  $("resultCountText").textContent = buf.hits.length
+    ? `top ${fmtInt(buf.hits.length)} of ${fmtInt(buf.data.candidates || buf.data.total)} matching · `
+      + `${fmtInt(buf.data.num_rows_searched)} clips searched in ${buf.data.elapsed_ms} ms · `
+      + `similarity ${buf.data.score_lo}–${buf.data.score_hi} (approximate)`
+    : "no clips match the current query + filters";
+  $("gridStatus").textContent = buf.hits.length ? "" : "Try widening the date range or filters.";
+  renderQueryStrip(buf.data);
+  renderGrid();
+  renderPager();
 }
 async function _issue(endpoint, body) {
   const seq = ++_issueSeq;
