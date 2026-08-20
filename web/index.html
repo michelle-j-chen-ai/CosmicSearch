@@ -48,6 +48,14 @@
         <input id="searchInput" placeholder="Describe a moment — e.g. ego makes an unprotected left turn across oncoming traffic">
         <button id="searchBtn">Search</button>
       </div>
+      <!-- Mirrors the toolbar toggle, which only exists once results are on
+           screen: without one here the full corpus is unreachable until after a
+           search has already run against the loaded one. Both inputs are kept in
+           sync so either can be used. -->
+      <label class="rt-checkbox" style="display:block;margin-top:10px;color:var(--muted-2)"
+             title="Search the entire corpus (34M clips) instead of the loaded one. Loads on first use and takes a few minutes.">
+        <input type="checkbox" id="fullCorpusHome"> search the full corpus (34M clips, loads on first use)
+      </label>
       <div class="hero-sub"><button class="link-btn" id="clipToggle">▶ Search by video clip instead</button><span class="hero-sep">·</span><button class="link-btn" id="uploadToggle">▶ Search by image / video (drag &amp; drop)</button></div>
       <div class="empty-hint">Type a query to get a starting search vector — you'll refine it with 👍/👎 on the next screen.</div>
 

@@ -117,6 +117,7 @@ function wireEvents() {
   $("filtersChip").onclick = toggleSearchFilters;
   $("applyFiltersBtn").onclick = applySearchFilters;
   wireDxCombo();
+  wireFullCorpusToggles();
 
   $("pagePrev").onclick = () => reload({ page: state.page - 1 });
   $("pageNext").onclick = () => reload({ page: state.page + 1 });
@@ -284,7 +285,7 @@ async function runSearch(startOpts) {
   // Full-corpus mode ranks all ~34M clips instead of the loaded corpus. It is a
   // different endpoint because that corpus is loaded on demand and has no paging
   // or refine; the response envelope is identical, so the grid is unchanged.
-  if ($("fullCorpus") && $("fullCorpus").checked) {
+  if (_fullCorpusOn()) {
     await _issueFullCorpus(q);
     return;
   }
@@ -410,6 +411,18 @@ function reload(startOpts) {
   return runSearch(startOpts);
 }
 
+// The toggle exists twice: once on the landing page and once in the results
+// toolbar, which does not exist until results are on screen. Either one counts,
+// and checking one updates the other so they never disagree.
+function _fullCorpusOn() {
+  const a = $("fullCorpus"), b = $("fullCorpusHome");
+  return !!((a && a.checked) || (b && b.checked));
+}
+function wireFullCorpusToggles() {
+  const a = $("fullCorpus"), b = $("fullCorpusHome");
+  const sync = (from, to) => { if (from && to) from.addEventListener("change", () => { to.checked = from.checked; }); };
+  sync(a, b); sync(b, a);
+}
 async function _issueFullCorpus(q) {
   // The corpus is read and decoded on first use (minutes, ~12GB), so the server
   // answers 503 until it is resident. Kick the load, tell the user where it is
