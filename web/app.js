@@ -473,6 +473,7 @@ async function _issueFullCorpus(q, page) {
     to_date: $("sf-dateTo").value || null,
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
+    segment_set_uuid: state.searchSegUuid,
   };
   $("gridStatus").textContent = "Searching all clips…";
   let data;
@@ -497,7 +498,8 @@ const FULL_BATCH = 200;
 
 function _fullKey(q) {
   return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
-          $("sf-vehicle").value, $("sf-drive").value].join("|");
+          $("sf-vehicle").value, $("sf-drive").value,
+          state.searchSegUuid || ""].join("|");
 }
 
 function _renderFullPage(page) {
@@ -671,7 +673,7 @@ function vote(chunkId, dir) {
   const h = (state.rendered || []).find((x) => x.chunk_id === chunkId) || state.hits.find((x) => x.chunk_id === chunkId); if (!h) return;
   const cur = state.marks[chunkId];
   if (cur && cur.mark === dir) delete state.marks[chunkId];
-  else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, rank: h.rank, score: h.score };
+  else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, row: h.row, rank: h.rank, score: h.score };
   // Toggle ONLY the clicked card in place — never re-render the whole grid (that
   // would reload every video on every click).
   const m = state.marks[chunkId];
@@ -692,10 +694,10 @@ let _fitTimer = null;
 function scheduleFit() { clearTimeout(_fitTimer); _fitTimer = setTimeout(fitOnly, 500); }
 async function fitOnly() {
   if (!state.sweepActive) return;
-  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "" }));
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, row: m.row, segment_id: m.segment_id || "" }));
   const f = _searchFilters();
   try {
-    const thr = await fetch("/api/threshold_search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
+    const thr = await fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
     if (!thr) return;
     state.suggestedTau = thr.suggested_threshold;
     const fitTau = thr.threshold;
@@ -752,12 +754,12 @@ function closeSweep() {
 }
 
 async function refreshSweep() {
-  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "" }));
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, row: m.row, segment_id: m.segment_id || "" }));
   const f = _searchFilters();
   try {
     const [dist, thr] = await Promise.all([
       fetch("/api/score_distribution", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, k: 2000, ...f, interval_mode: "k", interval_score: null }) }).then((r) => r.ok ? r.json() : null),
-      fetch("/api/threshold_search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
+      fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
     ]);
     const hist = (dist && dist.edges) ? dist : (thr && thr.histogram) ? thr.histogram : null;
     if (!hist) { showToast("Could not compute distribution"); return; }
@@ -1096,8 +1098,78 @@ function _exportFilename(resp, fb) { const n = resp.headers.get("X-NLS-Export-Na
 
 function doExport() {
   if (state.selected.size === 0) return;
-  if (state.offlineScan) launchScan(); else downloadCsv();
+  if (_fullCorpusOn()) fullExport(); else if (state.offlineScan) launchScan(); else downloadCsv();
 }
+// Threshold fitting follows whichever corpus the results came from. The two
+// endpoints address marks differently -- the resident one by `index`, the
+// full-corpus one by `row` -- and sending full-corpus marks to the resident
+// endpoint silently drops every label, which reads as "no labels yet".
+function _thresholdEndpoint() {
+  return _fullCorpusOn() ? "/api/full_threshold" : "/api/threshold_search";
+}
+
+// Export straight from the resident 34M-row corpus. This is the online
+// replacement for the Lilypad scan: the ranking pass is the same one a search
+// runs, so the only extra cost is materializing the rows.
+async function fullExport() {
+  const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
+  if (!rows.length) return;
+  const topk = state.cutoffMode === "topk";
+  const btn = $("exportBtn"); btn.disabled = true;
+  const note = $("exportNote");
+  const filters = _exportFilters();
+  let done = 0;
+  try {
+    for (const e of rows) {
+      const tag = e.tag || e.query;
+      note.textContent = `Exporting ${tag} from all 34M clips… (${done + 1}/${rows.length})`;
+      const body = {
+        query: e.query || e.tag, tag,
+        interval: state.sampleMode === "interval",
+        dedupe_segment: $("dedupInput").checked,
+        create_segment_set: $("segsetInput").checked,
+        exact: !!$("exactInput") && $("exactInput").checked,
+        from_date: filters.from_date, to_date: filters.to_date,
+        vehicle: filters.vehicle, drive_id: filters.drive_id,
+        segment_set_uuid: filters.segment_set_uuid,
+      };
+      if (topk) body.k = kForRow(e) || 50;
+      else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
+      const resp = await fetch("/api/full_export", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        let d; try { d = (await resp.json()).detail; } catch (_e) { }
+        throw new Error(`${tag}: ${d || "HTTP " + resp.status}`);
+      }
+      const h = (k) => resp.headers.get(k) || "";
+      const blob = await resp.blob(); const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href = url;
+      a.download = _exportFilename(resp, tag + ".csv");
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      done++;
+      const bits = [`${fmtInt(+h("X-NLS-Rows"))} rows`, `${h("X-NLS-Elapsed-Ms")} ms`];
+      if (h("X-NLS-Parquet")) bits.push(`parquet → ${h("X-NLS-Parquet")}`);
+      else bits.push("⚠ parquet not written");
+      if (h("X-NLS-Segset")) bits.push(`segment set ${h("X-NLS-Segset")}`);
+      if (h("X-NLS-Segset-Error")) bits.push(`⚠ ${h("X-NLS-Segset-Error")}`);
+      // A capped threshold export is a partial answer; say so on the same line
+      // as the row count rather than letting it read as the complete set.
+      if (h("X-NLS-Truncated") === "1") {
+        bits.push(`⚠ capped — ${fmtInt(+h("X-NLS-Candidates"))} matched`);
+      }
+      if (h("X-NLS-Score-Kind") === "bounded_approx") {
+        bits.push(`scores ±${h("X-NLS-Score-Error-Bound")}`);
+      }
+      note.textContent = `${tag}: ` + bits.join(" · ");
+    }
+    showToast(`Exported ${done} tag(s) from the full corpus`);
+  } catch (err) {
+    note.textContent = "Export failed: " + err.message;
+  } finally { btn.disabled = false; }
+}
+
 async function downloadCsv() {
   const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
   const topk = state.cutoffMode === "topk";
