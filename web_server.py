@@ -1324,6 +1324,15 @@ def _create_export_segment_set(
     ids = sorted({s for s in seg_ids if s})
     if not ids:
         return "", "no segments to register"
+    # Same ceiling the scan path enforces. Beyond it the set is corpus-sized (a
+    # symptom of too low a threshold) and the DORA CreateDataSet call hangs, so
+    # report it instead of registering. Only the scan path checked this; an
+    # in-app export large enough to hit it would have hung the request.
+    if len(ids) > _SEGSET_MAX_SEGMENTS:
+        return "", (
+            f"not registered: {len(ids):,} segments exceeds "
+            f"{_SEGSET_MAX_SEGMENTS:,} cap (raise the threshold or lower k)"
+        )
     meta = {k: v for k, v in provenance.items() if v not in (None, "", [])}
     meta["num_segments"] = len(ids)
     try:
@@ -3207,7 +3216,7 @@ class FullExportRequest(BaseModel):
     Selection is `k` (bounded by construction) or `threshold` (unbounded, so
     `max_rows` caps it). `exact` re-scores the selected rows against the original
     768-d embeddings; it costs one S3 round trip per 100k rows and is refused
-    above `_FULL_EXACT_MAX` rather than silently downgraded.
+    when projected past `_FULL_EXACT_BUDGET_S` rather than silently downgraded.
     """
 
     query: str
@@ -3483,10 +3492,23 @@ def _write_config_export_parquet(rows: list, name: str | None = None) -> str:
 # per-request.
 _FULL_EXPORT_LOCK = threading.Lock()
 
-# Above this, exact re-scoring stops being a round trip and becomes a table
-# scan. Refused rather than silently downgraded to screening scores: a caller
-# who asked for exact numbers and got approximate ones has no way to tell.
-_FULL_EXACT_MAX = 300_000
+# Exact re-scoring is bounded by TIME, not row count. Memory is not the
+# constraint -- exact_scores fetches in chunks and frees each one, so peak stays
+# flat whatever the total -- and the old 300,000-row cap was inherited from the
+# DORA segment-set limit, which is a different system's problem. What actually
+# breaks is the Cloud Run request timeout (600s): overrun it and the export dies
+# mid-write, losing both the artifact and the caller's CSV.
+#
+# 300s leaves the other half of the budget for the scan, the interval merge, the
+# parquet write and the upload. It is also how long the export lock is held, so
+# every concurrent export gets a 429 for that whole window.
+_FULL_EXACT_BUDGET_S = float(os.getenv("NLS_EXACT_BUDGET_S", "300"))
+
+# Measured: 3.17s per 10,000 rows of vector_black_dwarf via take(). Used only to
+# refuse up front; the fetch also checks the real clock between chunks, because a
+# slow day makes this constant optimistic and a mid-write timeout is worse than
+# an early refusal.
+_EXACT_MS_PER_ROW = 0.317
 
 # Hard ceiling on a threshold export regardless of what the caller asks for.
 # A permissive tau matches a tenth of the corpus (a mean+3*std cutoff selected
@@ -3559,16 +3581,25 @@ def full_export(req: FullExportRequest, request: Request) -> Response:
         exact_scores = None
         score_kind = "bounded_approx"
         if req.exact:
-            if len(sel) > _FULL_EXACT_MAX:
+            projected = len(sel) * _EXACT_MS_PER_ROW / 1000.0
+            if projected > _FULL_EXACT_BUDGET_S:
                 raise HTTPException(
                     400,
-                    f"exact scoring is capped at {_FULL_EXACT_MAX:,} rows; "
-                    f"this selection has {len(sel):,}. Lower k, raise the "
-                    "threshold, or export with exact=false.",
+                    f"exact scoring {len(sel):,} rows is projected at "
+                    f"{projected:.0f}s, over the {_FULL_EXACT_BUDGET_S:.0f}s "
+                    "budget. Lower k, raise the threshold, or export with "
+                    "exact=false (scores stay bounded-approximate).",
                 )
             try:
                 corpus._verify_alignment(sel.rows)
-                exact_scores = corpus.exact_scores(sel.rows, vec)
+                exact_scores = corpus.exact_scores(
+                    sel.rows, vec, deadline=time.monotonic() + _FULL_EXACT_BUDGET_S
+                )
+            except TimeoutError as exc:
+                # The estimate was optimistic. 503 rather than 400: the request
+                # was reasonable, the object store was slow, and retrying or
+                # narrowing are both sensible next moves.
+                raise HTTPException(503, str(exc))
             except RuntimeError as exc:
                 # Either the snapshot moved under the loaded row positions, or
                 # this corpus has no dataset handle to read from. Both mean the

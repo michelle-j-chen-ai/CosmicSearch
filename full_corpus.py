@@ -547,14 +547,24 @@ class FullCorpus:
         sel = self.select(query, k=k, **filters)
         return float(sel.cutoff)
 
-    def exact_scores(self, rows: np.ndarray, query: np.ndarray) -> np.ndarray:
+    def exact_scores(
+        self, rows: np.ndarray, query: np.ndarray, *, deadline: float | None = None
+    ) -> np.ndarray:
         """768-d cosine for `rows`, in the order given, fetched in chunks.
 
         `rescore` returns a dict keyed by row and verifies every chunk_id, which
         is right for a page on screen. At export size the dict and the per-row
         check cost more than the arithmetic, so this returns a bare array and
         spot-checks instead (see `_verify_alignment`).
+
+        `deadline` is a `time.monotonic()` value: the fetch stops between chunks
+        once it is passed. The caller estimates the cost before starting, but
+        that estimate uses a fixed per-row constant, and a slow object store makes
+        it optimistic. Overrunning silently means the request is killed mid-write
+        and the caller loses both the artifact and their download, so this fails
+        early and says how far it got.
         """
+        import time as _time
         if self.dataset is None:
             raise RuntimeError("corpus has no dataset handle; exact scores unavailable")
         rows = np.asarray(rows, dtype=np.int64)
@@ -572,6 +582,12 @@ class FullCorpus:
         ordered = rows[order]
         out = np.empty(rows.size, dtype=np.float64)
         for at in range(0, ordered.size, _EXACT_CHUNK_ROWS):
+            if deadline is not None and at and _time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"exact scoring exceeded its time budget after {at:,} of "
+                    f"{ordered.size:,} rows; narrow the selection or export with "
+                    "exact=false"
+                )
             part = ordered[at : at + _EXACT_CHUNK_ROWS]
             tbl = self.dataset.take(part, columns=[col])
             flat = tbl.column(col).combine_chunks().values.to_numpy(
