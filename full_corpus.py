@@ -559,6 +559,49 @@ class FullCorpus:
             )
         return out
 
+    def window_rows(
+        self, *, run_uuid: str = "", segment_id: str = "",
+        start_unix: int = 0, end_unix: int = 0,
+    ) -> np.ndarray:
+        """Rows of the clips already embedded for a drive/segment and time window.
+
+        The query-by-example counterpart of `search_engine.window_query`'s front
+        half, over the resident metadata: run_uuid and segment_id are matched on
+        dictionary codes and the Arrow column rather than row-by-row in Python,
+        which is the difference between milliseconds and a minute at 34M rows.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        run_uuid = (run_uuid or "").strip()
+        segment_id = (segment_id or "").strip()
+        if not run_uuid and not segment_id:
+            raise ValueError("window_rows needs a run_uuid or a segment_id")
+        m = self._meta
+        mask = np.ones(self.num_rows, dtype=bool)
+        if run_uuid:
+            try:
+                code = m["run_uuid_uniques"].index(run_uuid)
+            except ValueError:
+                return np.empty(0, dtype=np.int64)
+            mask &= m["run_uuid"] == code
+        if segment_id:
+            seg = m["segment_id"]
+            if seg is None:
+                return np.empty(0, dtype=np.int64)
+            hit = pc.equal(seg, pa.scalar(segment_id, type=pa.string()))
+            mask &= pc.fill_null(hit, False).to_numpy(zero_copy_only=False).astype(bool)
+        # Half-open overlap: chunk [cs, ce) overlaps [start, end) iff cs < end and
+        # ce > start. A 0 bound leaves that side open.
+        starts = m["chunk_start_unix"]
+        ends = np.where(m["chunk_end_unix"] < 0, starts + _DEFAULT_WINDOW_S, m["chunk_end_unix"])
+        if start_unix:
+            mask &= ends > int(start_unix)
+        if end_unix:
+            mask &= starts < int(end_unix)
+        rows = np.nonzero(mask)[0]
+        return rows[np.argsort(starts[rows], kind="stable")]
+
     def vectors_for(self, rows: "list[int] | np.ndarray") -> np.ndarray:
         """The original 768-d embeddings for `rows`, in the order given.
 
