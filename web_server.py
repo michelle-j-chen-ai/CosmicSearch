@@ -3593,7 +3593,9 @@ def full_export(req: FullExportRequest, request: Request) -> Response:
             score_kind = "exact"
 
         if req.interval:
-            return _full_export_intervals(req, request, corpus, sel, vec, t0)
+            return _full_export_intervals(
+                req, request, corpus, sel, vec, t0, exact_scores, score_kind
+            )
 
         rows, scores = sel.rows, sel.scores
         if exact_scores is not None:
@@ -3650,11 +3652,29 @@ def full_export(req: FullExportRequest, request: Request) -> Response:
 
 
 def _full_export_intervals(
-    req: "FullExportRequest", request: Request, corpus, sel, vec, t0: float
+    req: "FullExportRequest", request: Request, corpus, sel, vec, t0: float,
+    exact_scores=None, score_kind: str = "bounded_approx",
 ) -> Response:
     """Interval-granularity full-corpus export: merge the selected clips into
-    variable-length spans per drive, then write those instead of clips."""
-    intervals = corpus.intervals(sel.rows, sel.scores, tau=float(sel.cutoff))
+    variable-length spans per drive, then write those instead of clips.
+
+    Merges on the exact scores when they were fetched. This branch used to ignore
+    them: `exact=true` paid the S3 read and then projected intervals from the
+    screening scores anyway, so the option cost time and changed nothing.
+
+    The cutoff has to move with the scores. `sel.cutoff` is a SCREENING score for
+    a top-k selection, and comparing it against exact ones would threshold in the
+    wrong space -- so in exact mode a k-selection re-derives it from the exact
+    scores, while a threshold selection keeps the caller's own cutoff (which is a
+    cosine, and therefore more correctly applied to exact scores than to the
+    screen).
+    """
+    scores = sel.scores if exact_scores is None else np.asarray(exact_scores)
+    if exact_scores is None or req.threshold is not None:
+        tau = float(sel.cutoff)
+    else:
+        tau = float(scores.min()) if scores.size else 0.0
+    intervals = corpus.intervals(sel.rows, scores, tau=tau)
     if not intervals:
         raise HTTPException(404, "no intervals formed above the cutoff")
     rows = _interval_rows_full(intervals, corpus, req.query.strip())
@@ -3664,7 +3684,7 @@ def _full_export_intervals(
     # meant interval exports -- the mode the app defaults to -- never appeared in
     # Recent scans.
     _publish_full_export(
-        req, request, base, parquet_uri, "", sel, len(rows), corpus, "bounded_approx",
+        req, request, base, parquet_uri, "", sel, len(rows), corpus, score_kind,
         segset_error=(
             "intervals: segment-set export not supported yet"
             if req.create_segment_set else ""
@@ -3672,8 +3692,8 @@ def _full_export_intervals(
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
-        "full export (intervals) %r -> %d intervals from %d clips in %.1fms",
-        req.query.strip(), len(rows), len(sel), took_ms,
+        "full export (intervals) %r -> %d intervals from %d clips (%s) in %.1fms",
+        req.query.strip(), len(rows), len(sel), score_kind, took_ms,
     )
     return Response(
         content=_interval_csv(rows),
@@ -3681,8 +3701,8 @@ def _full_export_intervals(
         headers=_full_export_headers(
             base, parquet_uri, "",
             "intervals: segment-set export not supported yet" if req.create_segment_set else "",
-            sel, len(rows), "bounded_approx", took_ms,
-        ) | {"X-NLS-Interval-Threshold": f"{float(sel.cutoff):.6f}"},
+            sel, len(rows), score_kind, took_ms,
+        ) | {"X-NLS-Interval-Threshold": f"{tau:.6f}"},
     )
 
 
