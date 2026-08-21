@@ -231,6 +231,9 @@ class FullCorpus:
         # Encoder identity recorded next to the basis, so a mismatched corpus is
         # detectable rather than assumed from a constant.
         self.model_id = ""
+        # Set at load by `probe_vector_fp`. False means the middle cascade tier
+        # is the quantization it would be there to resolve.
+        self.vector_fp_usable = False
 
     @property
     def num_rows(self) -> int:
@@ -642,6 +645,51 @@ class FullCorpus:
         rows = np.nonzero(mask)[0]
         return rows[np.argsort(starts[rows], kind="stable")]
 
+    def probe_vector_fp(self, sample: int = 64) -> dict:
+        """Is `vector_fp` the true pre-quantization projection, or a fallback?
+
+        `lance_writer` populates that column from a real fp32 PCA projection when
+        one was supplied at write time, and otherwise from the int8 dequantized
+        back to fp32. The two are indistinguishable by schema -- no flag records
+        which -- but not by content: the fallback equals `i8 * scale / 127`
+        exactly, because that is how it was produced.
+
+        This matters because the whole point of the middle cascade tier is to
+        resolve quantization error. If it IS the quantization, refining through
+        it resolves nothing and the tier is dead weight dressed as precision.
+        """
+        if self.dataset is None:
+            return {"available": False, "reason": "no dataset handle"}
+        col = vector_fp_column(CORPUS_MODEL)
+        if col not in self.dataset.schema.names:
+            return {"available": False, "reason": f"no column {col!r}"}
+        rows = np.unique(
+            np.linspace(0, self.num_rows - 1, num=min(sample, self.num_rows))
+            .astype(np.int64)
+        )
+        try:
+            tbl = self.dataset.take(rows, columns=[col])
+        except Exception as exc:  # noqa: BLE001 - a probe must never break load
+            return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+        flat = tbl.column(col).combine_chunks().values.to_numpy(zero_copy_only=False)
+        fp = np.asarray(flat, dtype=np.float32).reshape(rows.size, -1)
+        dequant = self.corpus_i8[rows].astype(np.float32) * (
+            self.scale.astype(np.float32) / np.float32(127.0)
+        )
+        dev = float(np.abs(fp - dequant).max())
+        # The dequantized value is exactly representable, so a genuine fallback
+        # matches to float32 round-off. A real projection differs by the
+        # quantization error it was quantized FROM -- orders of magnitude larger.
+        quant_step = float((self.scale / 127.0).max())
+        is_fallback = dev < quant_step * 1e-3
+        return {
+            "available": True,
+            "is_fallback": is_fallback,
+            "max_deviation": dev,
+            "quant_step": quant_step,
+            "rows_probed": int(rows.size),
+        }
+
     def vectors_for(self, rows: "list[int] | np.ndarray") -> np.ndarray:
         """The original 768-d embeddings for `rows`, in the order given.
 
@@ -969,5 +1017,22 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     corpus.corpus_uri = DEFAULT_CORPUS_TABLE_URI
     corpus.dataset_version = getattr(ds, "version", None)
     corpus.loaded_at = time.time()
+    probe = corpus.probe_vector_fp()
+    corpus.vector_fp_usable = bool(probe.get("available") and not probe.get("is_fallback"))
+    if not probe.get("available"):
+        LOGGER.info("vector_fp unavailable (%s); cascade is int8 -> 768d",
+                    probe.get("reason"))
+    elif probe["is_fallback"]:
+        LOGGER.warning(
+            "vector_fp is the int8 dequantized (max dev %.3g vs quant step %.3g): "
+            "refining through it would resolve nothing, so it is not used",
+            probe["max_deviation"], probe["quant_step"],
+        )
+    else:
+        LOGGER.info(
+            "vector_fp is a real pre-quantization projection (max dev %.3g vs "
+            "quant step %.3g); usable as the middle cascade tier",
+            probe["max_deviation"], probe["quant_step"],
+        )
     corpus.warm()
     return corpus
