@@ -1175,6 +1175,10 @@ async function fullExport() {
       note.textContent = `${tag}: ` + bits.join(" · ");
     }
     showToast(`Exported ${done} tag(s) from the full corpus`);
+    // Publish-then-refresh, so the row other people will see is visible to the
+    // person who just made it -- an export that only exists in one browser's
+    // downloads folder is the thing this list is meant to prevent.
+    loadScanJobs(true);
   } catch (err) {
     note.textContent = "Export failed: " + err.message;
   } finally { btn.disabled = false; }
@@ -1286,6 +1290,15 @@ function renderScans() {
     // threshold scan). Threshold scans keep the per-tag "@tau" suffix.
     const tagList = (j.tags || []).map((t) => escapeHtml(t) + (!topK && j.thresholds && j.thresholds[t] != null ? ` @${j.thresholds[t]}` : "")).join(", ");
     const modeBadge = topK ? `<span class="scan-mode-topk" title="Top-K ranking within the downsampled scope (per-tag thresholds ignored)">top-K=${topK}</span> ` : "";
+    // In-app exports and offline scans share this list, but a reader should not
+    // have to guess which produced a row: an app export is already complete and
+    // has no console to open, and its artifact is a parquet, not a segments.lance.
+    const srcBadge = j.source === "app"
+      ? `<span class="scan-mode-topk" title="Exported in-app from the full corpus — no offline job">in-app</span> `
+      : "";
+    const truncNote = j.counts && j.counts.truncated
+      ? `<div class="ct-sub" style="color:var(--neg)">⚠ capped — ${(j.counts.candidates || 0).toLocaleString()} matched</div>`
+      : "";
     const filt = _fmtScanFilters(j.filters);
     const out = j.lance_uri
       ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span><button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button></div>`
@@ -1295,14 +1308,14 @@ function renderScans() {
     else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
     return `<tr>
       <td class="scan-time">${escapeHtml(j.created_at || "")}</td>
-      <td>${id}</td>
+      <td>${srcBadge}${id}</td>
       <td class="scan-tags">${(j.tags || []).length} tag(s): ${modeBadge}${tagList}</td>
       <td class="scan-filters">${escapeHtml(filt)}</td>
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
-      <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}</td>
+      <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}${truncNote}</td>
       <td>${out}</td>
       <td>${dx}</td></tr>`;
-  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No scans launched yet.</td></tr>`;
+  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
 }
 // Result counts (total segments + per-tag breakdown), mirroring the Data Explorer view.
 function _fmtScanCounts(c, status) {

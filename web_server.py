@@ -2453,6 +2453,8 @@ def scans(limit: int = 50, live: bool = False) -> dict:
             "output_dir": row.get("output_dir") or "",
             "lance_uri": row.get("lance_uri") or "",
             "console_url": row.get("console_url") or "",
+            # "lilypad" (offline launch) vs "app" (in-app full-corpus export).
+            "source": row.get("source") or "lilypad",
             "register_segset": bool(row.get("register_segset")),
             "segset_uuid": row.get("segset_uuid") or "",
             "segset_label": row.get("segset_label") or "",
@@ -4311,6 +4313,10 @@ def full_export(req: FullExportRequest, request: Request) -> Response:
             score_kind, corpus.num_rows, took_ms,
         )
         _record_full_export(req, request, corpus, table, vec, parquet_uri, sel)
+        _publish_full_export(
+            req, request, base, parquet_uri, segset_label, sel, table.num_rows,
+            corpus, score_kind,
+        )
         return Response(
             content=_arrow_csv(table),
             media_type="text/csv",
@@ -4334,6 +4340,12 @@ def _full_export_intervals(
     rows = _interval_rows_full(intervals, corpus, req.query.strip())
     base = _export_base(req.tag or "intervals")
     parquet_uri = _write_interval_export_parquet(rows, name=base)
+    # Same publish as the clip path: this branch returns early, so leaving it out
+    # meant interval exports -- the mode the app defaults to -- never appeared in
+    # Recent scans.
+    _publish_full_export(
+        req, request, base, parquet_uri, "", sel, len(rows), corpus, "bounded_approx"
+    )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
         "full export (intervals) %r -> %d intervals from %d clips in %.1fms",
@@ -4505,6 +4517,62 @@ def _record_full_export(req, request: Request, corpus, table, vec, parquet_uri: 
         )
     except Exception as exc:  # noqa: BLE001 - never block the download
         LOGGER.warning("full export not recorded: %s", exc)
+
+
+def _publish_full_export(
+    req, request: Request, base: str, parquet_uri: str, segset_label: str,
+    sel, num_rows: int, corpus, score_kind: str,
+) -> None:
+    """Publish a finished export to the Recent scans panel.
+
+    An export is only useful to one person if it lives in their browser's
+    downloads. The panel is the shared record of what has been produced and
+    where the artifact landed, so an in-app export belongs in it for the same
+    reason a Lilypad scan does -- the difference is `source`, not visibility.
+
+    Best-effort: an export that downloaded fine must not fail because the
+    listing row could not be written.
+    """
+    tag = req.tag or req.query.strip()
+    try:
+        ok = db.insert_scan_job(
+            {
+                "execution_id": base,
+                "user_email": _current_user(request),
+                "tags": [tag],
+                "thresholds": {tag: float(sel.cutoff)},
+                "output_dir": parquet_uri.rsplit("/", 1)[0] if parquet_uri else "",
+                "lance_uri": parquet_uri,
+                "console_url": "",
+                "status": "SUCCEEDED",
+                "register_segset": bool(req.create_segment_set),
+                "segset_name": segset_label,
+                "filters": {
+                    "date_from": req.from_date,
+                    "date_to": req.to_date,
+                    "vehicle": req.vehicle,
+                    "drive_id": req.drive_id,
+                    "segment_set_uuid": req.segment_set_uuid,
+                    "filter_lance_uri": req.filter_lance_uri,
+                },
+                "source": "app",
+            }
+        )
+        if ok:
+            db.set_scan_counts(
+                base,
+                {
+                    "num_segments": int(num_rows),
+                    "num_clips_scanned": int(corpus.num_rows),
+                    "candidates": int(sel.candidates),
+                    "truncated": bool(sel.truncated),
+                    "score_kind": score_kind,
+                },
+            )
+        if segset_label:
+            db.set_scan_segset(base, "", segset_label)
+    except Exception as exc:  # noqa: BLE001 - never fail a completed download
+        LOGGER.warning("full export not published to Recent scans: %s", exc)
 
 
 @app.post("/api/full_threshold")
