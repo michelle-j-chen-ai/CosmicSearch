@@ -248,6 +248,15 @@ class FullCorpus:
             return (0, 0)
         return (int(starts.min()), int(starts.max()))
 
+    def has_segment_id(self) -> bool:
+        """Whether any row carries a segment_id (drives the UI's capability note)."""
+        import pyarrow.compute as pc
+
+        seg = self._meta["segment_id"]
+        if seg is None:
+            return False
+        return bool(pc.any(pc.not_equal(seg, "")).as_py())
+
     def vehicles(self) -> list[str]:
         """Distinct vehicle ids present, for populating a filter UI."""
         return sorted(v for v in self._meta["vehicle_uniques"] if v)

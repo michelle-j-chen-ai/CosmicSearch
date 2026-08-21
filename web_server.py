@@ -7,7 +7,7 @@ segment sets) and ``config`` unchanged, and serves a hand-built frontend from
 exactly like the Streamlit ``cache_resource`` path.
 
 Run locally:
-    NLS_EMBEDDINGS_URI=... uvicorn web_server:app --host 127.0.0.1 --port 8501
+    uvicorn web_server:app --host 127.0.0.1 --port 8501
 """
 
 from __future__ import annotations
@@ -112,9 +112,11 @@ def _load_engine() -> None:
     )
     cfg = AppConfig.from_env()
     _state["cfg"] = cfg
-    _state["corpora"] = {}  # embeddings_uri -> Corpus (resident cache)
     _state["s3"] = oci_s3.s3_client()
-    _state["active_uri"] = cfg.default_embeddings_uri
+    # One corpus, named once. Kept in _state because several endpoints stamp it
+    # onto persisted rows (exported vectors, threshold policies) as the space
+    # those numbers belong to.
+    _state["active_uri"] = full_corpus_module().DEFAULT_CORPUS_TABLE_URI
     threading.Thread(target=_warm_engine, name="engine-warmup", daemon=True).start()
     # Pre-warm the DORA gRPC channel + machine token now (independent of the
     # model), so the first segment-set selection doesn't pay channel/auth setup.
@@ -140,16 +142,9 @@ def _warm_engine() -> None:
         )
         _state["model_uri"] = cfg.model_artifact_uri  # active encoder (swappable)
         _state["model_ready"] = True  # endpoints unblock here
-        LOGGER.info("model ready; pre-warming default corpus ...")
+        LOGGER.info("model ready")
         db.init_schema()  # best-effort; logs + continues if exp-db is unreachable
-        try:
-            rows = _get_corpus(cfg.default_embeddings_uri).num_rows
-            LOGGER.info("ready: %d corpus rows", rows)
-        except _CORPUS_ERRORS as exc:
-            # A bad/slow default corpus must not wedge the app -- users can still
-            # load another corpus by URI now that the model is up.
-            LOGGER.warning("default corpus pre-warm failed: %s", exc)
-        # Full-corpus search is the default, so start its load here rather than
+        # There is one corpus, so start its load here rather than
         # waiting for someone to search: the read and decode take minutes, and
         # paying that on a user's first query reads as a hang. Runs on its own
         # thread and never gates readiness -- browse works throughout.
@@ -235,31 +230,6 @@ def platform() -> dict:
 # per-URI lock only ONE load runs; the rest block briefly then get the cached one.
 _CORPUS_LOCKS_GUARD = threading.Lock()
 _CORPUS_LOCKS: dict[str, threading.Lock] = {}
-
-
-def _get_corpus(uri: str) -> search_engine.Corpus:
-    """Load + cache a corpus by its embeddings URI (resident, once per URI).
-
-    Concurrency-safe: a per-URI lock ensures a given corpus is loaded exactly once
-    even under concurrent requests, so duplicate in-flight loads can't blow up
-    memory. Callers that arrive mid-load block on the lock and return the shared
-    resident corpus rather than starting their own."""
-    uri = (uri or _state["cfg"].default_embeddings_uri).strip()
-    cache = _state["corpora"]
-    c = cache.get(uri)
-    if c is not None:
-        return c
-    with _CORPUS_LOCKS_GUARD:
-        load_lock = _CORPUS_LOCKS.setdefault(uri, threading.Lock())
-    with load_lock:
-        c = cache.get(
-            uri
-        )  # re-check: another thread may have loaded it while we waited
-        if c is None:
-            LOGGER.info("loading corpus %s ...", uri)
-            c = search_engine.load_corpus(uri, _state["cfg"].matrix_dtype)
-            cache[uri] = c
-    return c
 
 
 # --- helpers ----------------------------------------------------------------
@@ -380,33 +350,6 @@ def _segment_ids(uuid: str) -> frozenset[str] | None:
 
     threading.Thread(target=_load, name=f"segload-{uuid[:8]}", daemon=True).start()
     return None
-
-
-def _scored_order(query, start_unix, end_unix, allowed_mask, corpus, uri, seg_sig):
-    """Encode + score + rank, memoizing the last (uri, query, filters) for paging.
-
-    ``allowed_mask`` is the cached corpus-aligned boolean mask for the segment
-    set (or None); ``seg_sig`` keys the cache (the uuid + whether the filter was
-    actually applied).
-    """
-    sig = (uri, query, start_unix, end_unix, seg_sig)
-    cache = _state.get("last")
-    if cache and cache["sig"] == sig:
-        return cache["scores"], cache["order"]
-    vec = search_engine.encode_query(
-        query, _state["processor"], _state["model"], _state["cfg"].device
-    )
-    scores = search_engine.score_corpus(vec, corpus)
-    order = search_engine.ranked_order(
-        scores,
-        corpus,
-        start_unix=start_unix,
-        end_unix=end_unix,
-        allowed_mask=allowed_mask,
-    )
-    # Keep the encoded vector too, so export can persist it without re-encoding.
-    _state["last"] = {"sig": sig, "scores": scores, "order": order, "vec": vec}
-    return scores, order
 
 
 def _resolve_segment_filter(seg_uuid: str | None):
@@ -713,74 +656,10 @@ def _parse_drive_ids(drive_id: str | None) -> frozenset[str]:
     )
 
 
-def _combined_mask(
-    uri: str,
-    corpus,
-    seg_uuid: str | None,
-    lance_uri: str | None,
-    vehicle: str | None = None,
-    drive_id: str | None = None,
-):
-    """Resolve all downsample sources into ONE corpus mask (AND of segment-set,
-    lance, vehicle, and drive id).
-
-    Returns ``(mask_or_None, pending, seg_count, lance_count, lance_key,
-    lance_error, seg_sig)``. ``seg_sig`` keys the score/order cache and folds in
-    ALL filters so paging never reuses a stale ranking when any one changes.
-    """
-    seg_mask, pending, seg_count = _resolve_segment_mask(uri, seg_uuid, corpus)
-    lance_mask = None
-    lance_count = 0
-    lance_key: str | None = None
-    lance_error: str | None = None
-    if lance_uri:
-        try:
-            lance_key, ids = _lance_filter_ids(lance_uri.strip())
-            lance_mask = _lance_filter_mask(
-                uri, lance_uri.strip(), corpus, lance_key, ids
-            )
-            lance_count = len(ids)
-        except _CORPUS_ERRORS as exc:  # surfaced to the UI, never silently dropped
-            lance_error = str(exc)
-            LOGGER.warning("lance downsample load failed for %s: %s", lance_uri, exc)
-    if seg_mask is not None and lance_mask is not None:
-        combined = seg_mask & lance_mask
-    elif seg_mask is not None:
-        combined = seg_mask
-    else:
-        combined = lance_mask
-    # Vehicle filter: AND a vehicle-membership mask (inert when the corpus has no
-    # vehicle column or no vehicles requested).
-    veh_set = _parse_vehicles(vehicle)
-    veh_part = None
-    if veh_set:
-        veh_mask = search_engine.vehicle_mask(corpus, veh_set)
-        if veh_mask is not None:
-            combined = veh_mask if combined is None else (combined & veh_mask)
-            veh_part = tuple(sorted(veh_set))
-    # Drive-id filter: AND a run_uuid-membership mask (run_uuid is always present).
-    drive_set = _parse_drive_ids(drive_id)
-    drive_part = None
-    if drive_set:
-        drive_m = search_engine.run_mask(corpus, drive_set)
-        combined = drive_m if combined is None else (combined & drive_m)
-        drive_part = tuple(sorted(drive_set))
-    seg_part = seg_uuid if (seg_uuid and not pending) else None
-    lance_part = lance_uri.strip() if (lance_uri and lance_error is None) else None
-    seg_sig = (
-        (seg_part, lance_part, veh_part, drive_part)
-        if (seg_part or lance_part or veh_part or drive_part)
-        else None
-    )
-    return combined, pending, seg_count, lance_count, lance_key, lance_error, seg_sig
-
-
 def _resident_corpus():
-    """The active corpus if it is already resident, else None (no load triggered)."""
-    uri = (
-        _state.get("active_uri") or _state["cfg"].default_embeddings_uri or ""
-    ).strip()
-    return _state["corpora"].get(uri)
+    """The full corpus if it is already loaded, else None (no load triggered)."""
+    with _FULL_LOCK:
+        return _FULL["corpus"]
 
 
 def _current_user(request: Request) -> str:
@@ -811,7 +690,15 @@ def _utc(sec: int | None) -> str:
     )
 
 
-def _hit_dict(h: search_engine.RankedHit) -> dict:
+def _hit_dict(h) -> dict:
+    """One hit as the UI grid expects it.
+
+    Takes either a `search_engine.RankedHit` or a `full_corpus.Hit`: the two
+    agree on every field but the row address, and they number different things
+    -- `index` is a resident-corpus position, `row` a full-corpus one. Each hit
+    carries whichever it has, so a mark made on it can be resolved against the
+    corpus it actually came from.
+    """
     return {
         "rank": h.rank,
         "score": round(float(h.score), 4),
@@ -823,7 +710,8 @@ def _hit_dict(h: search_engine.RankedHit) -> dict:
         "start_utc": _utc(h.chunk_start_unix),
         "end_utc": _utc(h.chunk_end_unix),
         "source_media_uri": h.source_media_uri,
-        "index": h.index,
+        "index": getattr(h, "index", -1),
+        "row": getattr(h, "row", None),
     }
 
 
@@ -837,7 +725,6 @@ class SearchRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
-    filter_lance_uri: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -870,7 +757,6 @@ class RefineRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
-    filter_lance_uri: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -929,7 +815,6 @@ class ThresholdSearchRequest(BaseModel):
     to_date: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
     embeddings_uri: str | None = None
@@ -958,7 +843,6 @@ class VectorSearchRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
-    filter_lance_uri: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -989,7 +873,6 @@ class WindowSearchRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
-    filter_lance_uri: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
@@ -1056,7 +939,6 @@ class CurateExportRequest(BaseModel):
     embeddings_uri: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    filter_lance_uri: str | None = None
     from_date: str | None = None
     to_date: str | None = None
 
@@ -1064,28 +946,36 @@ class CurateExportRequest(BaseModel):
 # --- API --------------------------------------------------------------------
 @app.get("/api/corpus")
 def corpus_info(uri: str | None = None) -> dict:
-    """Info for a corpus; if `uri` is given, load + activate it (switch corpus)."""
-    _require_ready()
+    """Info for THE corpus. There is only one, and it cannot be switched.
+
+    `uri` used to load and activate an arbitrary Lance table. Pointing a run at
+    the wrong table silently produces plausible results -- a query scored against
+    another model's embeddings still returns a ranked list -- so the corpus is
+    pinned to `full_corpus.DEFAULT_CORPUS_TABLE_URI` and the parameter is
+    rejected rather than ignored.
+    """
+    if uri and uri.strip() and uri.strip() != full_corpus_module().DEFAULT_CORPUS_TABLE_URI:
+        raise HTTPException(
+            400,
+            "the corpus is fixed to "
+            f"{full_corpus_module().DEFAULT_CORPUS_TABLE_URI} and cannot be switched",
+        )
     cfg = _state["cfg"]
-    try:
-        c = _get_corpus(uri) if uri else _get_corpus(_state["active_uri"])
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    if uri:
-        _state["active_uri"] = uri.strip()
+    c = _require_full_corpus()
     lo, hi = c.time_span()
     return {
         "num_rows": c.num_rows,
         "dim": c.dim,
-        "matrix_dtype": str(c.matrix.dtype),
+        "matrix_dtype": str(c.corpus_i8.dtype),
         "span_lo_date": dt.datetime.fromtimestamp(lo, tz=dt.timezone.utc)
         .date()
         .isoformat(),
         "span_hi_date": dt.datetime.fromtimestamp(hi, tz=dt.timezone.utc)
         .date()
         .isoformat(),
-        "has_segment_id": bool((c.segment_id_array() != "").any()),
-        "embeddings_uri": _state["active_uri"],
+        "has_segment_id": c.has_segment_id(),
+        "embeddings_uri": c.corpus_uri,
+        "corpus_version": c.dataset_version,
         # The ACTIVE (possibly runtime-swapped) encoder, not just the configured
         # default -- so the pill reflects /api/model switches. Friendly name
         # (e.g. "white-dwarf") via _MODEL_LABELS; raw URI kept in model_uri.
@@ -1172,144 +1062,24 @@ def _window(corpus, scores, order, page, page_size, start_rank, start_score, t0,
 
 @app.post("/api/search")
 def search(req: SearchRequest, request: Request) -> dict:
-    _require_ready()
-    if not req.query.strip():
-        raise HTTPException(400, "empty query")
-    t0 = time.time()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, pending, seg_count, lance_count, lance_key, lance_err, seg_sig = (
-        _combined_mask(uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id)
-    )
-    scores, order = _scored_order(
-        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
-    )
-    out = _window(
-        corpus,
-        scores,
-        order,
-        req.page,
-        req.page_size,
-        req.start_rank,
-        req.start_score,
-        t0,
-        f'text: "{req.query.strip()}"',
-    )
-    out["segment_set_pending"] = pending
-    out["segment_set_count"] = seg_count
-    out["filter_lance_count"] = lance_count
-    out["filter_lance_key"] = lance_key
-    out["filter_lance_error"] = lance_err
-    out["funnel"] = search_engine.filter_funnel(
-        corpus, start_unix, end_unix, allowed_mask=seg_mask
-    )
-    # Track what people search (real IAP users only, like visits). Best-effort.
-    user = _current_user(request)
-    if user and user != "local":
-        analytics.record_search(user, req.query.strip(), time.time(), out.get("total"))
-    return out
+    """Retired. This ranked the 2M resident corpus, which no longer exists.
+
+    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
+    nothing, and quietly serving the full corpus from here would change the
+    result set under a client that never asked for it.
+    """
+    raise _gone("/api/full_search")
 
 
 @app.post("/api/refine")
 def refine(req: RefineRequest, request: Request) -> dict:
-    """Re-rank by a Rocchio direction from the 👍/👎 marks, keeping the filters."""
-    _require_ready()
-    t0 = time.time()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    positives = [m.index for m in req.marks if m.mark == "up" and m.index is not None]
-    negatives = [m.index for m in req.marks if m.mark == "down" and m.index is not None]
-    if not positives:
-        raise HTTPException(400, "refine needs at least one 👍 mark")
+    """Retired. This ranked the 2M resident corpus, which no longer exists.
 
-    # Capture every mark in the feedback ledger (per-segment, on use) so the true
-    # count is recorded even if the user never Downloads.
-    db.record_marks(
-        [{"chunk_id": m.chunk_id, "segment_id": m.segment_id, "mark": m.mark} for m in req.marks],
-        query=req.query, user_email=_current_user(request), source="refine",
-        embeddings_uri=uri, model_uri=_state["cfg"].model_artifact_uri,
-    )
-
-    text_vec = None
-    if req.text_weight > 0 and req.query.strip():
-        text_vec = search_engine.encode_query(
-            req.query.strip(),
-            _state["processor"],
-            _state["model"],
-            _state["cfg"].device,
-        )
-    try:
-        # Per-negative penalty: score = cos(x, w_pos) - gamma * max_j cos(x, neg_j).
-        # ``direction`` is the positive prototype w_pos (persisted for export/scan);
-        # ``scores`` already includes the negative penalty for in-app ranking.
-        scores, direction = search_engine.refine_scores(
-            corpus,
-            positives,
-            negative_indices=negatives,
-            text_vector=text_vec,
-            negative_weight=req.negative_weight,
-            text_weight=req.text_weight,
-        )
-    except ValueError as exc:
-        raise HTTPException(400, f"could not refine: {exc}")
-
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, pending, seg_count, lance_count, lance_key, lance_err, seg_sig = (
-        _combined_mask(uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id)
-    )
-    order = search_engine.ranked_order(
-        scores,
-        corpus,
-        start_unix=start_unix,
-        end_unix=end_unix,
-        allowed_mask=seg_mask,
-    )
-    # Cache the refined direction so paging + export reuse it (export persists
-    # this refined vector as the search_vector).
-    _state["last"] = {
-        "sig": (
-            "refine",
-            uri,
-            tuple(positives),
-            tuple(negatives),
-            req.negative_weight,
-            req.text_weight,
-            start_unix,
-            end_unix,
-            seg_sig,
-        ),
-        "scores": scores,
-        "order": order,
-        "vec": direction,
-    }
-    label = f"refined: {len(positives)} 👍 / {len(negatives)} 👎"
-    out = _window(
-        corpus,
-        scores,
-        order,
-        req.page,
-        req.page_size,
-        req.start_rank,
-        req.start_score,
-        t0,
-        label,
-    )
-    out["segment_set_pending"] = pending
-    out["segment_set_count"] = seg_count
-    out["filter_lance_count"] = lance_count
-    out["filter_lance_key"] = lance_key
-    out["filter_lance_error"] = lance_err
-    out["funnel"] = search_engine.filter_funnel(
-        corpus, start_unix, end_unix, allowed_mask=seg_mask
-    )
-    return out
+    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
+    nothing, and quietly serving the full corpus from here would change the
+    result set under a client that never asked for it.
+    """
+    raise _gone("/api/full_refine")
 
 
 @app.get("/api/search_session/{session_id}")
@@ -1354,97 +1124,13 @@ def search_session(session_id: int) -> dict:
 
 @app.post("/api/search_by_vector")
 def search_by_vector(req: VectorSearchRequest) -> dict:
-    """Rank the corpus by a pre-computed query vector (resume a saved search).
+    """Retired. This ranked the 2M resident corpus, which no longer exists.
 
-    Mirrors /api/search but skips text encoding: the vector is supplied (e.g.
-    the persisted search_vector of a previous export), scored directly against
-    the corpus, with the same date + segment-set filters applied.
+    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
+    nothing, and quietly serving the full corpus from here would change the
+    result set under a client that never asked for it.
     """
-    _require_ready()
-    if not req.vector:
-        raise HTTPException(400, "empty search vector")
-    t0 = time.time()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    vec = np.asarray(req.vector, dtype=np.float32)
-    if vec.ndim != 1 or vec.shape[0] != corpus.dim:
-        raise HTTPException(
-            400,
-            f"vector dim {vec.shape[0]} != corpus dim {corpus.dim} -- resume "
-            "against the corpus the search was originally run on",
-        )
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, pending, seg_count, lance_count, lance_key, lance_err, seg_sig = (
-        _combined_mask(uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id)
-    )
-    scores = search_engine.score_corpus(vec, corpus)
-    order = search_engine.ranked_order(
-        scores,
-        corpus,
-        start_unix=start_unix,
-        end_unix=end_unix,
-        allowed_mask=seg_mask,
-    )
-    # Cache so paging reuses the ranking and a follow-up export persists this vec.
-    _state["last"] = {
-        "sig": (
-            "resume",
-            uri,
-            len(req.vector),
-            float(vec[0]),
-            float(vec[-1]),
-            start_unix,
-            end_unix,
-            seg_sig,
-        ),
-        "scores": scores,
-        "order": order,
-        "vec": vec,
-    }
-    label = f'resumed: "{req.query.strip()}"' if req.query.strip() else "resumed search"
-    out = _window(
-        corpus,
-        scores,
-        order,
-        req.page,
-        req.page_size,
-        req.start_rank,
-        req.start_score,
-        t0,
-        label,
-    )
-    out["segment_set_pending"] = pending
-    out["segment_set_count"] = seg_count
-    out["filter_lance_count"] = lance_count
-    out["filter_lance_key"] = lance_key
-    out["filter_lance_error"] = lance_err
-    out["funnel"] = search_engine.filter_funnel(
-        corpus, start_unix, end_unix, allowed_mask=seg_mask
-    )
-    return out
-
-
-# Cap on how many frames a client may send per upload (video sends ~8; the encoder
-# resamples to the model's fixed 8 either way). Bounds the request + decode work.
-_UPLOAD_MAX_FRAMES = 16
-_UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg is tiny)
-
-
-class UploadEncodeRequest(BaseModel):
-    """A user-supplied image OR video (decoded to frames) to encode into the corpus's
-    video/text space. The client sends base64 frames (data-URL prefix tolerated) as
-    JSON -- no python-multipart dependency, and for video only the extracted frames
-    travel, never the whole file. Provide ``frames_b64`` (image: 1 frame; video: the
-    browser-extracted frames from a duration-capped window) or the legacy single
-    ``image_b64``."""
-
-    frames_b64: list[str] = []
-    image_b64: str = ""  # legacy single-image convenience
-    filename: str = ""
-    content_type: str = ""
+    raise _gone("/api/full_search_by_vector")
 
 
 @app.post("/api/search_by_upload")
@@ -1490,93 +1176,58 @@ def search_by_upload(req: UploadEncodeRequest) -> dict:
 
 @app.post("/api/search_by_window")
 def search_by_window(req: WindowSearchRequest) -> dict:
-    """Search by an example video window (query-by-example over the corpus).
+    """Search by an example video window (query-by-example over the whole corpus).
 
     Resolve the mini-segment chunks already embedded for the given drive/segment
-    and time window, mean-pool their embeddings into a query vector, then rank
-    the corpus exactly like /api/search_by_vector -- same date + segment-set
-    filters, same paging, and the pooled vector is cached so a follow-up export
-    (Download CSV / save vector / register segment set) persists it. Also returns
-    ``query_clips``: a handful of the matched chunks (filmstrip preview).
+    and time window, mean-pool their ORIGINAL embeddings into a query vector,
+    then rank the full corpus. The pooling reads the matched clips' 768-d vectors
+    from S3 -- a handful of rows -- because the resident screen is quantized and
+    PCA-reduced and cannot reconstruct a usable query direction.
     """
-    _require_ready()
     if not req.run_uuid.strip() and not req.segment_id.strip():
         raise HTTPException(400, "provide a run_uuid or segment_id for the query window")
-    t0 = time.time()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+    corpus = _require_full_corpus()
     # UI works in unix nanoseconds (like the result timestamps); the corpus
-    # chunk_start/end are unix seconds. 0 leaves that side of the window open.
+    # chunk bounds are unix seconds. 0 leaves that side of the window open.
     start_s = int(req.start_ns) // 1_000_000_000 if req.start_ns else 0
     end_s = int(req.end_ns) // 1_000_000_000 if req.end_ns else 0
     try:
-        wm = search_engine.window_query(
-            corpus,
-            run_uuid=req.run_uuid,
-            segment_id=req.segment_id,
-            start_unix=start_s,
-            end_unix=end_s,
+        rows = corpus.window_rows(
+            run_uuid=req.run_uuid, segment_id=req.segment_id,
+            start_unix=start_s, end_unix=end_s,
         )
     except ValueError as exc:
-        raise HTTPException(404, str(exc))
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, pending, seg_count, lance_count, lance_key, lance_err, seg_sig = (
-        _combined_mask(
-            uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
-        )
-    )
-    scores = search_engine.score_corpus(wm.vector, corpus)
-    order = search_engine.ranked_order(
-        scores, corpus, start_unix=start_unix, end_unix=end_unix, allowed_mask=seg_mask
-    )
-    # Cache like search_by_vector so paging reuses the ranking and a follow-up
-    # export persists this pooled query vector.
-    _state["last"] = {
-        "sig": (
-            "window",
-            uri,
-            req.run_uuid.strip(),
-            req.segment_id.strip(),
-            start_s,
-            end_s,
-            start_unix,
-            end_unix,
-            seg_sig,
-        ),
-        "scores": scores,
-        "order": order,
-        "vec": wm.vector,
-    }
-    key = req.run_uuid.strip() or req.segment_id.strip()
-    label = req.query.strip() or f"video window: {key}"
-    out = _window(
-        corpus,
-        scores,
-        order,
-        req.page,
-        req.page_size,
-        req.start_rank,
-        req.start_score,
-        t0,
-        label,
-    )
-    # The matched query chunks (score = their cosine to the pooled vector).
+        raise HTTPException(400, str(exc))
+    if rows.size == 0:
+        key = req.run_uuid.strip() or req.segment_id.strip()
+        raise HTTPException(404, f"no embedded clips for {key!r} in that window")
+    try:
+        mat = corpus.vectors_for(rows[:_WINDOW_MAX_POOL])
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    pooled = mat.mean(axis=0)
+    norm = float(np.linalg.norm(pooled))
+    if norm == 0.0:
+        raise HTTPException(422, "the window's embeddings cancelled to a zero vector")
+    vec = (pooled / norm).astype(np.float32)
+
+    out = _full_rank(corpus, vec, req, label=req.run_uuid.strip() or req.segment_id.strip())
+    # Filmstrip preview of the clips the query was pooled from.
+    preview = corpus.to_arrow(rows[:12], np.zeros(min(12, rows.size))).to_pydict()
     out["query_clips"] = [
-        _hit_dict(search_engine._hit(corpus, scores, i, 0)) for i in wm.preview
+        {
+            "chunk_id": preview["chunk_id"][i],
+            "run_uuid": preview["run_uuid"][i],
+            "segment_id": preview["segment_id"][i],
+            "start_timestamp_ns": preview["start_timestamp_ns"][i],
+            "end_timestamp_ns": preview["end_timestamp_ns"][i],
+            "source_media_uri": preview["source_media_uri"][i],
+        }
+        for i in range(len(preview["chunk_id"]))
     ]
-    out["query_chunk_count"] = int(wm.indices.size)
-    out["query_span_seconds"] = int(wm.span_seconds)
-    out["segment_set_pending"] = pending
-    out["segment_set_count"] = seg_count
-    out["filter_lance_count"] = lance_count
-    out["filter_lance_key"] = lance_key
-    out["filter_lance_error"] = lance_err
-    out["funnel"] = search_engine.filter_funnel(
-        corpus, start_unix, end_unix, allowed_mask=seg_mask
-    )
+    out["query_clip_count"] = int(rows.size)
     return out
 
 
@@ -1594,7 +1245,7 @@ def segment_set_prefetch(uuid: str) -> dict:
     """
     corpus = _resident_corpus()
     if corpus is not None and corpus.has_internal_ids():
-        _resolve_segment_mask(_state["active_uri"], uuid, corpus)
+        _full_segment_ids(uuid)
     else:
         _segment_ids(uuid)  # idempotent: starts the loader only if not cached/loading
     with _SEG_LOCK:
@@ -1895,7 +1546,7 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
     if not vec:
         raise HTTPException(400, "run a search or refine first to define a vector to save")
     cfg = _state["cfg"]
-    uri = _state.get("active_uri") or cfg.default_embeddings_uri
+    uri = _state["active_uri"]
     saved = db.insert_export(
         {
             "user_email": _current_user(request),
@@ -2007,17 +1658,15 @@ def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
     if not _offline_scan_enabled():
         raise HTTPException(
             403,
-            "offline scan is disabled on this deployment (the full dataset is resident in "
-            "memory; use Download CSV over the in-app corpus instead)",
+            "the offline scan is retired; /api/full_export selects and writes over "
+            "the whole corpus in-process. Set NLS_OFFLINE_SCAN=on only for a match "
+            "set too large for it.",
         )
     if not nls_launcher.available():
         raise HTTPException(503, "scan launch unavailable (lilypad SDK / machine creds missing)")
     cfg = _state["cfg"]
-    uri = _state.get("active_uri") or cfg.default_embeddings_uri
-    try:
-        corpus = _get_corpus(uri)
-    except (ValueError, botocore.exceptions.ClientError) as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
+    corpus = _require_full_corpus()
+    uri = corpus.corpus_uri
 
     # Launch dedup is OPT-IN, via an Idempotency-Key header. A caller that fans the
     # same scan out from many workers (e.g. a Spark stage) sends one key and its
@@ -2497,29 +2146,32 @@ def score_distribution(req: ExportRequest, request: Request) -> dict:
     """Similarity-score histogram across the entire corpus for the current query,
     INDEPENDENT of interval preview/export. Marks the interval threshold tau the
     current mode/k/cutoff would produce, so it doubles as a threshold picker."""
-    _require_ready()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, _p, _sc, _lc, _lk, _le, seg_sig = _combined_mask(
-        uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+    corpus = _require_full_corpus()
+    vec = search_engine.encode_query(
+        req.query.strip(), _state["processor"], _state["model"], _state["cfg"].device
     )
-    scores, order = _scored_order(
-        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
-    )
-    allowed = np.zeros(corpus.num_rows, dtype=bool)
-    allowed[order] = True
+    scores, err = corpus.score(vec)
+    mask = corpus.filter_mask(**_full_filters(req))
+    allowed = mask if mask is not None else np.ones(corpus.num_rows, dtype=bool)
     mode = "score" if req.interval_mode == "score" else "k"
-    tau = search_engine.interval_threshold(
-        scores, corpus, allowed, mode=mode, k=int(req.k), score_cutoff=req.interval_score
-    )
+    if mode == "score":
+        tau = float(req.interval_score or 0.0)
+    else:
+        # k-th best score among the rows that passed the filters -- the cutoff a
+        # top-k export would use, which is what makes this a threshold picker.
+        sub = scores[allowed]
+        k = max(1, min(int(req.k), int(sub.size)))
+        tau = float(np.partition(sub, sub.size - k)[sub.size - k]) if sub.size else 0.0
     dist = _score_histogram(scores, tau)
     if dist is None:
         raise HTTPException(400, "no finite scores to summarize")
     dist["mode"] = mode
+    dist["score_kind"] = "bounded_approx"
+    dist["score_error_bound"] = round(float(err), 4)
+    dist["num_rows_searched"] = corpus.num_rows
+    dist["candidates"] = int(allowed.sum())
     return dist
 
 
@@ -2592,475 +2244,24 @@ def refit_policy(request: Request) -> dict:
 
 @app.post("/api/threshold_search")
 def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
-    """Choose a similarity cutoff for the current query from labeled 👍/👎 marks,
-    and return the next batch of boundary clips to label.
+    """Retired. This ranked the 2M resident corpus, which no longer exists.
 
-    Picking a cosine threshold from labels is binary-classifier operating-point
-    selection: we score the labeled clips with the SAME query+filters the app
-    ranks with, sweep every candidate cutoff, and pick the one optimizing the
-    chosen objective (search_engine.fit_threshold -- no random subsampling). To
-    bootstrap when labels are scarce we also return a score-stratified, boundary-
-    biased batch of UNLABELED clips (search_engine.stratified_boundary_sample);
-    labeling those and re-posting tightens the threshold each round. Overlaid
-    labeled 👍/👎 score arrays + the corpus histogram + the PR curve back the UI.
+    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
+    nothing, and quietly serving the full corpus from here would change the
+    result set under a client that never asked for it.
     """
-    _require_ready()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, _p, _sc, _lc, _lk, _le, seg_sig = _combined_mask(
-        uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
-    )
-    scores, order = _scored_order(
-        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
-    )
-    allowed = np.zeros(corpus.num_rows, dtype=bool)
-    allowed[order] = True
-
-    def _valid(idxs: list[int]) -> list[int]:
-        seen: dict[int, None] = {}
-        for i in idxs:
-            if i is not None and 0 <= int(i) < corpus.num_rows:
-                seen[int(i)] = None
-        return list(seen)
-
-    pos_idx = _valid([m.index for m in req.marks if m.mark == "up"])
-    neg_idx = _valid([m.index for m in req.marks if m.mark == "down"])
-    labeled = set(pos_idx) | set(neg_idx)
-    pos_scores = scores[np.asarray(pos_idx, dtype=np.int64)] if pos_idx else np.array([])
-    neg_scores = scores[np.asarray(neg_idx, dtype=np.int64)] if neg_idx else np.array([])
-
-    fit: dict | None = None
-    note = ""
-    if pos_idx and neg_idx:
-        fit = search_engine.fit_threshold(
-            pos_scores,
-            neg_scores,
-            objective=req.objective,
-            beta=req.beta,
-            min_precision=req.min_precision,
-            val_fraction=req.val_fraction,
-        )
-        if fit["objective"] == "precision" and not fit["precision_floor_met"]:
-            note = (
-                f"No cutoff reaches precision >= {req.min_precision:.2f} on the "
-                "current labels; showing the highest-precision cutoff. Label more "
-                "boundary clips to separate the classes."
-            )
-    else:
-        missing = "positive (👍)" if not pos_idx else "negative (👎)"
-        note = (
-            f"Need at least one {missing} label to fit a threshold. Label the "
-            "boundary clips below, then run again."
-        )
-
-    tau = float(fit["threshold"]) if fit else None
-    # First-pass, label-free policy: a heuristic cutoff from THIS query's own score
-    # distribution, so a fresh tag gets a sensible tau before any labeling. When
-    # there's no fit yet, it also centers the boundary sampling + histogram mark.
-    stats = search_engine.score_stats(scores)
-    # Suggested (label-free) tau: the learned policy for this corpus if one is fitted,
-    # otherwise the mean+3*std heuristic. Cheap dot product on the request path.
-    suggested = _suggested_tau(uri, stats)
-    tau_for_sampling = tau if tau is not None else suggested
-    # Next active-labeling batch: boundary-biased, excludes already-labeled rows,
-    # restricted to the same filtered candidate set the search is ranking.
-    sample_idx = search_engine.stratified_boundary_sample(
-        scores, allowed, labeled, req.sample_size, tau=tau_for_sampling, band=req.band
-    )
-    rank_of = np.empty(corpus.num_rows, dtype=np.int64)
-    rank_of[order] = np.arange(1, order.size + 1)
-    sample_hits = [
-        _hit_dict(search_engine._hit(corpus, scores, i, int(rank_of[i])))
-        for i in sample_idx
-    ]
-
-    # Log a training episode when a labeled fit exists: (score features, suggested
-    # tau, fit tau, metrics). Accumulates rows for a future learned policy; the
-    # data is otherwise transient. insert_threshold_episode is best-effort (it
-    # swallows DB errors internally, like insert_export), so this never blocks.
-    if fit is not None:
-        db.insert_threshold_episode(
-            {
-                "user_email": _current_user(request),
-                "query": req.query.strip(),
-                "tag": req.query.strip(),
-                "model_uri": _state["cfg"].model_artifact_uri,
-                "embeddings_uri": uri,
-                "features": stats,
-                "suggested_tau": suggested,
-                "fit_tau": tau,
-                "f1": fit["f1"],
-                "precision": fit["precision"],
-                "recall": fit["recall"],
-                "average_precision": fit["average_precision"],
-                "objective": fit["objective"],
-                "n_pos": fit["n_pos"],
-                "n_neg": fit["n_neg"],
-            }
-        )
-        # Refresh the learned policy in the background as episodes accumulate.
-        _maybe_refit_policy_async(uri)
-
-    # Capture the per-segment marks in the feedback ledger (distinct, on use) --
-    # separate from the aggregate episode above, which only stores counts.
-    db.record_marks(
-        [{"chunk_id": m.chunk_id, "segment_id": m.segment_id, "mark": m.mark} for m in req.marks],
-        query=req.query, user_email=_current_user(request), source="threshold",
-        embeddings_uri=uri, model_uri=_state["cfg"].model_artifact_uri,
-    )
-
-    hist = _score_histogram(scores, tau_for_sampling)
-    return {
-        "threshold": tau,
-        "suggested_threshold": suggested,
-        "fit": fit,
-        "note": note,
-        "num_up": len(pos_idx),
-        "num_down": len(neg_idx),
-        # Small labeled arrays for the overlaid 👍/👎 histograms in the UI.
-        "up_scores": [round(float(s), 4) for s in pos_scores.tolist()],
-        "down_scores": [round(float(s), 4) for s in neg_scores.tolist()],
-        "histogram": hist,
-        "sample": sample_hits,
-    }
-
-
-def _export_intervals(
-    req: ExportRequest, request: Request, corpus, uri: str, scores, order
-) -> Response:
-    """Interval-granularity export: project clip scores -> 4s grid -> merged,
-    interpolated intervals (CSV + parquet). ``order`` already reflects the active
-    date/segment/lance/vehicle filters, so reuse it to build the allowed mask."""
-    allowed = np.zeros(corpus.num_rows, dtype=bool)
-    allowed[order] = True
-    mode = "score" if req.interval_mode == "score" else "k"
-    intervals, tau = search_engine.project_intervals(
-        scores,
-        corpus,
-        allowed,
-        mode=mode,
-        k=int(req.k),
-        score_cutoff=req.interval_score,
-    )
-    rows = _interval_rows(intervals, corpus, req.query.strip())
-    base = _export_base(req.tag or "intervals")
-    csv_text = _interval_csv(rows)
-    parquet_uri = _write_interval_export_parquet(rows, name=base)
-
-    vec = _state.get("last", {}).get("vec")
-    saved = db.insert_export(
-        {
-            "user_email": _current_user(request),
-            "query": req.query.strip(),
-            "tag": req.tag,
-            "k": int(req.k),
-            "num_results": len(rows),
-            "model_uri": _state["cfg"].model_artifact_uri,
-            "embeddings_uri": uri,
-            "segment_set_uuid": req.segment_set_uuid,
-            "segment_set_name": req.segment_set_name,
-            "date_from": req.from_date,
-            "date_to": req.to_date,
-            "filter_lance_uri": req.filter_lance_uri,
-            "vehicle": req.vehicle,
-            "drive_id": req.drive_id,
-            "thumbs_up": [],
-            "thumbs_down": [],
-            "search_vector": vec.tolist() if vec is not None else [],
-            "parquet_uri": parquet_uri,
-        }
-    )
-    # Segment-set registration is not yet supported for intervals (would need
-    # creating new DORA segments with start/end times). Report it, don't fail.
-    segset_error = (
-        "intervals: segment-set export not supported yet"
-        if req.create_segment_set
-        else ""
-    )
-    return Response(
-        content=csv_text,
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": f'attachment; filename="{base}.csv"',
-            "X-NLS-Saved": "1" if saved else "0",
-            "X-NLS-Parquet": parquet_uri,
-            "X-NLS-Export-Name": base,
-            "X-NLS-Segset": "",
-            "X-NLS-Segset-Error": segset_error,
-            "X-NLS-Interval-Threshold": f"{tau:.6f}",
-            "X-NLS-Interval-Count": str(len(rows)),
-        },
-    )
-
-
-def _dedupe_order_by_segment(corpus, order: np.ndarray) -> np.ndarray:
-    """Collapse a score-ranked index array to the best clip per segment_id: keep the first
-    (= highest-scoring, since ``order`` is score-desc) clip of each distinct segment, plus
-    every clip that has no segment_id (those can't be merged). Rank order is preserved.
-    Returns ``order`` unchanged when the corpus carries no usable segment_id."""
-    seg = corpus.segment_id_array()
-    if seg is None or not seg.any():
-        return order
-    seg_ranked = seg[order]
-    _vals, first_idx = np.unique(seg_ranked, return_index=True)  # first occ of each segment
-    empty_idx = np.nonzero(seg_ranked == "")[0]  # keep ALL clips lacking a segment_id
-    keep = np.unique(np.concatenate([first_idx, empty_idx]))  # sorted -> preserves rank order
-    return order[keep]
+    raise _gone("/api/full_threshold")
 
 
 @app.post("/api/export")
 def export(req: ExportRequest, request: Request) -> Response:
-    """Build the top-k CSV, persist the session to exp-db (best-effort), return CSV.
+    """Retired. This ranked the 2M resident corpus, which no longer exists.
 
-    Also writes a parquet copy of the same rows to the OCI export prefix and
-    records its path with the export. The ``X-NLS-Saved`` response header reports
-    whether the Postgres row was written and ``X-NLS-Parquet`` carries the
-    written parquet URI (empty if none), so the UI can report both without
-    blocking the download.
+    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
+    nothing, and quietly serving the full corpus from here would change the
+    result set under a client that never asked for it.
     """
-    _require_ready()
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-
-    # Capture the per-segment marks in the feedback ledger (covers both the CSV
-    # and interval export paths); the export_log row below also keeps a snapshot.
-    db.record_marks(
-        [{"chunk_id": m.chunk_id, "segment_id": m.segment_id, "mark": m.mark} for m in req.marks],
-        query=req.query, user_email=_current_user(request), source="export",
-        embeddings_uri=uri, model_uri=_state["cfg"].model_artifact_uri,
-    )
-
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, _pending, _sc, _lc, _lk, _le, seg_sig = _combined_mask(
-        uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
-    )
-    scores, order = _scored_order(
-        req.query.strip(), start_unix, end_unix, seg_mask, corpus, uri, seg_sig
-    )
-    if req.interval:
-        return _export_intervals(req, request, corpus, uri, scores, order)
-
-    # Optional segment_id dedup: collapse to the best clip per segment BEFORE the top-k cut,
-    # so the CSV holds k distinct segments (not k clips that may repeat a segment).
-    if req.dedupe_segment:
-        order = _dedupe_order_by_segment(corpus, order)
-    total = int(order.size)
-
-    hits = search_engine.hits_from_order(corpus, scores, order, 0, int(req.k))
-
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(
-        [
-            "rank",
-            "score",
-            "segment_id",
-            "chunk_id",
-            "run_uuid",
-            "start_timestamp_ns",
-            "end_timestamp_ns",
-            "source_media_uri",
-            "tag",
-        ]
-    )
-    for h in hits:
-        w.writerow(
-            [
-                h.rank,
-                f"{h.score:.6f}",
-                h.segment_id,
-                h.chunk_id,
-                h.run_uuid,
-                _ns(h.chunk_start_unix),
-                _ns(h.chunk_end_unix),
-                h.source_media_uri,
-                req.tag,
-            ]
-        )
-
-    def _mark_rows(kind: str) -> list[dict]:
-        return [
-            {
-                "chunk_id": m.chunk_id,
-                "segment_id": m.segment_id,
-                # Persist the corpus row index too, so a later Resume can re-apply
-                # these marks AND feed them straight into Refine (which keys on
-                # index). Older rows without it still restore visually.
-                "index": m.index,
-                "rank": m.rank,
-                "score": m.score,
-            }
-            for m in req.marks
-            if m.mark == kind
-        ]
-
-    base = _export_base(req.tag)
-    parquet_uri = _write_export_parquet(hits, req.tag, name=base)
-
-    segset_label, segset_error = "", ""
-    if req.create_segment_set:
-        segset_label, segset_error = _create_export_segment_set(
-            (h.segment_id for h in hits),
-            base,
-            provenance={
-                "source": "nls_search_app",
-                "query": req.query.strip(),
-                "embeddings_uri": uri,
-                "model_uri": _state["cfg"].model_artifact_uri,
-                "segment_set_uuid": req.segment_set_uuid,
-                "filter_lance_uri": req.filter_lance_uri,
-                "date_from": req.from_date,
-                "date_to": req.to_date,
-            },
-        )
-
-    vec = _state.get("last", {}).get("vec")
-    saved = db.insert_export(
-        {
-            "user_email": _current_user(request),
-            "query": req.query.strip(),
-            "tag": req.tag,
-            "k": int(req.k),
-            "num_results": total,
-            "model_uri": _state["cfg"].model_artifact_uri,
-            "embeddings_uri": uri,
-            "segment_set_uuid": req.segment_set_uuid,
-            "segment_set_name": req.segment_set_name,
-            "date_from": req.from_date,
-            "date_to": req.to_date,
-            "filter_lance_uri": req.filter_lance_uri,
-            "vehicle": req.vehicle,
-            "drive_id": req.drive_id,
-            "thumbs_up": _mark_rows("up"),
-            "thumbs_down": _mark_rows("down"),
-            "search_vector": vec.tolist() if vec is not None else [],
-            "parquet_uri": parquet_uri,
-        }
-    )
-
-    return Response(
-        content=buf.getvalue(),
-        media_type="text/csv",
-        headers={
-            "Content-Disposition": f'attachment; filename="{base}.csv"',
-            "X-NLS-Saved": "1" if saved else "0",
-            "X-NLS-Parquet": parquet_uri,
-            "X-NLS-Export-Name": base,
-            "X-NLS-Segset": segset_label,
-            "X-NLS-Segset-Error": segset_error,
-        },
-    )
-
-
-def _query_vector(query: str, uri: str, model_uri: str, corpus):
-    """``(vector, reused)``: reuse a stored search vector for this query from exp-db
-    when present and dimensionally valid, else encode fresh. The lookup is by TAG
-    (config export persists each query under tag=query) scoped to this corpus+model,
-    so a prior run's vector is reused read-only. Backs "Export from config" reuse."""
-    stored = db.find_vector_by_tag(query, uri, model_uri)
-    if stored is not None:
-        vec = np.asarray(stored, dtype=np.float32)
-        if vec.ndim == 1 and vec.shape[0] == corpus.dim:
-            return vec, True
-        LOGGER.info(
-            "stored vector for %r has dim %d != corpus %d; re-encoding",
-            query,
-            int(vec.shape[0]) if vec.ndim == 1 else -1,
-            corpus.dim,
-        )
-    vec = search_engine.encode_query(
-        query, _state["processor"], _state["model"], _state["cfg"].device
-    )
-    return vec, False
-
-
-def _config_csv(rows: list) -> str:
-    """CSV text for multi-query rows -- a list of ``(query, RankedHit)``. The query is
-    written into the ``tag`` column (no separate query column). Shared by
-    ``/api/export_config`` and ``/api/curate_export`` so their output is identical."""
-    buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(
-        [
-            "rank",
-            "score",
-            "segment_id",
-            "chunk_id",
-            "run_uuid",
-            "start_timestamp_ns",
-            "end_timestamp_ns",
-            "source_media_uri",
-            "tag",
-        ]
-    )
-    for q, h in rows:
-        w.writerow(
-            [
-                h.rank,
-                f"{h.score:.6f}",
-                h.segment_id,
-                h.chunk_id,
-                h.run_uuid,
-                _ns(h.chunk_start_unix),
-                _ns(h.chunk_end_unix),
-                h.source_media_uri,
-                q,
-            ]
-        )
-    return buf.getvalue()
-
-
-def _write_config_export_parquet(rows: list, name: str | None = None) -> str:
-    """Write multi-query config-export rows as parquet under the export prefix.
-
-    ``rows`` is a list of ``(query, RankedHit)``; the row's query is written into the
-    ``tag`` column (no separate query column). Mirrors ``_write_export_parquet``;
-    best-effort (returns "" on failure). When ``name`` is given the object stem is
-    exactly ``name`` (matching the CSV download + segment-set name)."""
-    prefix = _state["cfg"].export_s3_prefix.strip()
-    if not prefix:
-        return ""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    table = pa.table(
-        {
-            "rank": [h.rank for _, h in rows],
-            "score": [float(h.score) for _, h in rows],
-            "segment_id": [h.segment_id for _, h in rows],
-            "chunk_id": [h.chunk_id for _, h in rows],
-            "run_uuid": [h.run_uuid for _, h in rows],
-            "start_timestamp_ns": [_ns(h.chunk_start_unix) for _, h in rows],
-            "end_timestamp_ns": [_ns(h.chunk_end_unix) for _, h in rows],
-            "source_media_uri": [h.source_media_uri for _, h in rows],
-            "tag": [q for q, _ in rows],
-        }
-    )
-    sink = io.BytesIO()
-    pq.write_table(table, sink)
-
-    stem = name or _export_base("config_export")
-    key = f"{prefix.rstrip('/')}/{stem}.parquet"
-    try:
-        oci_s3.put_bytes(key, sink.getvalue(), _state["s3"], "application/octet-stream")
-        LOGGER.info("config export parquet written: %s (%d rows)", key, len(rows))
-        return key
-    except (
-        ValueError,
-        botocore.exceptions.BotoCoreError,
-        botocore.exceptions.ClientError,
-    ) as exc:
-        LOGGER.warning(
-            "config export parquet write failed (%s): %s", type(exc).__name__, exc
-        )
-        return ""
+    raise _gone("/api/full_export")
 
 
 @app.post("/api/export_config")
@@ -3073,46 +2274,29 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
     for this exact ``(query, corpus, model)``; otherwise it is encoded and persisted
     so the next run reuses it (and the query shows up in Search history).
     """
-    _require_ready()
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
     queries = [q for q in req.queries if q.query.strip()]
     if not queries:
         raise HTTPException(400, "no queries in config")
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    # One filter mask (date + segment set + lance superset) reused for every query.
-    seg_mask, _pending, _sc, _lc, _lk, _le, _sig = _combined_mask(
-        uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
-    )
+    corpus = _require_full_corpus()
+    uri = corpus.corpus_uri
+    # One filter set (date + vehicle + drive + segment set + lance) for every query.
+    filters = _full_filters(req)
     model_uri = _state["cfg"].model_artifact_uri
 
-    rows: list = []  # (query, RankedHit) in config order, per-query rank 1..k
+    rows: list = []  # (query, Hit) in config order, per-query rank 1..k
     new_encodes = 0
     saved_any = False
     for cq in queries:
         q = cq.query.strip()
         vec, reused = _query_vector(q, uri, model_uri, corpus)
-        scores = search_engine.score_corpus(vec, corpus)
-        order = search_engine.ranked_order(
-            scores,
-            corpus,
-            start_unix=start_unix,
-            end_unix=end_unix,
-            allowed_mask=seg_mask,
-        )
-        # Select by similarity threshold when given (clips with cosine >= threshold, capped at
-        # k as a safety max), else pure top-k. order is score-descending, so the above-threshold
-        # clips are its prefix -- count them via searchsorted on the negated (ascending) scores.
+        # Threshold when given (clips scoring >= it, capped at k as a safety max),
+        # else pure top-k. Selecting top-k first and trimming is the same set: the
+        # ranking is score-descending, so the above-threshold clips are its prefix.
+        hits, _cand = corpus.search(vec, limit=max(1, int(cq.k)), **filters)
         if cq.threshold and cq.threshold > 0:
-            sc_desc = scores[order]
-            n_above = int(np.searchsorted(-sc_desc, -float(cq.threshold), side="right"))
-            count = min(n_above, int(cq.k))
-        else:
-            count = int(cq.k)
-        hits = search_engine.hits_from_order(corpus, scores, order, 0, count)
+            hits = [h for h in hits if float(h.score) >= float(cq.threshold)]
         LOGGER.info(
             "config export: %r -> %d hits (k=%d threshold=%s, vector %s)",
             q, len(hits), int(cq.k), cq.threshold or "-", "reused" if reused else "encoded",
@@ -3238,34 +2422,21 @@ def curate_preview(req: ConfigExportRequest, request: Request) -> dict:
     New-query vectors are persisted (insert-if-absent, tag=query) exactly as
     export_config does, so previewed queries are reusable and show in Search history.
     """
-    _require_ready()
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
     queries = [q for q in req.queries if q.query.strip()]
     if not queries:
         raise HTTPException(400, "no queries in config")
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
-    try:
-        corpus = _get_corpus(uri)
-    except _CORPUS_ERRORS as exc:
-        raise HTTPException(400, f"could not load corpus: {exc}")
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    seg_mask, _pending, _sc, _lc, _lk, _le, _sig = _combined_mask(
-        uri, corpus, req.segment_set_uuid, req.filter_lance_uri, req.vehicle, req.drive_id
-    )
+    corpus = _require_full_corpus()
+    uri = corpus.corpus_uri
+    filters = _full_filters(req)
     model_uri = _state["cfg"].model_artifact_uri
 
     per_query: list[dict] = []
     for cq in queries:
         q = cq.query.strip()
         vec, reused = _query_vector(q, uri, model_uri, corpus)
-        scores = search_engine.score_corpus(vec, corpus)
-        order = search_engine.ranked_order(
-            scores,
-            corpus,
-            start_unix=start_unix,
-            end_unix=end_unix,
-            allowed_mask=seg_mask,
-        )
-        hits = search_engine.hits_from_order(corpus, scores, order, 0, int(cq.k))
+        hits, _cand = corpus.search(vec, limit=max(1, int(cq.k)), **filters)
         per_query.append(
             {
                 "query": q,
@@ -3307,7 +2478,7 @@ def curate_export(req: CurateExportRequest, request: Request) -> Response:
     _require_ready()
     if not req.rows:
         raise HTTPException(400, "no rows selected to export")
-    uri = (req.embeddings_uri or _state["active_uri"]).strip()
+    uri = _state["active_uri"]
 
     def _sec(ns: int | None) -> int | None:
         return int(ns) // 1_000_000_000 if ns is not None else None
@@ -3922,6 +3093,12 @@ def _full_corpus_begin_load() -> str:
 # filters or use an export instead.
 _FULL_MAX_DEPTH = 5000
 
+# Clips mean-pooled into a query-by-example vector. A long drive can match tens
+# of thousands of chunks, and pooling all of them is both a large S3 read and a
+# worse query -- the direction washes out. The window is the user's selection;
+# this only bounds the read.
+_WINDOW_MAX_POOL = 512
+
 
 def _full_refresh_worker() -> None:
     """Drop the resident corpus, then load the current one.
@@ -4162,10 +3339,147 @@ def _merge_filters(base: dict, extra: dict) -> dict:
     return out
 
 
+def _full_filters(req) -> dict:
+    """Filter kwargs for `full_corpus` from any request carrying the standard
+    filter fields. One definition so no endpoint can quietly support a different
+    subset than the others."""
+    corpus = _require_full_corpus()
+    start_unix, end_unix = _date_bounds(
+        getattr(req, "from_date", None), getattr(req, "to_date", None), corpus
+    )
+    return _merge_filters(
+        {
+            "vehicles": set(_parse_vehicles(getattr(req, "vehicle", None))) or None,
+            "run_uuids": set(_parse_drive_ids(getattr(req, "drive_id", None))) or None,
+            "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
+            "segment_ids": _full_segment_ids(getattr(req, "segment_set_uuid", None)),
+        },
+        _full_lance_filter(getattr(req, "filter_lance_uri", None)),
+    )
+
+
+def _gone(replacement: str) -> "HTTPException":
+    """410 for an endpoint that ranked the retired 2M corpus.
+
+    Deleting these outright would give an external caller a 404 and no idea why;
+    returning a plausible answer from a different corpus would be worse. The
+    replacement is named so a caller can move.
+    """
+    return HTTPException(
+        410,
+        f"this endpoint ranked the retired 2M corpus; use {replacement}, which "
+        "covers the whole table",
+    )
+
+
+def _query_vector(query: str, uri: str, model_uri: str, corpus):
+    """``(vector, reused)``: reuse a stored search vector for this query from exp-db
+    when present and dimensionally valid, else encode fresh. The lookup is by TAG
+    (config export persists each query under tag=query) scoped to this corpus+model,
+    so a prior run's vector is reused read-only. Backs "Export from config" reuse."""
+    stored = db.find_vector_by_tag(query, uri, model_uri)
+    if stored is not None:
+        vec = np.asarray(stored, dtype=np.float32)
+        if vec.ndim == 1 and vec.shape[0] == corpus.dim:
+            return vec, True
+        LOGGER.info(
+            "stored vector for %r has dim %d != corpus %d; re-encoding",
+            query,
+            int(vec.shape[0]) if vec.ndim == 1 else -1,
+            corpus.dim,
+        )
+    vec = search_engine.encode_query(
+        query, _state["processor"], _state["model"], _state["cfg"].device
+    )
+    return vec, False
+
+
+def _config_csv(rows: list) -> str:
+    """CSV text for multi-query rows -- a list of ``(query, RankedHit)``. The query is
+    written into the ``tag`` column (no separate query column). Shared by
+    ``/api/export_config`` and ``/api/curate_export`` so their output is identical."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(
+        [
+            "rank",
+            "score",
+            "segment_id",
+            "chunk_id",
+            "run_uuid",
+            "start_timestamp_ns",
+            "end_timestamp_ns",
+            "source_media_uri",
+            "tag",
+        ]
+    )
+    for q, h in rows:
+        w.writerow(
+            [
+                h.rank,
+                f"{h.score:.6f}",
+                h.segment_id,
+                h.chunk_id,
+                h.run_uuid,
+                _ns(h.chunk_start_unix),
+                _ns(h.chunk_end_unix),
+                h.source_media_uri,
+                q,
+            ]
+        )
+    return buf.getvalue()
+
+
+def _write_config_export_parquet(rows: list, name: str | None = None) -> str:
+    """Write multi-query config-export rows as parquet under the export prefix.
+
+    ``rows`` is a list of ``(query, RankedHit)``; the row's query is written into the
+    ``tag`` column (no separate query column). Mirrors ``_write_export_parquet``;
+    best-effort (returns "" on failure). When ``name`` is given the object stem is
+    exactly ``name`` (matching the CSV download + segment-set name)."""
+    prefix = _state["cfg"].export_s3_prefix.strip()
+    if not prefix:
+        return ""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table(
+        {
+            "rank": [h.rank for _, h in rows],
+            "score": [float(h.score) for _, h in rows],
+            "segment_id": [h.segment_id for _, h in rows],
+            "chunk_id": [h.chunk_id for _, h in rows],
+            "run_uuid": [h.run_uuid for _, h in rows],
+            "start_timestamp_ns": [_ns(h.chunk_start_unix) for _, h in rows],
+            "end_timestamp_ns": [_ns(h.chunk_end_unix) for _, h in rows],
+            "source_media_uri": [h.source_media_uri for _, h in rows],
+            "tag": [q for q, _ in rows],
+        }
+    )
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+
+    stem = name or _export_base("config_export")
+    key = f"{prefix.rstrip('/')}/{stem}.parquet"
+    try:
+        oci_s3.put_bytes(key, sink.getvalue(), _state["s3"], "application/octet-stream")
+        LOGGER.info("config export parquet written: %s (%d rows)", key, len(rows))
+        return key
+    except (
+        ValueError,
+        botocore.exceptions.BotoCoreError,
+        botocore.exceptions.ClientError,
+    ) as exc:
+        LOGGER.warning(
+            "config export parquet write failed (%s): %s", type(exc).__name__, exc
+        )
+        return ""
+
+
 # An export holds its selected rows, their metadata columns and (when exact) a
 # slab of fetched vectors, in a process that already sits near its memory
-# ceiling with the model, browse matrix and 8.8GB screen resident. Two at once
-# is what OOM-kills the container, so exports are serialized rather than queued
+# ceiling with the model and the 8.8GB screen resident. Two at once is what
+# OOM-kills the container, so exports are serialized rather than queued
 # per-request.
 _FULL_EXPORT_LOCK = threading.Lock()
 
@@ -4851,19 +4165,24 @@ def _require_full_corpus():
 
 
 def _full_rank(corpus, vec: np.ndarray, req, *, label: str) -> dict:
-    """Shared ranking + response envelope for the full-corpus vector endpoints."""
-    if req.limit <= 0 or req.limit > 1000:
+    """Shared ranking + response envelope for the full-corpus vector endpoints.
+
+    Accepts either field name for the page size: the vector/refine requests use
+    `limit`, the older window request uses `page_size`.
+    """
+    limit = int(getattr(req, "limit", None) or getattr(req, "page_size", None) or 50)
+    if limit <= 0 or limit > 1000:
         raise HTTPException(400, "limit must be between 1 and 1000")
     if req.page < 0:
         raise HTTPException(400, "page must not be negative")
-    offset = req.page * req.limit
-    if offset + req.limit > _FULL_MAX_DEPTH:
+    offset = req.page * limit
+    if offset + limit > _FULL_MAX_DEPTH:
         raise HTTPException(400, f"full-corpus paging stops at {_FULL_MAX_DEPTH:,} results")
     start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
     t0 = time.perf_counter()
     hits, candidates = corpus.search(
         vec,
-        limit=req.limit,
+        limit=limit,
         offset=offset,
         **_merge_filters(
             {
@@ -4880,7 +4199,7 @@ def _full_rank(corpus, vec: np.ndarray, req, *, label: str) -> dict:
         "full vector search %r -> %d hits over %d rows in %.1fms",
         label, len(hits), corpus.num_rows, took_ms,
     )
-    return _full_payload(hits, candidates, corpus, req, took_ms, label)
+    return _full_payload(hits, candidates, corpus, req, took_ms, label, page_size=limit)
 
 
 @app.post("/api/full_search")
@@ -4947,7 +4266,10 @@ def full_search(req: FullSearchRequest) -> dict:
     return _full_payload(hits, candidates, corpus, req, took_ms, query)
 
 
-def _full_payload(hits, candidates: int, corpus, req, took_ms: float, label: str) -> dict:
+def _full_payload(
+    hits, candidates: int, corpus, req, took_ms: float, label: str,
+    page_size: int | None = None,
+) -> dict:
     """The response envelope shared by every full-corpus ranking endpoint.
 
     Identical in shape to what /api/search returns, so the grid renders these
@@ -4985,7 +4307,7 @@ def _full_payload(hits, candidates: int, corpus, req, took_ms: float, label: str
         "total": min(candidates, _FULL_MAX_DEPTH),
         "candidates": candidates,
         "page": req.page,
-        "page_size": req.limit,
+        "page_size": page_size if page_size is not None else req.limit,
         "elapsed_ms": took_ms,
         "label": label,
         "score_lo": round(min(scores), 4) if scores else 0.0,

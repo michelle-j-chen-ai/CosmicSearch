@@ -26,10 +26,12 @@
 
   <!-- ⚙ corpus / model settings (backend switcher; hidden until opened) -->
   <div class="settings-pop hidden" id="settingsPop">
+    <!-- The corpus is pinned. It used to be typeable, but pointing a run at the
+         wrong table returns a confident ranked list scored against another
+         model's embeddings, with nothing to signal it. Shown read-only. -->
     <div class="settings-row">
       <span class="corpus-k">corpus</span>
-      <input id="embeddings-uri" type="text" class="plain" placeholder="s3://…/chunks.lance  or  s3://…/embeddings/<session>/" />
-      <button id="load-corpus" type="button" class="ghost">Load</button>
+      <input id="embeddings-uri" type="text" class="plain" readonly title="The corpus is fixed and cannot be switched" />
       <span id="corpus-note" class="note"></span>
     </div>
     <div class="settings-row">

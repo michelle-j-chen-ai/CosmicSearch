@@ -113,7 +113,6 @@ function wireEvents() {
   $("navSearch").onclick = () => setPage("search");
   $("navSaved").onclick = () => setPage("saved");
   $("settingsGear").onclick = () => $("settingsPop").classList.toggle("hidden");
-  $("load-corpus").onclick = loadCorpus;
   $("load-model").onclick = loadModel;
 
   const go = () => runSearch();
@@ -186,17 +185,16 @@ function setPage(which) {
   }
 }
 
+// Reports the pinned corpus; there is nothing to switch to. The server rejects
+// a `uri` that is not the pinned one, so offering the choice here would only
+// produce an error the user cannot act on.
 async function loadCorpus() {
-  const uri = $("embeddings-uri").value.trim();
-  if (!uri) return;
-  setNote("corpus-note", "loading corpus (downloading + into memory)…");
-  $("corpusPill").textContent = "loading corpus…";
   try {
-    const c = await fetch("/api/corpus?uri=" + encodeURIComponent(uri)).then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
+    const c = await fetch("/api/corpus").then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
     applyCorpus(c);
-    state.query = ""; state.marks = {}; $("resultsGrid").innerHTML = "";
-    setNote("corpus-note", `Loaded ${fmtInt(c.num_rows)} clips · segment_id ${c.has_segment_id ? "present ✓" : "absent"}`);
-  } catch (e) { setNote("corpus-note", "failed to load corpus: " + e.message, true); $("corpusPill").textContent = "corpus unavailable"; }
+    $("embeddings-uri").value = c.embeddings_uri || "";
+    setNote("corpus-note", `${fmtInt(c.num_rows)} clips · segment_id ${c.has_segment_id ? "present ✓" : "absent"}`);
+  } catch (e) { setNote("corpus-note", "corpus unavailable: " + e.message, true); $("corpusPill").textContent = "corpus unavailable"; }
 }
 async function loadModel() {
   const uri = $("model-uri").value.trim();
@@ -1017,7 +1015,6 @@ async function resumeSession(id) {
   try { s = await fetch("/api/search_session/" + encodeURIComponent(id)).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }); }
   catch (e) { showToast("Could not load: " + e.message); return; }
   if (!s.vector || !s.vector.length) { showToast("That saved search has no stored vector"); return; }
-  if (s.embeddings_uri && s.embeddings_uri !== state.embeddingsUri) { $("embeddings-uri").value = s.embeddings_uri; await loadCorpus(); }
   $("searchInput2").value = s.query || ""; state.query = s.query || "";
   $("tagInput").value = s.tag || "";
   state.marks = {};

@@ -371,13 +371,11 @@ def main() -> None:
     with st.sidebar:
         st.header("Corpus")
         st.caption("The pool of video clips you search over.")
-        embeddings_uri = st.text_input(
-            "Lance embeddings URI",
-            value=config.default_embeddings_uri,
-            placeholder="s3://bucket/.../embeddings/<session>/",
-            help="Parent S3 URI containing rank=NNNNN/ Lance shards. Downloaded "
-            "and cached on first use.",
-        )
+        # Not a text input any more: the corpus is pinned. Pointing a run at a
+        # different table silently returns a plausible ranked list scored against
+        # another model's embeddings, so there is nothing safe to type here.
+        embeddings_uri = full_corpus.DEFAULT_CORPUS_TABLE_URI
+        st.code(embeddings_uri, language=None)
         st.caption(f"Cache root: `{local_cache.cache_root()}`")
 
         st.header("Display")
@@ -503,9 +501,7 @@ def main() -> None:
         if not corpus_has_segment_id:
             st.caption(
                 ":warning: This corpus has no `segment_id`, so a set can't match "
-                "it -- selecting one would return nothing. Point "
-                "`NLS_EMBEDDINGS_URI` at a corpus that carries `segment_id` to "
-                "use this."
+                "it -- selecting one would return nothing."
             )
         if downsample:
             name_filter = st.text_input(
