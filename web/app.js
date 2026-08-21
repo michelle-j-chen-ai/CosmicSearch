@@ -68,9 +68,6 @@ async function loadPlatform() {
   // `offline_scan` hid every historical parquet/segments.lance the moment the
   // launcher was turned off.
   $("scansSection").style.display = "block";
-  $("scansHint").textContent = state.offlineScan
-    ? ""
-    : "History only — exports now run in-app against the full corpus. Past outputs stay downloadable.";
   renderExportPanel();
 }
 
@@ -1374,7 +1371,7 @@ function _renderScans() {
       ? `<a class="scan-copy" href="/api/export_file?uri=${encodeURIComponent(j.lance_uri)}" title="Download this parquet">download</a>`
       : "";
     const out = j.lance_uri
-      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span>`
+      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(_uriShort(j.lance_uri))}</span>`
         + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}</div>`
       : "—";
     let dx = `<span class="scan-dx none">—</span>`;

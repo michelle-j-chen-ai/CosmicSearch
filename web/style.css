@@ -129,7 +129,10 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);-we
 .filterbar{display:flex; align-items:center; gap:12px; margin-bottom:18px; flex-wrap:wrap;}
 .filterbar input[type=text]{flex:1; min-width:220px; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 14px; color:var(--text); font-size:13px;font-family:var(--sans);}
 .icon-btn-sm{background:var(--surface); border:1px solid var(--border); color:var(--muted); border-radius:8px; padding:9px 14px; font-size:13px; cursor:pointer;}
-.table-wrap{background:var(--surface); border:1px solid var(--border-soft); border-radius:12px; overflow:hidden; margin-bottom:22px;}
+/* overflow-x:auto, not hidden: the scans table has eight columns, and clipping
+   silently hid the last two (Output and Data Explorer) with nothing to show a
+   reader there was more to the right. */
+.table-wrap{background:var(--surface); border:1px solid var(--border-soft); border-radius:12px; overflow-x:auto; overflow-y:hidden; margin-bottom:22px;}
 table{width:100%; border-collapse:collapse;}
 thead th{text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted-2); padding:12px 14px; border-bottom:1px solid var(--border-soft); font-weight:500;}
 tbody td{padding:13px 14px; border-bottom:1px solid var(--border-soft); font-size:13px; vertical-align:top;}
@@ -168,8 +171,8 @@ tr.new-row{animation:flashnew 2s ease;}
 .status-pill.succeeded,.status-pill.ok{color:var(--accent); border-color:var(--accent-dim);}
 .status-pill.queued,.status-pill.running{color:var(--warn); border-color:#8a6220;}
 .status-pill.failed,.status-pill.err{color:var(--neg); border-color:#a13a30;}
-.scan-output{display:flex; align-items:flex-start; gap:6px; max-width:360px;}
-.scan-uri{font-family:var(--mono); font-size:11px; color:var(--muted); word-break:break-all; white-space:normal; user-select:all; flex:1; line-height:1.35;}
+.scan-output{display:flex; align-items:center; gap:6px; max-width:230px;}
+.scan-uri{font-family:var(--mono); font-size:11px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; user-select:all; flex:1; line-height:1.35;}
 .scan-copy{flex:0 0 auto; font-size:10px; font-family:var(--sans, inherit); color:var(--muted); background:var(--surface-2); border:1px solid var(--border); border-radius:6px; padding:2px 7px; cursor:pointer; line-height:1.4;}
 .scan-copy:hover{color:var(--fg, #fff); border-color:var(--accent, #c8ff4d);}
 .scan-mode-topk{font-family:var(--mono); font-size:10px; font-weight:600; color:var(--bg, #111); background:var(--accent, #c8ff4d); border-radius:5px; padding:1px 6px; white-space:nowrap;}
