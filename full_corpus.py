@@ -65,6 +65,16 @@ _MEDIA_URI_TEMPLATE = (
     "dt={dt}/{run_uuid}_t{chunk_start_unix}.mp4"
 )
 
+# Rows per take() when fetching exact vectors for an export. take() has a ~1.65s
+# floor per call regardless of size, so bigger is cheaper -- but each chunk holds
+# rows x 768 x 4 bytes (~300MB at 100k) on top of a process already near its
+# ceiling, so this trades a few extra round trips for a bounded peak.
+_EXACT_CHUNK_ROWS = 100_000
+
+# Clip length used when chunk_end_unix is NULL (-1 in the resident array), so
+# interval projection still has a span to work with. Matches interval_core.
+_DEFAULT_WINDOW_S = 8
+
 # Filterable/emittable metadata held resident. source_media_uri and chunk_id are
 # excluded on purpose (both reconstructed above).
 _METADATA_COLUMNS = (
@@ -144,6 +154,31 @@ class Hit:
     chunk_end_unix: int | None
     vehicle: str | None
     dx_internal_id: int | None
+
+
+@dataclasses.dataclass(frozen=True)
+class Selection:
+    """An export-sized result set, held as arrays rather than objects.
+
+    `rows` are corpus row positions in score-descending order and `scores` are
+    the int8 screening scores for exactly those rows. `cutoff` is the score of
+    the worst included row (top-k) or the requested threshold (tau), so a caller
+    can hand either mode's result to the same interval projection.
+
+    `candidates` counts everything that passed the filters and the cutoff BEFORE
+    `max_rows` was applied, so a truncated export still reports how much it left
+    behind instead of quietly presenting a partial answer as complete.
+    """
+
+    rows: np.ndarray
+    scores: np.ndarray
+    error_bound: float
+    candidates: int
+    cutoff: float
+    truncated: bool
+
+    def __len__(self) -> int:
+        return int(self.rows.size)
 
 
 def _dictionary_codes(column: object) -> tuple[np.ndarray, list]:
@@ -275,11 +310,29 @@ class FullCorpus:
 
     # ---- filtering -----------------------------------------------------
 
+    def segment_mask(self, segment_ids: "set[str] | frozenset[str]") -> np.ndarray:
+        """Rows whose segment_id is in `segment_ids`.
+
+        `search_engine.segment_mask` tests membership row by row in Python, which
+        is fine over a few million rows and takes tens of seconds over 34M. The
+        resident segment_id column is Arrow, so `is_in` does the same test in one
+        vectorized pass.
+        """
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        seg = self._meta["segment_id"]
+        if seg is None:
+            return np.zeros(self.num_rows, dtype=bool)
+        hit = pc.is_in(seg, value_set=pa.array(sorted(segment_ids), type=pa.string()))
+        return pc.fill_null(hit, False).to_numpy(zero_copy_only=False).astype(bool)
+
     def filter_mask(
         self,
         vehicles: "set[str] | None" = None,
         date_range: "tuple[int | None, int | None] | None" = None,
         run_uuids: "set[str] | None" = None,
+        segment_ids: "set[str] | frozenset[str] | None" = None,
     ) -> np.ndarray | None:
         """AND of the given filters; None when nothing was asked for.
 
@@ -287,9 +340,11 @@ class FullCorpus:
         vehicle box accepts a list, and a single-value filter silently dropped
         every vehicle but one.
         """
-        if not vehicles and date_range is None and not run_uuids:
+        if not vehicles and date_range is None and not run_uuids and not segment_ids:
             return None
         mask = np.ones(self.num_rows, dtype=bool)
+        if segment_ids:
+            mask &= self.segment_mask(segment_ids)
         if vehicles:
             uniques = self._meta["vehicle_uniques"]
             codes = [i for i, v in enumerate(uniques) if v in vehicles]
@@ -347,6 +402,7 @@ class FullCorpus:
         vehicles: "set[str] | None" = None,
         date_range: "tuple[int | None, int | None] | None" = None,
         run_uuids: "set[str] | None" = None,
+        segment_ids: "set[str] | frozenset[str] | None" = None,
     ) -> "tuple[list[Hit], int]":
         """`(hits, candidates)`: rows `offset`..`offset+limit`, best first.
 
@@ -361,7 +417,7 @@ class FullCorpus:
         if offset < 0:
             raise ValueError("offset must not be negative")
         scores, err = self.score(query)
-        mask = self.filter_mask(vehicles, date_range, run_uuids)
+        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids)
         depth = offset + limit
         if mask is None:
             candidates = self.num_rows
@@ -380,6 +436,261 @@ class FullCorpus:
             ],
             candidates,
         )
+
+    # ---- export-scale selection ---------------------------------------
+
+    def select(
+        self,
+        query: np.ndarray,
+        *,
+        k: int | None = None,
+        tau: float | None = None,
+        vehicles: "set[str] | None" = None,
+        date_range: "tuple[int | None, int | None] | None" = None,
+        run_uuids: "set[str] | None" = None,
+        segment_ids: "set[str] | frozenset[str] | None" = None,
+        max_rows: int = 0,
+    ) -> "Selection":
+        """Rows matching a top-`k` cut or a `tau` threshold, as plain arrays.
+
+        Deliberately NOT `search`: that builds one `Hit` object per result, which
+        is right for a 200-row page and fatal for an export -- a 3.4M-row result
+        costs well over a gigabyte of Python objects plus the GC time to walk
+        them. Everything here stays in numpy, and the metadata is materialized
+        columnwise only once, in `to_arrow`.
+
+        Exactly one of `k` / `tau` is required. `k` is bounded by construction;
+        `tau` is not, so `max_rows` (when non-zero) truncates by score and sets
+        `truncated`, rather than letting a permissive threshold decide how much
+        memory this process uses.
+        """
+        if (k is None) == (tau is None):
+            raise ValueError("pass exactly one of k= or tau=")
+        if k is not None and k <= 0:
+            raise ValueError("k must be positive")
+        scores, err = self.score(query)
+        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids)
+        if mask is None:
+            allowed = None
+            candidates = self.num_rows
+        else:
+            allowed = np.nonzero(mask)[0]
+            candidates = int(allowed.size)
+        if candidates == 0:
+            empty = np.empty(0, dtype=np.int64)
+            return Selection(empty, np.empty(0, dtype=np.float32), err, 0, 0.0, False)
+
+        truncated = False
+        if k is not None:
+            depth = min(int(k), candidates)
+            if allowed is None:
+                rows = self._top_k(scores, depth)
+            else:
+                rows = allowed[self._top_k(scores[allowed], depth)]
+            cut = float(scores[rows[-1]]) if rows.size else 0.0
+        else:
+            # Threshold over the SCREEN score. A row's exact PCA score is within
+            # +/-err of this, so rows within err of tau are genuinely undecided;
+            # `score_kind` on the result says so rather than implying otherwise.
+            hits = scores >= np.float32(tau)
+            if allowed is not None:
+                sub = hits[allowed]
+                rows = allowed[sub]
+            else:
+                rows = np.nonzero(hits)[0]
+            matched = int(rows.size)
+            if max_rows and matched > max_rows:
+                rows = rows[self._top_k(scores[rows], max_rows)]
+                truncated = True
+            else:
+                rows = rows[np.argsort(-scores[rows], kind="stable")]
+            cut = float(tau)
+            # What passed the filters AND the cutoff -- not what passed the
+            # filters alone, which is what a top-k selection reports. A capped
+            # export needs this number to say how much it left behind.
+            candidates = matched
+        return Selection(
+            rows=np.asarray(rows, dtype=np.int64),
+            scores=scores[rows].astype(np.float32),
+            error_bound=err,
+            candidates=candidates,
+            cutoff=cut,
+            truncated=truncated,
+        )
+
+    def tau_for_k(self, query: np.ndarray, k: int, **filters) -> float:
+        """The screen score of the k-th best row: the `tau` that selects the same
+        set `k` does. Every score is already resident, so this is one scan."""
+        sel = self.select(query, k=k, **filters)
+        return float(sel.cutoff)
+
+    def exact_scores(self, rows: np.ndarray, query: np.ndarray) -> np.ndarray:
+        """768-d cosine for `rows`, in the order given, fetched in chunks.
+
+        `rescore` returns a dict keyed by row and verifies every chunk_id, which
+        is right for a page on screen. At export size the dict and the per-row
+        check cost more than the arithmetic, so this returns a bare array and
+        spot-checks instead (see `_verify_alignment`).
+        """
+        if self.dataset is None:
+            raise RuntimeError("corpus has no dataset handle; exact scores unavailable")
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return np.empty(0, dtype=np.float64)
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(q))
+        if norm == 0.0:
+            raise ValueError("query vector is all zeros")
+        q = q / norm
+        col = vector_full_column(CORPUS_MODEL)
+        # take() addresses by canonical position, so the fetch must be ordered;
+        # results are scattered back to the caller's order at the end.
+        order = np.argsort(rows, kind="stable")
+        ordered = rows[order]
+        out = np.empty(rows.size, dtype=np.float64)
+        for at in range(0, ordered.size, _EXACT_CHUNK_ROWS):
+            part = ordered[at : at + _EXACT_CHUNK_ROWS]
+            tbl = self.dataset.take(part, columns=[col])
+            flat = tbl.column(col).combine_chunks().values.to_numpy(
+                zero_copy_only=False
+            )
+            mat = np.asarray(flat, dtype=np.float32).reshape(part.size, -1)
+            out[order[at : at + _EXACT_CHUNK_ROWS]] = np.einsum(
+                "ij,j->i", mat, q, dtype=np.float64
+            )
+        return out
+
+    def _verify_alignment(self, rows: np.ndarray, sample: int = 32) -> None:
+        """Raise if `rows` no longer resolve to the clips this corpus holds.
+
+        Row positions are only valid against the loaded dataset version. A full
+        per-row check is what `rescore` does; at export size that is another pass
+        over the table, so this checks a spread-out sample. It catches a shifted
+        snapshot (which moves every row) without pretending to catch a single
+        altered row.
+        """
+        if self.dataset is None or rows.size == 0:
+            return
+        probe = np.unique(
+            np.linspace(0, rows.size - 1, num=min(sample, rows.size)).astype(np.int64)
+        )
+        idx = np.sort(rows[probe])
+        got = self.dataset.take(idx, columns=["chunk_id"]).column("chunk_id").to_pylist()
+        m = self._meta
+        for pos, row in enumerate(idx):
+            expect = (
+                f"{m['run_uuid_uniques'][m['run_uuid'][row]]}"
+                f"#t{int(m['chunk_start_unix'][row])}"
+            )
+            if got[pos] != expect:
+                raise RuntimeError(
+                    f"row {int(row)} resolved to {got[pos]!r}, expected {expect!r}: "
+                    "the dataset changed under the loaded snapshot"
+                )
+
+    def to_arrow(
+        self,
+        rows: np.ndarray,
+        scores: np.ndarray,
+        *,
+        tag: str = "",
+        exact: np.ndarray | None = None,
+    ) -> object:
+        """Export rows as an Arrow table, built column-at-a-time from the
+        resident arrays. No per-row Python objects: the dictionary-coded columns
+        are expanded by numpy fancy-indexing into the uniques list, which is what
+        keeps a multi-million-row export inside a sane memory budget.
+        """
+        import pyarrow as pa
+
+        rows = np.asarray(rows, dtype=np.int64)
+        m = self._meta
+        starts = m["chunk_start_unix"][rows]
+        ends = m["chunk_end_unix"][rows]
+        run_codes = m["run_uuid"][rows]
+        runs = np.asarray(m["run_uuid_uniques"], dtype=object)[run_codes]
+        dt_codes = m["dt"][rows]
+        dts = np.where(
+            dt_codes >= 0, np.asarray(m["dt_uniques"], dtype=object)[dt_codes], ""
+        )
+        veh_codes = m["vehicle"][rows]
+        veh_uniques = np.asarray(m["vehicle_uniques"] + [None], dtype=object)
+        vehicles = veh_uniques[np.where(veh_codes >= 0, veh_codes, len(m["vehicle_uniques"]))]
+        seg = (
+            m["segment_id"].take(pa.array(rows)).to_pylist()
+            if m["segment_id"] is not None
+            else [None] * rows.size
+        )
+        chunk_ids = [f"{r}#t{int(s)}" for r, s in zip(runs, starts)]
+        media = [
+            _MEDIA_URI_TEMPLATE.format(dt=d, run_uuid=r, chunk_start_unix=int(s))
+            for d, r, s in zip(dts, runs, starts)
+        ]
+        cols = {
+            "rank": np.arange(1, rows.size + 1, dtype=np.int64),
+            "score": np.asarray(scores, dtype=np.float64),
+            "segment_id": seg,
+            "chunk_id": chunk_ids,
+            "run_uuid": runs.tolist(),
+            "start_timestamp_ns": starts * 1_000_000_000,
+            "end_timestamp_ns": np.where(ends < 0, -1, ends * 1_000_000_000),
+            "source_media_uri": media,
+            "vehicle": vehicles.tolist(),
+            "tag": [tag] * rows.size,
+            "corpus_row": rows,
+        }
+        if exact is not None:
+            cols["exact_score"] = np.asarray(exact, dtype=np.float64)
+        return pa.table(cols)
+
+    def drive_groups(
+        self, rows: np.ndarray, scores: np.ndarray
+    ) -> "list[tuple[str, np.ndarray, np.ndarray, np.ndarray]]":
+        """`(run_uuid, cell_score, cell_center, cell_peak_row)` per drive, the
+        input `interval_core._merge_drive` expects.
+
+        `search_engine._build_drives` does the same job but groups by comparing
+        run_uuid STRINGS: it materializes an object array and lexsorts it, which
+        at export size spends most of its time in Python string compares. The
+        resident corpus already holds run_uuid dictionary-coded, so this sorts
+        int32 codes instead and reads each drive's name once.
+        """
+        import interval_core
+
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return []
+        m = self._meta
+        codes = m["run_uuid"][rows]
+        starts = m["chunk_start_unix"][rows]
+        ends = m["chunk_end_unix"][rows]
+        ends = np.where(ends < 0, starts + _DEFAULT_WINDOW_S, ends)
+        g = np.lexsort((starts, codes))
+        rows_s, codes_s = rows[g], codes[g]
+        starts_s, ends_s = starts[g], ends[g]
+        scores_s = np.asarray(scores, dtype=np.float64)[g]
+        cuts = np.nonzero(codes_s[1:] != codes_s[:-1])[0] + 1
+        out = []
+        for grp in np.split(np.arange(rows_s.size), cuts):
+            if grp.size == 0:
+                continue
+            cs, cc, cpr, _d = interval_core._drive_cells(
+                starts_s[grp], ends_s[grp], scores_s[grp], rows_s[grp]
+            )
+            out.append((m["run_uuid_uniques"][int(codes_s[grp[0]])], cs, cc, cpr))
+        return out
+
+    def intervals(
+        self, rows: np.ndarray, scores: np.ndarray, *, tau: float
+    ) -> "list":
+        """Merge selected clips into per-drive intervals above `tau`."""
+        import interval_core
+
+        merged = []
+        for run_uuid, cs, cc, cpr in self.drive_groups(rows, scores):
+            merged.extend(interval_core._merge_drive(run_uuid, cs, cc, cpr, tau))
+        merged.sort(key=lambda iv: iv.peak_score, reverse=True)
+        return merged
 
     def rescore(self, rows: "list[int]", query: np.ndarray) -> "dict[int, float]":
         """True 768-d cosine for `rows`, read from the original embeddings.

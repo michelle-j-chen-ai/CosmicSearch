@@ -277,6 +277,10 @@
         <div><div class="toggle-label">Register as Data Explorer segment set</div><div class="toggle-sub">Makes the export browsable and cross-referenceable in DX</div></div>
         <label class="switch"><input type="checkbox" id="segsetInput" checked><span class="slider-toggle"></span></label>
       </div>
+      <div class="toggle-row">
+        <div><div class="toggle-label">Exact scores</div><div class="toggle-sub">Re-scores the exported rows against the original 768-d embeddings instead of the quantized screen. Adds an S3 read; capped at 300,000 rows.</div></div>
+        <label class="switch"><input type="checkbox" id="exactInput"><span class="slider-toggle"></span></label>
+      </div>
 
       <div class="export-action">
         <button class="btn-export" id="exportBtn">⬇ Export</button>

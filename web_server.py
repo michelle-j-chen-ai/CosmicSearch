@@ -198,16 +198,18 @@ def _is_frontier() -> bool:
 
 
 def _offline_scan_enabled() -> bool:
-    """Whether the offline (Lilypad) full-corpus segment scan is offered. Disabled on frontier,
-    where the ENTIRE dataset is resident in CPU memory -- the in-app corpus already IS the full
-    corpus, so Download CSV over the resident corpus replaces the offline scan. An explicit env
-    override (``NLS_OFFLINE_SCAN`` = on/off) wins when set."""
-    override = os.getenv("NLS_OFFLINE_SCAN", "").strip().lower()
-    if override in ("0", "off", "false", "no"):
-        return False
-    if override in ("1", "on", "true", "yes"):
-        return True
-    return not _is_frontier()
+    """Whether the offline (Lilypad) full-corpus segment scan is offered.
+
+    Off by default: `/api/full_export` selects and writes over the same 34M rows
+    in-process, so a launch buys a wait and a second copy of the corpus. It also
+    scanned a DIFFERENT (staler) table than the app searched, which is how an
+    export could disagree with the results that produced it.
+
+    Kept behind ``NLS_OFFLINE_SCAN=on`` rather than deleted, for the one case the
+    online path refuses: a threshold so permissive that the match set exceeds
+    ``_FULL_EXPORT_MAX_ROWS``.
+    """
+    return os.getenv("NLS_OFFLINE_SCAN", "").strip().lower() in ("1", "on", "true", "yes")
 
 
 @app.get("/api/platform")
@@ -848,7 +850,11 @@ class Mark(BaseModel):
     chunk_id: str
     segment_id: str = ""
     mark: str  # "up" | "down"
-    index: int | None = None  # corpus row index, for refine
+    index: int | None = None  # resident-corpus row index, for refine
+    # Full-corpus row position. Distinct from `index` on purpose: the two number
+    # different tables, and a full-corpus row reused as a resident index would
+    # land on an unrelated clip whenever it happens to fall in range.
+    row: int | None = None
     rank: int | None = None
     score: float | None = None
 
@@ -3933,6 +3939,8 @@ def _full_refresh_worker() -> None:
         _FULL["error"] = ""
         _FULL["started"] = time.time()
     del previous
+    with _FULL_SEG_LOCK:
+        _FULL_SEG_IDS.clear()
     gc.collect()
     _full_load_worker()
 
@@ -4013,6 +4021,56 @@ def full_corpus_module():
     return full_corpus
 
 
+class FullExportRequest(BaseModel):
+    """Export from the FULL corpus, in-process. Replaces the offline Lilypad scan.
+
+    Selection is `k` (bounded by construction) or `threshold` (unbounded, so
+    `max_rows` caps it). `exact` re-scores the selected rows against the original
+    768-d embeddings; it costs one S3 round trip per 100k rows and is refused
+    above `_FULL_EXACT_MAX` rather than silently downgraded.
+    """
+
+    query: str
+    tag: str = ""
+    k: int | None = None
+    threshold: float | None = None
+    max_rows: int = 300_000
+    exact: bool = False
+    interval: bool = False
+    dedupe_segment: bool = False
+    create_segment_set: bool = False
+    from_date: str | None = None
+    to_date: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    segment_set_uuid: str | None = None
+
+
+class FullThresholdRequest(BaseModel):
+    """Fit a cutoff for a full-corpus query from labeled marks.
+
+    Separate from `/api/threshold_search` because that one addresses marks by
+    resident-corpus row index, and full-corpus hits have no resident index --
+    they carry `row`, a position in the 34M table. Feeding those to the resident
+    endpoint silently dropped every label (they fail its bounds check), which
+    left every tag on the label-free mean+3*std heuristic without saying so.
+    """
+
+    query: str
+    marks: list[Mark] = []
+    objective: str = "f1"
+    beta: float = 1.0
+    min_precision: float = 0.9
+    val_fraction: float = 0.0
+    sample_size: int = 12
+    band: float = 0.02
+    from_date: str | None = None
+    to_date: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    segment_set_uuid: str | None = None
+
+
 class FullSearchRequest(BaseModel):
     query: str
     limit: int = 50
@@ -4023,6 +4081,494 @@ class FullSearchRequest(BaseModel):
     # resident path, MULTIPLE vehicles are honoured here.
     vehicle: str | None = None
     drive_id: str | None = None
+    segment_set_uuid: str | None = None
+
+
+# Segment-set membership resolved against the FULL corpus, cached per set uuid.
+# The resident corpus is pinned to one dataset version for its lifetime, so a
+# set's mask cannot go stale under it; the cache is cleared when it reloads.
+_FULL_SEG_IDS: dict[str, frozenset] = {}
+_FULL_SEG_LOCK = threading.Lock()
+
+
+def _full_segment_ids(seg_uuid: str | None) -> frozenset | None:
+    """The segment_ids of a Data Explorer set, for filtering the full corpus.
+
+    Uses the external_id (segment_id) path rather than the dx_internal_id bitmap
+    the resident corpus prefers: dx_internal_id is populated on only ~0.3% of the
+    consolidated corpus, so a bitmap AND would drop nearly every row and look
+    exactly like a set that legitimately matched nothing.
+
+    Raises rather than returning None on failure. A filter that silently fails to
+    apply returns a confident result set over the whole corpus, which is worse
+    than an error because nothing in the answer looks wrong.
+    """
+    if not seg_uuid:
+        return None
+    with _FULL_SEG_LOCK:
+        cached = _FULL_SEG_IDS.get(seg_uuid)
+    if cached is not None:
+        return cached
+    allowed, pending, _count = _resolve_segment_filter(seg_uuid)
+    if pending:
+        raise HTTPException(503, "segment set is still loading; retry in a moment")
+    if allowed is None:
+        raise HTTPException(400, f"could not resolve segment set {seg_uuid}")
+    ids = frozenset(allowed)
+    with _FULL_SEG_LOCK:
+        _FULL_SEG_IDS[seg_uuid] = ids
+    LOGGER.info("full-corpus segment set %s: %d ids", seg_uuid, len(ids))
+    return ids
+
+
+# An export holds its selected rows, their metadata columns and (when exact) a
+# slab of fetched vectors, in a process that already sits near its memory
+# ceiling with the model, browse matrix and 8.8GB screen resident. Two at once
+# is what OOM-kills the container, so exports are serialized rather than queued
+# per-request.
+_FULL_EXPORT_LOCK = threading.Lock()
+
+# Above this, exact re-scoring stops being a round trip and becomes a table
+# scan. Refused rather than silently downgraded to screening scores: a caller
+# who asked for exact numbers and got approximate ones has no way to tell.
+_FULL_EXACT_MAX = 300_000
+
+# Hard ceiling on a threshold export regardless of what the caller asks for.
+# A permissive tau matches a tenth of the corpus (a mean+3*std cutoff selected
+# 3.4M rows in practice), and the row count -- not the scan -- is what decides
+# how much memory this endpoint uses.
+_FULL_EXPORT_MAX_ROWS = 2_000_000
+
+
+def _full_export_selection(corpus, req: "FullExportRequest", vec) -> object:
+    """Resolve a FullExportRequest to a `full_corpus.Selection`."""
+    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
+    filters = {
+        "vehicles": set(_parse_vehicles(req.vehicle)) or None,
+        "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
+        "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
+        "segment_ids": _full_segment_ids(req.segment_set_uuid),
+    }
+    if req.k is not None:
+        return corpus.select(vec, k=int(req.k), **filters)
+    return corpus.select(
+        vec,
+        tau=float(req.threshold),
+        max_rows=min(int(req.max_rows or 0) or _FULL_EXPORT_MAX_ROWS, _FULL_EXPORT_MAX_ROWS),
+        **filters,
+    )
+
+
+@app.post("/api/full_export")
+def full_export(req: FullExportRequest, request: Request) -> Response:
+    """Export from the whole 34M-row corpus, in-process -- no Lilypad launch.
+
+    The screening pass that ranks a search already produces every row's score, so
+    selection here is the same scan plus a cut: `k` takes the best k, `threshold`
+    takes everything at or above a cutoff. What made this an offline job was
+    never the scoring (~190ms) but materializing millions of results; the
+    columnar path in `full_corpus` is what removes that.
+
+    `exact=true` replaces the screening scores with true 768-d cosine for the
+    selected rows. Worth it for a bounded k, and the reason `threshold` mode
+    defaults to off: at a permissive cutoff the boundary is not meaningful
+    enough to pay a per-100k-row S3 fetch to resolve.
+    """
+    query = (req.query or "").strip()
+    if not query:
+        raise HTTPException(400, "query must not be empty")
+    if (req.k is None) == (req.threshold is None):
+        raise HTTPException(400, "pass exactly one of k or threshold")
+    if req.k is not None and req.k <= 0:
+        raise HTTPException(400, "k must be a positive integer")
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+    with _FULL_LOCK:
+        corpus = _FULL["corpus"]
+    if corpus is None:
+        _full_corpus_begin_load()
+        raise HTTPException(503, "full corpus is loading; poll /api/full_corpus_status")
+
+    if not _FULL_EXPORT_LOCK.acquire(blocking=False):
+        raise HTTPException(429, "another export is running; retry when it finishes")
+    try:
+        t0 = time.perf_counter()
+        vec = search_engine.encode_query(
+            query, _state["processor"], _state["model"], _state["cfg"].device
+        )
+        sel = _full_export_selection(corpus, req, vec)
+        if len(sel) == 0:
+            raise HTTPException(404, "nothing matched the query and filters")
+
+        exact_scores = None
+        score_kind = "bounded_approx"
+        if req.exact:
+            if len(sel) > _FULL_EXACT_MAX:
+                raise HTTPException(
+                    400,
+                    f"exact scoring is capped at {_FULL_EXACT_MAX:,} rows; "
+                    f"this selection has {len(sel):,}. Lower k, raise the "
+                    "threshold, or export with exact=false.",
+                )
+            try:
+                corpus._verify_alignment(sel.rows)
+                exact_scores = corpus.exact_scores(sel.rows, vec)
+            except RuntimeError as exc:
+                # Either the snapshot moved under the loaded row positions, or
+                # this corpus has no dataset handle to read from. Both mean the
+                # exact scores would be wrong or absent -- 409 rather than a
+                # confident number attached to the wrong clip.
+                raise HTTPException(409, str(exc))
+            score_kind = "exact"
+
+        if req.interval:
+            return _full_export_intervals(req, request, corpus, sel, vec, t0)
+
+        rows, scores = sel.rows, sel.scores
+        if exact_scores is not None:
+            # Re-rank on the exact numbers: rows that sat within the screening
+            # error bound of one another can legitimately swap.
+            order = np.argsort(-exact_scores, kind="stable")
+            rows, scores, exact_scores = rows[order], scores[order], exact_scores[order]
+        table = corpus.to_arrow(
+            rows, exact_scores if exact_scores is not None else scores,
+            tag=req.tag or query, exact=None,
+        )
+        if req.dedupe_segment:
+            table = _dedupe_arrow_by_segment(table)
+
+        base = _export_base(req.tag or query)
+        parquet_uri = _write_arrow_export(table, base)
+        segset_label, segset_error = "", ""
+        if req.create_segment_set:
+            segset_label, segset_error = _create_export_segment_set(
+                table.column("segment_id").to_pylist(),
+                base,
+                provenance={
+                    "source": "nls_search_app_full_corpus",
+                    "query": query,
+                    "embeddings_uri": corpus.corpus_uri,
+                    "model_uri": _state["cfg"].model_artifact_uri,
+                    "date_from": req.from_date,
+                    "date_to": req.to_date,
+                    "vehicle": req.vehicle,
+                    "drive_id": req.drive_id,
+                },
+            )
+        took_ms = round((time.perf_counter() - t0) * 1000, 1)
+        LOGGER.info(
+            "full export %r -> %d rows (%s, %s) over %d rows in %.1fms",
+            query, table.num_rows, "k=%d" % req.k if req.k else "tau=%.4f" % req.threshold,
+            score_kind, corpus.num_rows, took_ms,
+        )
+        _record_full_export(req, request, corpus, table, vec, parquet_uri, sel)
+        return Response(
+            content=_arrow_csv(table),
+            media_type="text/csv",
+            headers=_full_export_headers(
+                base, parquet_uri, segset_label, segset_error, sel, table.num_rows,
+                score_kind, took_ms,
+            ),
+        )
+    finally:
+        _FULL_EXPORT_LOCK.release()
+
+
+def _full_export_intervals(
+    req: "FullExportRequest", request: Request, corpus, sel, vec, t0: float
+) -> Response:
+    """Interval-granularity full-corpus export: merge the selected clips into
+    variable-length spans per drive, then write those instead of clips."""
+    intervals = corpus.intervals(sel.rows, sel.scores, tau=float(sel.cutoff))
+    if not intervals:
+        raise HTTPException(404, "no intervals formed above the cutoff")
+    rows = _interval_rows_full(intervals, corpus, req.query.strip())
+    base = _export_base(req.tag or "intervals")
+    parquet_uri = _write_interval_export_parquet(rows, name=base)
+    took_ms = round((time.perf_counter() - t0) * 1000, 1)
+    LOGGER.info(
+        "full export (intervals) %r -> %d intervals from %d clips in %.1fms",
+        req.query.strip(), len(rows), len(sel), took_ms,
+    )
+    return Response(
+        content=_interval_csv(rows),
+        media_type="text/csv",
+        headers=_full_export_headers(
+            base, parquet_uri, "",
+            "intervals: segment-set export not supported yet" if req.create_segment_set else "",
+            sel, len(rows), "bounded_approx", took_ms,
+        ) | {"X-NLS-Interval-Threshold": f"{float(sel.cutoff):.6f}"},
+    )
+
+
+def _interval_rows_full(intervals: list, corpus, query: str) -> list[dict]:
+    """`_interval_rows` for the full corpus: same output columns, but the peak
+    clip's identifiers come from the resident arrays rather than a Corpus."""
+    import pyarrow as pa
+
+    peaks = np.asarray([iv.peak_index for iv in intervals], dtype=np.int64)
+    valid = peaks >= 0
+    lookup = corpus.to_arrow(peaks[valid], np.zeros(int(valid.sum()))).to_pydict()
+    it = iter(range(int(valid.sum())))
+    rows = []
+    for rank, iv in enumerate(intervals, start=1):
+        if valid[rank - 1]:
+            j = next(it)
+            chunk_id, seg, media = (
+                lookup["chunk_id"][j], lookup["segment_id"][j],
+                lookup["source_media_uri"][j],
+            )
+        else:
+            chunk_id, seg, media = "", None, ""
+        rows.append(
+            {
+                "rank": rank,
+                "peak_score": round(float(iv.peak_score), 6),
+                "mean_score": round(float(iv.mean_score), 6),
+                "run_uuid": iv.run_uuid,
+                "start_timestamp_ns": _ns_f(iv.start_unix),
+                "end_timestamp_ns": _ns_f(iv.end_unix),
+                "duration_s": round(float(iv.end_unix - iv.start_unix), 3),
+                "num_chunks": int(iv.num_cells),
+                "segment_id": seg or "",
+                "chunk_id": chunk_id,
+                "source_media_uri": media,
+                "tag": query,
+            }
+        )
+    return rows
+
+
+def _dedupe_arrow_by_segment(table):
+    """Keep the best row per segment_id, preserving rank order. Rows with no
+    segment_id are all kept -- they cannot be merged into anything."""
+    import pyarrow as pa
+
+    seg = table.column("segment_id").to_pylist()
+    seen: set = set()
+    keep = []
+    for i, s in enumerate(seg):
+        if not s:
+            keep.append(i)
+        elif s not in seen:
+            seen.add(s)
+            keep.append(i)
+    if len(keep) == table.num_rows:
+        return table
+    out = table.take(pa.array(keep))
+    return out.set_column(
+        out.schema.get_field_index("rank"), "rank",
+        pa.array(np.arange(1, out.num_rows + 1, dtype=np.int64)),
+    )
+
+
+def _arrow_csv(table) -> str:
+    """Arrow table -> CSV text, streamed through pyarrow rather than the csv
+    module: an export can be millions of rows, and building those as Python
+    lists costs more than the write."""
+    import pyarrow.csv as pacsv
+
+    sink = io.BytesIO()
+    # Match what csv.writer produced for the resident export: quote only fields
+    # that need it. pyarrow quotes the header row unconditionally whatever the
+    # style, so the header is written here and the body appended -- otherwise
+    # this emits a valid CSV that is a different file from the one existing
+    # consumers parse.
+    pacsv.write_csv(
+        table,
+        sink,
+        write_options=pacsv.WriteOptions(
+            include_header=False, quoting_style="needed"
+        ),
+    )
+    return ",".join(table.column_names) + "\n" + sink.getvalue().decode()
+
+
+def _write_arrow_export(table, name: str) -> str:
+    """Write an export table as parquet under the OCI export prefix. Returns the
+    URI, or "" if export is unconfigured or the upload fails (best-effort, so a
+    failed upload never costs the caller their CSV)."""
+    prefix = _state["cfg"].export_s3_prefix.strip()
+    if not prefix:
+        return ""
+    import pyarrow.parquet as pq
+
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="zstd")
+    key = f"{prefix.rstrip('/')}/{name}.parquet"
+    try:
+        oci_s3.put_bytes(key, sink.getvalue(), _state["s3"], "application/octet-stream")
+        LOGGER.info("full export parquet written: %s (%d rows)", key, table.num_rows)
+        return key
+    except (
+        ValueError,
+        botocore.exceptions.BotoCoreError,
+        botocore.exceptions.ClientError,
+    ) as exc:
+        LOGGER.warning("full export parquet write failed (%s): %s", type(exc).__name__, exc)
+        return ""
+
+
+def _full_export_headers(
+    base: str, parquet_uri: str, segset: str, segset_error: str,
+    sel, num_rows: int, score_kind: str, took_ms: float,
+) -> dict:
+    """Response headers for a full-corpus export. `X-NLS-Truncated` and
+    `X-NLS-Candidates` are the honest pair: a capped threshold export says how
+    much it left behind instead of presenting a partial answer as complete."""
+    return {
+        "Content-Disposition": f'attachment; filename="{base}.csv"',
+        "X-NLS-Export-Name": base,
+        "X-NLS-Parquet": parquet_uri,
+        "X-NLS-Segset": segset,
+        "X-NLS-Segset-Error": segset_error,
+        "X-NLS-Rows": str(num_rows),
+        "X-NLS-Candidates": str(sel.candidates),
+        "X-NLS-Truncated": "1" if sel.truncated else "0",
+        "X-NLS-Cutoff": f"{float(sel.cutoff):.6f}",
+        "X-NLS-Score-Kind": score_kind,
+        "X-NLS-Score-Error-Bound": f"{float(sel.error_bound):.6f}",
+        "X-NLS-Elapsed-Ms": str(took_ms),
+    }
+
+
+def _record_full_export(req, request: Request, corpus, table, vec, parquet_uri: str, sel) -> None:
+    """Log the export to exp-db. Best-effort, like the resident export path."""
+    try:
+        db.insert_export(
+            {
+                "user_email": _current_user(request),
+                "query": req.query.strip(),
+                "tag": req.tag or req.query.strip(),
+                "k": int(req.k or 0),
+                "num_results": int(table.num_rows),
+                "model_uri": _state["cfg"].model_artifact_uri,
+                "embeddings_uri": corpus.corpus_uri,
+                "date_from": req.from_date,
+                "date_to": req.to_date,
+                "vehicle": req.vehicle,
+                "drive_id": req.drive_id,
+                "thumbs_up": [],
+                "thumbs_down": [],
+                "search_vector": vec.tolist() if vec is not None else [],
+                "parquet_uri": parquet_uri,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - never block the download
+        LOGGER.warning("full export not recorded: %s", exc)
+
+
+@app.post("/api/full_threshold")
+def full_threshold(req: FullThresholdRequest, request: Request) -> dict:
+    """Fit a cutoff for a full-corpus query from labeled marks, and return the
+    next batch of boundary clips to label.
+
+    Same operating-point selection as `/api/threshold_search`, against the full
+    corpus's screening scores. Marks are addressed by `row` (a position in the
+    34M table), which is what full-corpus hits carry; `index` is a resident-corpus
+    address and is ignored here.
+    """
+    query = (req.query or "").strip()
+    if not query:
+        raise HTTPException(400, "query must not be empty")
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+    with _FULL_LOCK:
+        corpus = _FULL["corpus"]
+    if corpus is None:
+        _full_corpus_begin_load()
+        raise HTTPException(503, "full corpus is loading; poll /api/full_corpus_status")
+
+    vec = search_engine.encode_query(
+        query, _state["processor"], _state["model"], _state["cfg"].device
+    )
+    scores, err = corpus.score(vec)
+    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
+    mask = corpus.filter_mask(
+        set(_parse_vehicles(req.vehicle)) or None,
+        (start_unix, end_unix) if (start_unix or end_unix) else None,
+        set(_parse_drive_ids(req.drive_id)) or None,
+        _full_segment_ids(req.segment_set_uuid),
+    )
+    allowed = mask if mask is not None else np.ones(corpus.num_rows, dtype=bool)
+
+    def _valid(rows: list) -> list[int]:
+        seen: dict[int, None] = {}
+        for r in rows:
+            if r is not None and 0 <= int(r) < corpus.num_rows:
+                seen[int(r)] = None
+        return list(seen)
+
+    pos_idx = _valid([m.row for m in req.marks if m.mark == "up"])
+    neg_idx = _valid([m.row for m in req.marks if m.mark == "down"])
+    dropped = sum(1 for m in req.marks if m.row is None)
+    labeled = set(pos_idx) | set(neg_idx)
+    pos_scores = scores[np.asarray(pos_idx, dtype=np.int64)] if pos_idx else np.array([])
+    neg_scores = scores[np.asarray(neg_idx, dtype=np.int64)] if neg_idx else np.array([])
+
+    fit, note = None, ""
+    if pos_idx and neg_idx:
+        fit = search_engine.fit_threshold(
+            pos_scores, neg_scores, objective=req.objective, beta=req.beta,
+            min_precision=req.min_precision, val_fraction=req.val_fraction,
+        )
+        if fit["objective"] == "precision" and not fit["precision_floor_met"]:
+            note = (
+                f"No cutoff reaches precision >= {req.min_precision:.2f} on the "
+                "current labels; showing the highest-precision cutoff."
+            )
+    else:
+        missing = "positive (\N{THUMBS UP SIGN})" if not pos_idx else "negative (\N{THUMBS DOWN SIGN})"
+        note = f"Need at least one {missing} label to fit a threshold."
+    if dropped:
+        note = (
+            f"{dropped} mark(s) carried no full-corpus row and were ignored. "
+            + note
+        ).strip()
+
+    tau = float(fit["threshold"]) if fit else None
+    stats = search_engine.score_stats(scores)
+    suggested = search_engine.heuristic_threshold(stats)
+    tau_for_sampling = tau if tau is not None else suggested
+    sample_idx = search_engine.stratified_boundary_sample(
+        scores, allowed, labeled, req.sample_size, tau=tau_for_sampling, band=req.band
+    )
+    sample_rows = np.asarray(sample_idx, dtype=np.int64)
+    sample_hits = [
+        {
+            "row": int(r), "index": -1,
+            "score": round(float(scores[r]), 4),
+            "score_error_bound": round(float(err), 4),
+            **{
+                key: val[j]
+                for key, val in corpus.to_arrow(sample_rows, scores[sample_rows])
+                .select(["chunk_id", "run_uuid", "segment_id", "source_media_uri", "vehicle"])
+                .to_pydict().items()
+            },
+        }
+        for j, r in enumerate(sample_rows)
+    ]
+    # How many rows the fitted cutoff would actually export -- the number that
+    # turns "tau = 0.05" into a decision, since a plausible-looking cutoff can
+    # select a tenth of the corpus.
+    selected = int((scores[allowed] >= np.float32(tau_for_sampling)).sum())
+    return {
+        "threshold": tau,
+        "suggested_threshold": suggested,
+        "fit": fit,
+        "note": note,
+        "num_up": len(pos_idx),
+        "num_down": len(neg_idx),
+        "score_kind": "bounded_approx",
+        "score_error_bound": round(float(err), 4),
+        "up_scores": [round(float(s), 4) for s in pos_scores.tolist()],
+        "down_scores": [round(float(s), 4) for s in neg_scores.tolist()],
+        "histogram": _score_histogram(scores, tau_for_sampling),
+        "sample": sample_hits,
+        "num_rows_searched": corpus.num_rows,
+        "candidates": int(allowed.sum()),
+        "selected_at_threshold": selected,
+    }
 
 
 @app.get("/api/full_corpus_status")
@@ -4099,6 +4645,7 @@ def full_search(req: FullSearchRequest) -> dict:
         vehicles=set(_parse_vehicles(req.vehicle)) or None,
         run_uuids=set(_parse_drive_ids(req.drive_id)) or None,
         date_range=(start_unix, end_unix) if (start_unix or end_unix) else None,
+        segment_ids=_full_segment_ids(req.segment_set_uuid),
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
@@ -4160,5 +4707,6 @@ def full_search(req: FullSearchRequest) -> dict:
             "drive_id": sorted(_parse_drive_ids(req.drive_id)) or None,
             "from_date": req.from_date or None,
             "to_date": req.to_date or None,
+            "segment_set_uuid": req.segment_set_uuid or None,
         },
     }
