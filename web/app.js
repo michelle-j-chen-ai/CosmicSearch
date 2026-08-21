@@ -569,7 +569,11 @@ function _renderFullPage(page) {
   $("resultCountText").textContent = buf.hits.length
     ? `searched ALL ${fmtInt(d.num_rows_searched)} clips in ${d.elapsed_ms} ms${filtLine}`
       + ` · showing top ${fmtInt(buf.hits.length)}`
-      + ` · similarity ${d.score_lo}–${d.score_hi} ±${d.score_error_bound} (approximate)`
+      // Exact scores carry no error bound; printing one next to them would be
+      // stating an uncertainty that no longer applies.
+      + (d.score_kind === "exact"
+          ? ` · similarity ${d.score_lo}–${d.score_hi} (exact)`
+          : ` · similarity ${d.score_lo}–${d.score_hi} ±${d.score_error_bound} (approximate)`)
     : `searched ALL ${fmtInt(d.num_rows_searched)} clips${filtLine} · nothing matched`;
   const prov = d.corpus_loaded_utc
     ? `corpus ${String(d.corpus_uri || "").split("/").slice(-2).join("/")}`
@@ -589,8 +593,16 @@ function _renderFullPage(page) {
 // one S3 round trip with a ~1.65s floor, so blocking on it would undo the 190ms
 // search for a number the user has not looked at yet.
 async function rescoreVisible() {
-  const rows = (state.hits || []).map((h) => h.row).filter((r) => r != null && r >= 0);
-  if (!rows.length || !state.query) return;
+  const buf = state.fullBuf;
+  if (!buf || !buf.hits || !buf.hits.length || !state.query) return;
+  // Already sharpened this result set -- paging must not refetch or re-sort.
+  if (buf.exact) return;
+  // Rescore the WHOLE buffer, not the visible page. Two reasons: the ranking has
+  // to be global or page 2 can hold a clip that outranks page 1 and never moves,
+  // and the round trip has a ~1.65s floor regardless of row count, so doing it
+  // per page pays that cost again for every page.
+  const rows = buf.hits.map((h) => h.row).filter((r) => r != null && r >= 0);
+  if (!rows.length) return;
   let data;
   try {
     data = await fetch("/api/full_rescore", {
@@ -601,17 +613,27 @@ async function rescoreVisible() {
   if (!data || !data.scores) return;
   const byRow = new Map(data.scores.map((s) => [s.row, s.score]));
   let changed = 0;
-  for (const h of state.hits) {
+  for (const h of buf.hits) {
     const exact = byRow.get(h.row);
     if (exact != null && exact !== h.score) { h.score = exact; changed++; }
     if (exact != null) h.score_kind = "exact";
   }
+  buf.exact = true;
   if (!changed) return;
   // Exact scores can reorder rows that sat within the error bound of each other.
-  state.hits.sort((a, b) => b.score - a.score);
-  renderGrid();
-  const el = $("resultCountText");
-  if (el) el.textContent = el.textContent.replace(/\(approximate\)/, "(exact)");
+  buf.hits.sort((a, b) => b.score - a.score);
+  // Renumber. `rank` came from the screening pass; leaving it alone after a
+  // re-sort is what showed ranks 1, 19, 5, 2 down the grid -- correct ordering
+  // labelled with the ordering it replaced.
+  buf.hits.forEach((h, i) => { h.rank = i + 1; });
+  const d = buf.data;
+  if (d) {
+    const sc = buf.hits.map((h) => h.score);
+    d.score_lo = Math.round(Math.min(...sc) * 1e4) / 1e4;
+    d.score_hi = Math.round(Math.max(...sc) * 1e4) / 1e4;
+    d.score_kind = "exact";
+  }
+  _renderFullPage(state.page || 0);
 }
 async function _issue(endpoint, body) {
   const seq = ++_issueSeq;
