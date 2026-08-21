@@ -4204,8 +4204,8 @@ def _full_rank(corpus, vec: np.ndarray, req, *, label: str, exclude_rows=None) -
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
-        "full vector search %r -> %d hits over %d rows in %.1fms",
-        label, len(hits), corpus.num_rows, took_ms,
+        "full vector search %r -> %d hits over %d rows in %.1fms%s",
+        label, len(hits), corpus.num_rows, took_ms, _separation_note(hits),
     )
     return _full_payload(hits, candidates, corpus, req, took_ms, label, page_size=limit)
 
@@ -4268,10 +4268,30 @@ def full_search(req: FullSearchRequest) -> dict:
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
-        "full search %r -> %d hits over %d rows in %.1fms",
-        query, len(hits), corpus.num_rows, took_ms,
+        "full search %r -> %d hits over %d rows in %.1fms%s",
+        query, len(hits), corpus.num_rows, took_ms, _separation_note(hits),
     )
     return _full_payload(hits, candidates, corpus, req, took_ms, query)
+
+
+def _separation_note(hits) -> str:
+    """Whether this query actually separated anything, logged with the search.
+
+    A query can be answered fast and correctly over all 34M rows and still be
+    useless, because the model puts no distance between the best match and the
+    rest. Latency alone never shows that, so a bad tag looked identical to a good
+    one in the logs. `spread/eps` is the readable part: below ~1 the top hits sit
+    inside the screening error bound of each other and their order is noise.
+    """
+    if not hits:
+        return ""
+    sc = [float(h.score) for h in hits]
+    eps = float(hits[0].score_error_bound) or 1e-9
+    spread = max(sc) - min(sc)
+    return (
+        f" | top={max(sc):.4f} lo={min(sc):.4f} spread={spread:.4f}"
+        f" eps={eps:.4f} spread/eps={spread / eps:.1f}"
+    )
 
 
 def _full_payload(
