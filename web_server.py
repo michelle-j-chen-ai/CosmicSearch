@@ -13,6 +13,7 @@ Run locally:
 from __future__ import annotations
 
 import csv
+import dataclasses
 import base64
 import binascii
 import datetime as dt
@@ -3552,6 +3553,220 @@ def _full_export_selection(corpus, req: "FullExportRequest", vec) -> object:
     )
 
 
+class RetrieveRequest(BaseModel):
+    """The one retrieval interface: a query, a cutoff, and how to return it.
+
+    `k` and `threshold` are the same operation -- a top-k HAS a threshold, the
+    k-th score -- so they share one cascade rather than two implementations.
+    `output` decides serialization only: a page of JSON for browsing, a CSV
+    attachment (plus parquet, segment set and a Recent-scans row) for export.
+    """
+
+    # Query: text, or a pre-computed vector (resume / query-by-example).
+    query: str = ""
+    vector: list[float] | None = None
+
+    # Cutoff -- exactly one.
+    k: int | None = None
+    threshold: float | None = None
+
+    # Cascade control. "auto" resolves the eps band through layer 2 when it is
+    # usable; "never" answers from the resident screen alone; "always" refuses
+    # rather than silently returning bounded scores.
+    refine: str = "auto"
+    # Layer 3: replace scores with the true 768-d cosine. A separate question
+    # from membership, and a separate S3 read.
+    exact: bool = False
+
+    output: str = "hits"          # "hits" (JSON page) | "csv" (file + artifacts)
+    page: int = 0
+    limit: int = 50
+    max_rows: int = 0             # threshold-mode ceiling; 0 = the global one
+
+    # Export-only options, ignored for output="hits".
+    tag: str = ""
+    interval: bool = False
+    dedupe_segment: bool = False
+    create_segment_set: bool = False
+
+    from_date: str | None = None
+    to_date: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
+    marks: list[Mark] = []        # downvoted rows are excluded from results
+
+
+@app.post("/api/retrieve")
+def retrieve(req: RetrieveRequest, request: Request):
+    """Search and export, over one selection.
+
+    These were two endpoints over two implementations of the same search, and
+    every divergence between them shipped as a bug in one path and not the
+    other. Now there is one `full_corpus.select` underneath and this endpoint
+    chooses only how to serialize it.
+    """
+    if (req.k is None) == (req.threshold is None):
+        raise HTTPException(400, "pass exactly one of k or threshold")
+    if req.output not in ("hits", "csv"):
+        raise HTTPException(400, "output must be 'hits' or 'csv'")
+    corpus = _require_full_corpus()
+    vec = _retrieve_vector(req, corpus)
+    exclude = [
+        int(m.row) for m in req.marks
+        if m.mark == "down" and m.row is not None and 0 <= int(m.row) < corpus.num_rows
+    ]
+
+    if req.output == "csv":
+        # Export keeps its own lock, artifact writes and Recent-scans row; only
+        # the selection is shared.
+        return _retrieve_export(req, request, corpus, vec, exclude)
+    return _retrieve_hits(req, corpus, vec, exclude)
+
+
+def _retrieve_vector(req: "RetrieveRequest", corpus) -> np.ndarray:
+    """The query direction: a supplied vector, else the encoded text."""
+    if req.vector:
+        vec = np.asarray(req.vector, dtype=np.float32)
+        if vec.ndim != 1 or vec.shape[0] != corpus.dim:
+            raise HTTPException(
+                400, f"vector dim {vec.shape[0]} != corpus dim {corpus.dim}"
+            )
+        return vec
+    if not req.query.strip():
+        raise HTTPException(400, "provide a query or a vector")
+    if not _state.get("model_ready"):
+        raise HTTPException(503, "model still loading")
+    return search_engine.encode_query(
+        req.query.strip(), _state["processor"], _state["model"], _state["cfg"].device
+    )
+
+
+def _retrieve_selection(req: "RetrieveRequest", corpus, vec, exclude, *, k=None):
+    """Run the one search. `k` overrides the request's cutoff for paging."""
+    try:
+        return corpus.select(
+            vec,
+            k=k if k is not None else req.k,
+            tau=None if k is not None else req.threshold,
+            max_rows=min(
+                int(req.max_rows or 0) or _FULL_EXPORT_MAX_ROWS, _FULL_EXPORT_MAX_ROWS
+            ),
+            refine=req.refine,
+            exclude_rows=exclude or None,
+            **_full_filters(req),
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+
+
+def _retrieve_hits(req: "RetrieveRequest", corpus, vec, exclude) -> dict:
+    """A page of the selection, in the envelope the grid already renders."""
+    if req.limit <= 0 or req.limit > 1000:
+        raise HTTPException(400, "limit must be between 1 and 1000")
+    if req.page < 0:
+        raise HTTPException(400, "page must not be negative")
+    offset = req.page * req.limit
+    depth = offset + req.limit
+    if depth > _FULL_MAX_DEPTH:
+        raise HTTPException(400, f"paging stops at {_FULL_MAX_DEPTH:,} results")
+    t0 = time.perf_counter()
+    # `k` is the cutoff -- how many results exist -- and `limit` is the page over
+    # them, so a k smaller than a page yields fewer hits rather than being
+    # widened to fill it. A threshold query has no natural size, so the page
+    # depth caps it: materializing millions of rows to show twenty-four would
+    # cost the memory this endpoint exists to avoid spending.
+    sel = _retrieve_selection(req, corpus, vec, exclude)
+    if req.threshold is not None and len(sel) > depth:
+        sel = dataclasses.replace(
+            sel, rows=sel.rows[:depth], scores=sel.scores[:depth], truncated=True
+        )
+    rows, scores = sel.rows[offset:depth], sel.scores[offset:depth]
+    if req.exact and rows.size:
+        try:
+            scores = corpus.exact_scores(rows, vec).astype(np.float32)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        order = np.argsort(-scores, kind="stable")
+        rows, scores = rows[order], scores[order]
+    hits = [
+        corpus._hit(int(r), offset + i, float(s), sel.error_bound)
+        for i, (r, s) in enumerate(zip(rows, scores), start=1)
+    ]
+    took_ms = round((time.perf_counter() - t0) * 1000, 1)
+    LOGGER.info(
+        "retrieve %r -> %d hits over %d rows in %.1fms | band=%d refined=%s%s",
+        req.query or "vector", len(hits), corpus.num_rows, took_ms,
+        sel.band_rows, sel.refined, _separation_note(hits),
+    )
+    out = _full_payload(hits, sel.candidates, corpus, req, took_ms,
+                        req.query or "vector", page_size=req.limit)
+    out["score_kind"] = "exact" if req.exact else sel.score_kind
+    out["band_rows"] = sel.band_rows
+    out["refined"] = sel.refined
+    return out
+
+
+def _retrieve_export(req: "RetrieveRequest", request: Request, corpus, vec, exclude):
+    """The same selection, serialized as a file plus its artifacts.
+
+    Kept behind the same single-flight lock as before: an export holds its rows
+    and (with `exact`) a slab of fetched vectors in a process already near its
+    memory ceiling, and two at once is what kills the container.
+    """
+    if not _FULL_EXPORT_LOCK.acquire(blocking=False):
+        raise HTTPException(429, "another export is running; retry when it finishes")
+    try:
+        t0 = time.perf_counter()
+        sel = _retrieve_selection(req, corpus, vec, exclude)
+        if len(sel) == 0:
+            raise HTTPException(404, "nothing matched the query and filters")
+        exact_scores, score_kind = None, sel.score_kind
+        if req.exact:
+            projected = len(sel) * _EXACT_MS_PER_ROW / 1000.0
+            if projected > _FULL_EXACT_BUDGET_S:
+                raise HTTPException(
+                    400,
+                    f"exact scoring {len(sel):,} rows is projected at "
+                    f"{projected:.0f}s, over the {_FULL_EXACT_BUDGET_S:.0f}s budget",
+                )
+            try:
+                corpus._verify_alignment(sel.rows)
+                exact_scores = corpus.exact_scores(
+                    sel.rows, vec, deadline=time.monotonic() + _FULL_EXACT_BUDGET_S
+                )
+            except TimeoutError as exc:
+                raise HTTPException(503, str(exc))
+            except RuntimeError as exc:
+                raise HTTPException(409, str(exc))
+            score_kind = "exact"
+
+        # Delegate the artifact half to the existing writer, which already
+        # handles intervals, dedupe, parquet, segment sets and publishing.
+        shim = FullExportRequest(
+            query=req.query or "vector", tag=req.tag, k=req.k,
+            threshold=req.threshold, max_rows=req.max_rows or 300_000,
+            exact=req.exact, interval=req.interval,
+            dedupe_segment=req.dedupe_segment,
+            create_segment_set=req.create_segment_set,
+            from_date=req.from_date, to_date=req.to_date, vehicle=req.vehicle,
+            drive_id=req.drive_id, segment_set_uuid=req.segment_set_uuid,
+            filter_lance_uri=req.filter_lance_uri,
+        )
+        if req.interval:
+            return _full_export_intervals(
+                shim, request, corpus, sel, vec, t0, exact_scores, score_kind
+            )
+        return _full_export_write(
+            shim, request, corpus, sel, vec, t0, exact_scores, score_kind
+        )
+    finally:
+        _FULL_EXPORT_LOCK.release()
+
+
 @app.post("/api/full_export")
 def full_export(req: FullExportRequest, request: Request) -> Response:
     """Export from the whole 34M-row corpus, in-process -- no Lilypad launch.
@@ -3628,58 +3843,75 @@ def full_export(req: FullExportRequest, request: Request) -> Response:
                 req, request, corpus, sel, vec, t0, exact_scores, score_kind
             )
 
-        rows, scores = sel.rows, sel.scores
-        if exact_scores is not None:
-            # Re-rank on the exact numbers: rows that sat within the screening
-            # error bound of one another can legitimately swap.
-            order = np.argsort(-exact_scores, kind="stable")
-            rows, scores, exact_scores = rows[order], scores[order], exact_scores[order]
-        table = corpus.to_arrow(
-            rows, exact_scores if exact_scores is not None else scores,
-            tag=req.tag or query, exact=None,
-        )
-        if req.dedupe_segment:
-            table = _dedupe_arrow_by_segment(table)
-
-        base = _export_base(req.tag or query)
-        parquet_uri = _write_arrow_export(table, base)
-        segset_label, segset_error = "", ""
-        if req.create_segment_set:
-            segset_label, segset_error = _create_export_segment_set(
-                table.column("segment_id").to_pylist(),
-                base,
-                provenance={
-                    "source": "nls_search_app_full_corpus",
-                    "query": query,
-                    "embeddings_uri": corpus.corpus_uri,
-                    "model_uri": _state["cfg"].model_artifact_uri,
-                    "date_from": req.from_date,
-                    "date_to": req.to_date,
-                    "vehicle": req.vehicle,
-                    "drive_id": req.drive_id,
-                },
-            )
-        took_ms = round((time.perf_counter() - t0) * 1000, 1)
-        LOGGER.info(
-            "full export %r -> %d rows (%s, %s) over %d rows in %.1fms",
-            query, table.num_rows, "k=%d" % req.k if req.k else "tau=%.4f" % req.threshold,
-            score_kind, corpus.num_rows, took_ms,
-        )
-        _record_full_export(req, request, corpus, table, vec, parquet_uri, sel)
-        _publish_full_export(
-            req, request, base, parquet_uri, segset_label, sel, table.num_rows,
-            corpus, score_kind, segset_error=segset_error,
-        )
-        return Response(
-            content=_arrow_csv(table),
-            media_type="text/csv",
-            headers=_full_export_headers(
-                base, parquet_uri, segset_label, segset_error, sel, table.num_rows,
-                score_kind, took_ms,
-            ),
+        return _full_export_write(
+            req, request, corpus, sel, vec, t0, exact_scores, score_kind
         )
     finally:
         _FULL_EXPORT_LOCK.release()
+
+
+def _full_export_write(
+    req, request: Request, corpus, sel, vec, t0: float,
+    exact_scores=None, score_kind: str = "bounded_approx",
+) -> Response:
+    """Write a clip-granularity export: arrow table -> CSV + parquet, plus
+    the segment set, the exp-db row and the Recent-scans entry.
+
+    Extracted from `full_export` so the unified `/api/retrieve` writes the
+    same artifacts rather than growing a second copy of this -- duplicated
+    selection is what produced most of this module's divergence bugs.
+    """
+    query = (req.query or "").strip()
+    rows, scores = sel.rows, sel.scores
+    if exact_scores is not None:
+        # Re-rank on the exact numbers: rows that sat within the screening
+        # error bound of one another can legitimately swap.
+        order = np.argsort(-exact_scores, kind="stable")
+        rows, scores, exact_scores = rows[order], scores[order], exact_scores[order]
+    table = corpus.to_arrow(
+        rows, exact_scores if exact_scores is not None else scores,
+        tag=req.tag or query, exact=None,
+    )
+    if req.dedupe_segment:
+        table = _dedupe_arrow_by_segment(table)
+
+    base = _export_base(req.tag or query)
+    parquet_uri = _write_arrow_export(table, base)
+    segset_label, segset_error = "", ""
+    if req.create_segment_set:
+        segset_label, segset_error = _create_export_segment_set(
+            table.column("segment_id").to_pylist(),
+            base,
+            provenance={
+                "source": "nls_search_app_full_corpus",
+                "query": query,
+                "embeddings_uri": corpus.corpus_uri,
+                "model_uri": _state["cfg"].model_artifact_uri,
+                "date_from": req.from_date,
+                "date_to": req.to_date,
+                "vehicle": req.vehicle,
+                "drive_id": req.drive_id,
+            },
+        )
+    took_ms = round((time.perf_counter() - t0) * 1000, 1)
+    LOGGER.info(
+        "full export %r -> %d rows (%s, %s) over %d rows in %.1fms",
+        query, table.num_rows, "k=%d" % req.k if req.k else "tau=%.4f" % req.threshold,
+        score_kind, corpus.num_rows, took_ms,
+    )
+    _record_full_export(req, request, corpus, table, vec, parquet_uri, sel)
+    _publish_full_export(
+        req, request, base, parquet_uri, segset_label, sel, table.num_rows,
+        corpus, score_kind, segset_error=segset_error,
+    )
+    return Response(
+        content=_arrow_csv(table),
+        media_type="text/csv",
+        headers=_full_export_headers(
+            base, parquet_uri, segset_label, segset_error, sel, table.num_rows,
+            score_kind, took_ms,
+        ),
+    )
 
 
 def _full_export_intervals(
