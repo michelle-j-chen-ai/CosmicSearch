@@ -474,6 +474,7 @@ async function _issueFullCorpus(q, page) {
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
     segment_set_uuid: state.searchSegUuid,
+    filter_lance_uri: _splitList($("sf-lance") ? $("sf-lance").value : ""),
   };
   $("gridStatus").textContent = "Searching all clips…";
   let data;
@@ -499,7 +500,8 @@ const FULL_BATCH = 200;
 function _fullKey(q) {
   return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
           $("sf-vehicle").value, $("sf-drive").value,
-          state.searchSegUuid || ""].join("|");
+          state.searchSegUuid || "",
+          $("sf-lance") ? $("sf-lance").value : ""].join("|");
 }
 
 function _renderFullPage(page) {
@@ -1132,6 +1134,7 @@ async function fullExport() {
         from_date: filters.from_date, to_date: filters.to_date,
         vehicle: filters.vehicle, drive_id: filters.drive_id,
         segment_set_uuid: filters.segment_set_uuid,
+        filter_lance_uri: filters.filter_lance_uri,
       };
       if (topk) body.k = kForRow(e) || 50;
       else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
