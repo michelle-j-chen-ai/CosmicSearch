@@ -838,6 +838,7 @@ class SearchRequest(BaseModel):
     to_date: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
+    filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
     vehicle: str | None = None
@@ -870,6 +871,7 @@ class RefineRequest(BaseModel):
     to_date: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
+    filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
     vehicle: str | None = None
@@ -887,6 +889,7 @@ class ExportRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
     segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
@@ -926,6 +929,7 @@ class ThresholdSearchRequest(BaseModel):
     to_date: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
+    filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
     embeddings_uri: str | None = None
@@ -954,6 +958,7 @@ class VectorSearchRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -985,6 +990,7 @@ class WindowSearchRequest(BaseModel):
     to_date: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
+    filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
     embeddings_uri: str | None = None
@@ -1011,6 +1017,7 @@ class ConfigExportRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
     segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
@@ -1048,6 +1055,7 @@ class CurateExportRequest(BaseModel):
     create_segment_set: bool = False
     embeddings_uri: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
     filter_lance_uri: str | None = None
     from_date: str | None = None
     to_date: str | None = None
@@ -1820,6 +1828,7 @@ class SaveVectorRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
     segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
@@ -1851,6 +1860,7 @@ class SegmentScanRequest(BaseModel):
     # segment-set/lance/vehicle/drive ride along in the workflow config but are not yet
     # enforced by the scan (that needs a worker change). Preview/Download honor all of them.
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
     segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
@@ -4044,6 +4054,7 @@ class FullExportRequest(BaseModel):
     vehicle: str | None = None
     drive_id: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
 
 
 class FullThresholdRequest(BaseModel):
@@ -4069,6 +4080,7 @@ class FullThresholdRequest(BaseModel):
     vehicle: str | None = None
     drive_id: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
 
 
 class FullSearchRequest(BaseModel):
@@ -4082,6 +4094,7 @@ class FullSearchRequest(BaseModel):
     vehicle: str | None = None
     drive_id: str | None = None
     segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
 
 
 # Segment-set membership resolved against the FULL corpus, cached per set uuid.
@@ -4121,6 +4134,41 @@ def _full_segment_ids(seg_uuid: str | None) -> frozenset | None:
     return ids
 
 
+def _full_lance_filter(lance_uri: str | None) -> dict:
+    """Filter kwargs for a lance/parquet downsample dataset, for the full corpus.
+
+    The dataset names its own key column. `segment_id` and `run_uuid` both have
+    a resident counterpart here; `dx_internal_id` does not usefully -- it is
+    populated on ~0.3% of this corpus, so intersecting on it would drop nearly
+    every row and be indistinguishable from a downsample that legitimately
+    matched almost nothing. That case errors instead.
+    """
+    if not lance_uri or not lance_uri.strip():
+        return {}
+    try:
+        key, ids = _lance_filter_ids(lance_uri.strip())
+    except _CORPUS_ERRORS as exc:
+        raise HTTPException(400, f"could not read downsample dataset: {exc}")
+    if key == "segment_id":
+        return {"segment_ids": frozenset(ids)}
+    if key == "run_uuid":
+        return {"run_uuids": set(ids)}
+    raise HTTPException(
+        400,
+        f"downsample dataset is keyed by {key!r}, which the full corpus cannot "
+        "filter on; provide one keyed by segment_id or run_uuid",
+    )
+
+
+def _merge_filters(base: dict, extra: dict) -> dict:
+    """AND a downsample's filters into the request's own (intersection per key)."""
+    out = dict(base)
+    for key, val in extra.items():
+        cur = out.get(key)
+        out[key] = val if not cur else (set(cur) & set(val))
+    return out
+
+
 # An export holds its selected rows, their metadata columns and (when exact) a
 # slab of fetched vectors, in a process that already sits near its memory
 # ceiling with the model, browse matrix and 8.8GB screen resident. Two at once
@@ -4149,6 +4197,7 @@ def _full_export_selection(corpus, req: "FullExportRequest", vec) -> object:
         "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
         "segment_ids": _full_segment_ids(req.segment_set_uuid),
     }
+    filters = _merge_filters(filters, _full_lance_filter(req.filter_lance_uri))
     if req.k is not None:
         return corpus.select(vec, k=int(req.k), **filters)
     return corpus.select(
@@ -4485,10 +4534,15 @@ def full_threshold(req: FullThresholdRequest, request: Request) -> dict:
     scores, err = corpus.score(vec)
     start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
     mask = corpus.filter_mask(
-        set(_parse_vehicles(req.vehicle)) or None,
-        (start_unix, end_unix) if (start_unix or end_unix) else None,
-        set(_parse_drive_ids(req.drive_id)) or None,
-        _full_segment_ids(req.segment_set_uuid),
+        **_merge_filters(
+            {
+                "vehicles": set(_parse_vehicles(req.vehicle)) or None,
+                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
+                "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
+                "segment_ids": _full_segment_ids(req.segment_set_uuid),
+            },
+            _full_lance_filter(req.filter_lance_uri),
+        )
     )
     allowed = mask if mask is not None else np.ones(corpus.num_rows, dtype=bool)
 
@@ -4642,10 +4696,15 @@ def full_search(req: FullSearchRequest) -> dict:
         vec,
         limit=req.limit,
         offset=offset,
-        vehicles=set(_parse_vehicles(req.vehicle)) or None,
-        run_uuids=set(_parse_drive_ids(req.drive_id)) or None,
-        date_range=(start_unix, end_unix) if (start_unix or end_unix) else None,
-        segment_ids=_full_segment_ids(req.segment_set_uuid),
+        **_merge_filters(
+            {
+                "vehicles": set(_parse_vehicles(req.vehicle)) or None,
+                "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
+                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
+                "segment_ids": _full_segment_ids(req.segment_set_uuid),
+            },
+            _full_lance_filter(req.filter_lance_uri),
+        ),
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
@@ -4708,5 +4767,6 @@ def full_search(req: FullSearchRequest) -> dict:
             "from_date": req.from_date or None,
             "to_date": req.to_date or None,
             "segment_set_uuid": req.segment_set_uuid or None,
+            "filter_lance_uri": req.filter_lance_uri or None,
         },
     }
