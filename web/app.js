@@ -1318,6 +1318,15 @@ async function loadScanJobs(live) {
   }
 }
 function renderScans() {
+  try { _renderScans(); }
+  catch (e) {
+    // One malformed row must not blank the whole archive -- this panel is the
+    // only place some artifacts are discoverable.
+    console.error("renderScans failed", e);
+    $("scansBody").innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+function _renderScans() {
   const jobs = state.scanJobs || [];
   $("scansBody").innerHTML = jobs.length ? jobs.map((j) => {
     const id = j.console_url ? `<a class="scan-name" href="${j.console_url}" target="_blank" rel="noopener">${escapeHtml(j.execution_id)}</a>` : `<span class="scan-name">${escapeHtml(j.execution_id)}</span>`;
@@ -1337,8 +1346,17 @@ function renderScans() {
       ? `<div class="ct-sub" style="color:var(--neg)">⚠ capped — ${(j.counts.candidates || 0).toLocaleString()} matched</div>`
       : "";
     const filt = _fmtScanFilters(j.filters);
+    // An in-app export writes a parquet under the export prefix, which
+    // /api/export_file can presign -- so offer the artifact as a download, not
+    // just a path to copy. A Lilypad scan's segments.lance is a directory and
+    // has no single-object download, so it stays copy-only.
+    const isParquet = /\.parquet$/i.test(j.lance_uri || "");
+    const dl = isParquet
+      ? `<a class="scan-copy" href="/api/export_file?uri=${encodeURIComponent(j.lance_uri)}" title="Download this parquet">download</a>`
+      : "";
     const out = j.lance_uri
-      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span><button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button></div>`
+      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span>`
+        + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}</div>`
       : "—";
     let dx = `<span class="scan-dx none">—</span>`;
     if (j.segset_label) dx = `<span class="scan-dx">${escapeHtml(j.segset_label)}</span>`;

@@ -2341,6 +2341,12 @@ _SCAN_REFRESH_MIN_INTERVAL_S = 15.0
 def _row_needs_refresh(row: dict) -> bool:
     """True if a scan row has anything a background refresh could advance: a non-final
     status, missing result counts, or a pending segment-set registration."""
+    # In-app exports are already final when written: there is no workload to poll,
+    # no manifest.json beside the artifact, and the artifact is a parquet rather
+    # than a segments.lance. Feeding one to this worker made it retry a segment-set
+    # registration against interval rows on every poll, forever.
+    if (row.get("source") or "lilypad") == "app":
+        return False
     status = (row.get("status") or "").upper()
     if not _scan_status_terminal(status):
         return True
@@ -4315,7 +4321,7 @@ def full_export(req: FullExportRequest, request: Request) -> Response:
         _record_full_export(req, request, corpus, table, vec, parquet_uri, sel)
         _publish_full_export(
             req, request, base, parquet_uri, segset_label, sel, table.num_rows,
-            corpus, score_kind,
+            corpus, score_kind, segset_error=segset_error,
         )
         return Response(
             content=_arrow_csv(table),
@@ -4344,7 +4350,11 @@ def _full_export_intervals(
     # meant interval exports -- the mode the app defaults to -- never appeared in
     # Recent scans.
     _publish_full_export(
-        req, request, base, parquet_uri, "", sel, len(rows), corpus, "bounded_approx"
+        req, request, base, parquet_uri, "", sel, len(rows), corpus, "bounded_approx",
+        segset_error=(
+            "intervals: segment-set export not supported yet"
+            if req.create_segment_set else ""
+        ),
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
@@ -4521,7 +4531,7 @@ def _record_full_export(req, request: Request, corpus, table, vec, parquet_uri: 
 
 def _publish_full_export(
     req, request: Request, base: str, parquet_uri: str, segset_label: str,
-    sel, num_rows: int, corpus, score_kind: str,
+    sel, num_rows: int, corpus, score_kind: str, segset_error: str = "",
 ) -> None:
     """Publish a finished export to the Recent scans panel.
 
@@ -4569,8 +4579,15 @@ def _publish_full_export(
                     "score_kind": score_kind,
                 },
             )
-        if segset_label:
-            db.set_scan_segset(base, "", segset_label)
+        # Always record an OUTCOME, even a negative one. The panel treats
+        # "registration requested, nothing recorded" as still-in-progress, so a
+        # blank here shows as "pending..." for an export that will never register
+        # anything.
+        outcome = segset_label or segset_error or (
+            "not registered" if req.create_segment_set else ""
+        )
+        if outcome:
+            db.set_scan_segset(base, "", outcome)
     except Exception as exc:  # noqa: BLE001 - never fail a completed download
         LOGGER.warning("full export not published to Recent scans: %s", exc)
 
