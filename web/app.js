@@ -307,8 +307,9 @@ async function runRefine(startOpts) {
   state.mode = "refine";
   showToast(`Re-ranking with ${marks.filter((m) => m.mark === "up").length} 👍 / ${marks.filter((m) => m.mark === "down").length} 👎…`);
   if (_fullCorpusOn()) {
-    await _issueFullVector("/api/full_refine", {
-      query: state.query, marks, negative_weight: 0.5, text_weight: 0.3,
+    await _issueFullVector("/api/retrieve", {
+      query: state.query, marks, k: FULL_BATCH, output: "hits",
+      negative_weight: 0.5, text_weight: 0.3, refine_from_marks: true,
     }, (startOpts && startOpts.page) || 0);
     return;
   }
@@ -422,8 +423,9 @@ async function runVectorSearch(startOpts) {
   // 2M resident corpus while the identical text query covered 34M -- same UI,
   // same wording, quietly different corpus.
   if (_fullCorpusOn()) {
-    await _issueFullVector("/api/full_search_by_vector", {
+    await _issueFullVector("/api/retrieve", {
       vector: state.resumeVec, query: state.resumeLabel || state.query || "",
+      k: FULL_BATCH, output: "hits",
     }, (startOpts && startOpts.page) || 0);
     return;
   }
@@ -482,7 +484,7 @@ async function _ensureFullCorpus() {
 
 async function _issueFullCorpus(q, page) {
   if (!(await _ensureFullCorpus())) return;
-  await _fullFetch("/api/full_search", { query: q }, page, _fullKey(q));
+  await _fullFetch("/api/retrieve", { query: q, k: FULL_BATCH, output: "hits" }, page, _fullKey(q));
 }
 
 // The filter half of every full-corpus request body, so text search, resume,
@@ -1186,7 +1188,7 @@ async function fullExport() {
       const tag = e.tag || e.query;
       note.textContent = `Exporting ${tag} from all 34M clips… (${done + 1}/${rows.length})`;
       const body = {
-        query: e.query || e.tag, tag,
+        query: e.query || e.tag, tag, output: "csv",
         interval: state.sampleMode === "interval",
         dedupe_segment: $("dedupInput").checked,
         create_segment_set: $("segsetInput").checked,
@@ -1198,7 +1200,7 @@ async function fullExport() {
       };
       if (topk) body.k = kForRow(e) || 50;
       else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
-      const resp = await fetch("/api/full_export", {
+      const resp = await fetch("/api/retrieve", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });

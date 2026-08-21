@@ -3580,7 +3580,14 @@ class RetrieveRequest(BaseModel):
     drive_id: str | None = None
     segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    marks: list[Mark] = []        # downvoted rows are excluded from results
+    # Marks do two jobs: downvoted rows are excluded from the results, and with
+    # `refine_from_marks` they also build the query direction (Rocchio). Both,
+    # because moving the vector away from a rejection is not the same as
+    # removing it -- a clip near the positives survives the push and returns.
+    marks: list[Mark] = []
+    refine_from_marks: bool = False
+    negative_weight: float = 0.5
+    text_weight: float = 0.3
 
 
 @app.post("/api/retrieve")
@@ -3607,11 +3614,47 @@ def retrieve(req: RetrieveRequest, request: Request):
         # Export keeps its own lock, artifact writes and Recent-scans row; only
         # the selection is shared.
         return _retrieve_export(req, request, corpus, vec, exclude)
-    return _retrieve_hits(req, corpus, vec, exclude)
+    out = _retrieve_hits(req, corpus, vec, exclude)
+    if req.refine_from_marks:
+        # Report what the feedback actually did: how many labels shaped the
+        # vector, and how many rows were removed outright. Rocchio only rotates
+        # the query, so without the exclusion count a caller cannot tell whether
+        # a rejection took effect.
+        ups = sum(1 for m in req.marks if m.mark == "up" and m.row is not None)
+        out["refined_from"] = {
+            "num_up": ups, "num_down": len(exclude), "excluded": len(exclude),
+        }
+    return out
 
 
 def _retrieve_vector(req: "RetrieveRequest", corpus) -> np.ndarray:
-    """The query direction: a supplied vector, else the encoded text."""
+    """The query direction: a Rocchio prototype, a supplied vector, or the text."""
+    if req.refine_from_marks:
+        pos = [int(m.row) for m in req.marks if m.mark == "up" and m.row is not None]
+        neg = [int(m.row) for m in req.marks if m.mark == "down" and m.row is not None]
+        pos = [r for r in dict.fromkeys(pos) if 0 <= r < corpus.num_rows]
+        neg = [r for r in dict.fromkeys(neg) if 0 <= r < corpus.num_rows]
+        if not pos:
+            raise HTTPException(400, "mark at least one positive to re-rank")
+        text_vec = None
+        if req.text_weight > 0 and req.query.strip():
+            if not _state.get("model_ready"):
+                raise HTTPException(503, "model still loading")
+            text_vec = search_engine.encode_query(
+                req.query.strip(), _state["processor"], _state["model"],
+                _state["cfg"].device,
+            )
+        try:
+            # The marked clips' ORIGINAL embeddings: the resident screen is
+            # quantized and PCA-reduced and cannot reconstruct a direction of
+            # the quality feedback needs.
+            mat = corpus.vectors_for(pos + neg)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        return _rocchio(
+            mat[: len(pos)], mat[len(pos):], text_vec,
+            req.negative_weight, req.text_weight,
+        )
     if req.vector:
         vec = np.asarray(req.vector, dtype=np.float32)
         if vec.ndim != 1 or vec.shape[0] != corpus.dim:
@@ -3752,7 +3795,6 @@ def _retrieve_export(req: "RetrieveRequest", request: Request, corpus, vec, excl
         _FULL_EXPORT_LOCK.release()
 
 
-@app.post("/api/full_export")
 def full_export(req: FullExportRequest, request: Request) -> Response:
     """Export from the whole 34M-row corpus, in-process -- no Lilypad launch.
 
@@ -4352,7 +4394,6 @@ class FullRefineRequest(BaseModel):
     filter_lance_uri: str | None = None
 
 
-@app.post("/api/full_search_by_vector")
 def full_search_by_vector(req: FullVectorSearchRequest) -> dict:
     """Rank the WHOLE corpus by a supplied vector.
 
@@ -4373,7 +4414,6 @@ def full_search_by_vector(req: FullVectorSearchRequest) -> dict:
     return _full_rank(corpus, vec, req, label=req.query or "saved vector")
 
 
-@app.post("/api/full_refine")
 def full_refine(req: FullRefineRequest) -> dict:
     """Re-rank the whole corpus from 👍/👎 marks (Rocchio prototype).
 
@@ -4493,7 +4533,6 @@ def _full_rank(corpus, vec: np.ndarray, req, *, label: str, exclude_rows=None) -
     return _full_payload(hits, candidates, corpus, req, took_ms, label, page_size=limit)
 
 
-@app.post("/api/full_search")
 def full_search(req: FullSearchRequest) -> dict:
     """Top-`limit` clips over the ENTIRE corpus. No S3 access per query.
 
