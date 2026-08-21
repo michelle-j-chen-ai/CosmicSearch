@@ -44,6 +44,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import config
 import numpy as np
 import pyarrow.parquet as pq
 import torch
@@ -180,10 +181,7 @@ class _ArrowStrCol:
 # source_media_uri column (6.45GB at 48M rows -- the single biggest resident
 # cost) is NOT loaded; it is reconstructed per-hit from run_uuid + chunk_start.
 # Verified row-exact: dt is the UTC date of chunk_start_unix.
-_MP4_PREFIX = os.environ.get(
-    "NLS_MP4_PREFIX",
-    "s3://neuron-prod-data-intelligence-exploratory/vlm/chunks_mp4_v2/",
-)
+_MP4_PREFIX = config.mp4_prefix()
 
 
 class _ReconUriCol:
