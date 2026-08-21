@@ -175,6 +175,14 @@ class Selection:
     candidates: int
     cutoff: float
     truncated: bool
+    # "bounded_approx": L1 scores, within +/-error_bound of the L2 value.
+    # "pca_exact": the band was resolved through L2, so membership is exact.
+    # Neither is a 768-d cosine -- `exact_scores` produces that separately.
+    score_kind: str = "bounded_approx"
+    # Rows inside the eps window of the cutoff: the work the bound could NOT
+    # decide, and so the honest measure of what the cascade had to pay for.
+    band_rows: int = 0
+    refined: bool = False
 
     def __len__(self) -> int:
         return int(self.rows.size)
@@ -428,41 +436,44 @@ class FullCorpus:
         run_uuids: "set[str] | None" = None,
         segment_ids: "set[str] | frozenset[str] | None" = None,
         exclude_rows: "list[int] | np.ndarray | None" = None,
+        refine: str = "never",
     ) -> "tuple[list[Hit], int]":
-        """`(hits, candidates)`: rows `offset`..`offset+limit`, best first.
+        """A page of `select`, as Hit objects. `(hits, candidates)`.
 
-        Paging selects the top `offset + limit` and returns the tail slice.
-        Every score is already resident, so a deeper page costs one more
-        selection pass rather than another scan -- there is no cursor to keep
-        and no state between requests. `candidates` is how many rows survived
-        the filters, which is what the caller needs to size a pager.
+        Deliberately thin. This was a second implementation of the search -- its
+        own top-k, its own filter handling -- and every divergence between the
+        two surfaced as a bug present in one path and absent in the other.
+        Paging is a slice of a selection and a Hit is a serialization of a row;
+        neither is a different search.
+
+        `refine` defaults to "never": browsing wants the 190ms answer, and the
+        caller sharpens what is on screen afterwards via `exact_scores`.
         """
         if limit <= 0:
             raise ValueError("limit must be positive")
         if offset < 0:
             raise ValueError("offset must not be negative")
-        scores, err = self.score(query)
-        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids, exclude_rows)
-        depth = offset + limit
-        if mask is None:
-            candidates = self.num_rows
-            order = self._top_k(scores, min(depth, candidates))
-        else:
-            allowed = np.nonzero(mask)[0]
-            candidates = int(allowed.size)
-            if candidates == 0:
-                return [], 0
-            order = allowed[self._top_k(scores[allowed], min(depth, candidates))]
-        page = order[offset:]
+        sel = self.select(
+            query,
+            k=offset + limit,
+            vehicles=vehicles,
+            date_range=date_range,
+            run_uuids=run_uuids,
+            segment_ids=segment_ids,
+            exclude_rows=exclude_rows,
+            refine=refine,
+        )
+        if len(sel) == 0:
+            return [], sel.candidates
         return (
             [
-                self._hit(int(i), offset + rank, float(scores[i]), err)
-                for rank, i in enumerate(page, start=1)
+                self._hit(int(r), offset + rank, float(s), sel.error_bound)
+                for rank, (r, s) in enumerate(
+                    zip(sel.rows[offset:], sel.scores[offset:]), start=1
+                )
             ],
-            candidates,
+            sel.candidates,
         )
-
-    # ---- export-scale selection ---------------------------------------
 
     def select(
         self,
@@ -476,72 +487,134 @@ class FullCorpus:
         segment_ids: "set[str] | frozenset[str] | None" = None,
         exclude_rows: "list[int] | np.ndarray | None" = None,
         max_rows: int = 0,
+        refine: str = "auto",
     ) -> "Selection":
-        """Rows matching a top-`k` cut or a `tau` threshold, as plain arrays.
+        """The one search. Every other retrieval path in this app is a view on it.
 
-        Deliberately NOT `search`: that builds one `Hit` object per result, which
-        is right for a 200-row page and fatal for an export -- a 3.4M-row result
-        costs well over a gigabyte of Python objects plus the GC time to walk
-        them. Everything here stays in numpy, and the metadata is materialized
-        columnwise only once, in `to_arrow`.
+        Takes a top-`k` cut or a `tau` threshold; both reduce to the same
+        operation, because a top-k HAS a threshold -- the k-th score -- so one
+        cascade serves search and export alike.
 
-        Exactly one of `k` / `tau` is required. `k` is bounded by construction;
-        `tau` is not, so `max_rows` (when non-zero) truncates by score and sets
-        `truncated`, rather than letting a permissive threshold decide how much
-        memory this process uses.
+        Three layers, each answering a different question rather than polishing
+        the same number:
+
+          L1  int8 x 256, resident. Scores all 34.4M rows in ~190ms. Its error
+              against L2 is bounded by `eps`, which is what turns the next step
+              into a proof instead of a guess.
+          L2  `vector_fp`, fp32 x 256, on S3. The space L1 approximates. Read
+              ONLY for rows whose L1 score lies within `eps` of the cutoff -- the
+              genuinely undecided ones. Everything else is already settled by
+              arithmetic already done: provably in, or provably out, no fetch.
+          L3  the original 768-d embedding. A DIFFERENT space, not a deeper
+              refinement -- PCA-256 is a lossy projection of it and nothing
+              bounds that truncation, so L3 cannot sharpen an L2 decision. It is
+              read when the caller needs a cosine comparable to thresholds
+              calibrated elsewhere (`exact_scores`).
+
+        `refine`: "auto" resolves the band through L2 when it is usable; "never"
+        answers from L1 alone, which is what browsing wants; "always" raises
+        rather than silently degrading when L2 cannot be read.
+
+        A top-k cut uses a 2*eps window, not eps: a row is provably outside the
+        true top-k only when its L1 score is more than 2*eps below the k-th,
+        since its own score and the k-th can each be off by eps.
         """
+        import eps_bound
+
         if (k is None) == (tau is None):
             raise ValueError("pass exactly one of k= or tau=")
         if k is not None and k <= 0:
             raise ValueError("k must be positive")
-        scores, err = self.score(query)
-        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids, exclude_rows)
-        if mask is None:
-            allowed = None
-            candidates = self.num_rows
-        else:
-            allowed = np.nonzero(mask)[0]
-            candidates = int(allowed.size)
-        if candidates == 0:
-            empty = np.empty(0, dtype=np.int64)
-            return Selection(empty, np.empty(0, dtype=np.float32), err, 0, 0.0, False)
+        if refine not in ("auto", "never", "always"):
+            raise ValueError("refine must be auto, never or always")
 
-        truncated = False
+        scores, eps = self.score(query)
+        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids, exclude_rows)
+        allowed = None if mask is None else np.nonzero(mask)[0]
+        candidates = self.num_rows if allowed is None else int(allowed.size)
+        if candidates == 0:
+            return Selection(
+                np.empty(0, np.int64), np.empty(0, np.float32), eps, 0, 0.0, False
+            )
+
+        sub = scores if allowed is None else scores[allowed]
         if k is not None:
             depth = min(int(k), candidates)
-            if allowed is None:
-                rows = self._top_k(scores, depth)
-            else:
-                rows = allowed[self._top_k(scores[allowed], depth)]
-            cut = float(scores[rows[-1]]) if rows.size else 0.0
+            cut = float(np.partition(sub, sub.size - depth)[sub.size - depth])
+            window = 2.0 * eps
         else:
-            # Threshold over the SCREEN score. A row's exact PCA score is within
-            # +/-err of this, so rows within err of tau are genuinely undecided;
-            # `score_kind` on the result says so rather than implying otherwise.
-            hits = scores >= np.float32(tau)
-            if allowed is not None:
-                sub = hits[allowed]
-                rows = allowed[sub]
+            depth, cut, window = None, float(tau), eps
+
+        above, band, _below = eps_bound.classify(sub, cut, window)
+        band_rows = int(band.sum())
+
+        def _to_rows(positions):
+            return positions if allowed is None else allowed[positions]
+
+        above_idx = _to_rows(np.nonzero(above)[0])
+        keep, keep_exact = above_idx, None
+        refined = False
+        if band_rows and refine != "never":
+            if not self.vector_fp_usable:
+                if refine == "always":
+                    raise RuntimeError(
+                        "layer 2 (vector_fp) is unusable, so the band cannot be "
+                        "resolved; pass refine='never' to accept bounded scores"
+                    )
             else:
-                rows = np.nonzero(hits)[0]
-            matched = int(rows.size)
-            if max_rows and matched > max_rows:
-                rows = rows[self._top_k(scores[rows], max_rows)]
-                truncated = True
-            else:
-                rows = rows[np.argsort(-scores[rows], kind="stable")]
-            cut = float(tau)
-            # What passed the filters AND the cutoff -- not what passed the
-            # filters alone, which is what a top-k selection reports. A capped
-            # export needs this number to say how much it left behind.
-            candidates = matched
+                band_idx = _to_rows(np.nonzero(band)[0])
+                if depth is None:
+                    # Threshold: only MEMBERSHIP is in question, and ABOVE is
+                    # already proven, so the band alone is fetched. ABOVE can be
+                    # millions of rows; reading it to sort a set nobody asked to
+                    # be ordered would defeat the bound entirely.
+                    band_exact = self.pca_scores(band_idx, query)
+                    keep = np.concatenate([keep, band_idx[band_exact >= cut]])
+                else:
+                    # Top-k: ORDER decides the answer, not just membership, so
+                    # ABOVE is fetched too. Resolving the band and then ranking
+                    # on L1 scores picks the right candidates and puts them in
+                    # the wrong order -- which is the same as picking wrong at
+                    # the k-th place. Bounded by depth + band, so it stays small.
+                    cand = np.concatenate([above_idx, band_idx])
+                    keep_exact = self.pca_scores(cand, query)
+                    keep = cand
+                refined = True
+        if not refined and band_rows:
+            # Unresolved band: defer to the bounded score's own verdict, so an
+            # unrefined result is exactly what a plain `score >= cut` gives.
+            # Admitting the whole band would silently loosen a threshold by eps;
+            # dropping it would silently tighten one. Both answer a different
+            # question than the caller asked.
+            band_pos = np.nonzero(band)[0]
+            keep = np.concatenate([keep, _to_rows(band_pos[sub[band_pos] >= cut])])
+
+        keep = np.asarray(keep, dtype=np.int64)
+        # Rank on the best scores available for these rows: the exact layer-2
+        # values when they were fetched, the bounded layer-1 ones otherwise.
+        rank_on = scores[keep] if keep_exact is None else keep_exact
+        order = np.argsort(-np.asarray(rank_on), kind="stable")
+        keep = keep[order]
+        keep_scores = (scores[keep] if keep_exact is None
+                       else np.asarray(keep_exact)[order])
+
+        truncated = False
+        if depth is not None and keep.size > depth:
+            keep, keep_scores = keep[:depth], keep_scores[:depth]
+        elif max_rows and keep.size > max_rows:
+            keep, keep_scores = keep[:max_rows], keep_scores[:max_rows]
+            truncated = True
+
         return Selection(
-            rows=np.asarray(rows, dtype=np.int64),
-            scores=scores[rows].astype(np.float32),
-            error_bound=err,
-            candidates=candidates,
+            rows=keep,
+            scores=keep_scores.astype(np.float32),
+            error_bound=eps,
+            candidates=(candidates if depth is not None else int(above.sum()) + band_rows),
             cutoff=cut,
             truncated=truncated,
+            score_kind="pca_exact" if refined else "bounded_approx",
+            band_rows=band_rows,
+            refined=refined,
         )
 
     def tau_for_k(self, query: np.ndarray, k: int, **filters) -> float:
@@ -644,6 +717,39 @@ class FullCorpus:
             mask &= starts < int(end_unix)
         rows = np.nonzero(mask)[0]
         return rows[np.argsort(starts[rows], kind="stable")]
+
+    def pca_scores(self, rows: "np.ndarray", query: np.ndarray) -> np.ndarray:
+        """Exact PCA-256 score for `rows`, from `vector_fp` (layer 2).
+
+        This is the space the screening score approximates: `eps_cauchy_schwarz`
+        bounds |L1 score - THIS score|. Nothing bounds this against the 768-d
+        cosine, because PCA-256 is a lossy projection of it -- so L2 is what
+        makes a band decision provable, and L3 is a different, higher-fidelity
+        question rather than a further refinement of the same number.
+        """
+        if self.dataset is None:
+            raise RuntimeError("corpus has no dataset handle; layer 2 unavailable")
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return np.empty(0, dtype=np.float64)
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        norm = float(np.linalg.norm(q))
+        if norm == 0.0:
+            raise ValueError("query vector is all zeros")
+        q_pca = (self.pca @ (q / norm)).astype(np.float32)
+        col = vector_fp_column(CORPUS_MODEL)
+        order = np.argsort(rows, kind="stable")
+        ordered = rows[order]
+        out = np.empty(rows.size, dtype=np.float64)
+        for at in range(0, ordered.size, _EXACT_CHUNK_ROWS):
+            part = ordered[at : at + _EXACT_CHUNK_ROWS]
+            tbl = self.dataset.take(part, columns=[col])
+            flat = tbl.column(col).combine_chunks().values.to_numpy(zero_copy_only=False)
+            mat = np.asarray(flat, dtype=np.float32).reshape(part.size, -1)
+            out[order[at : at + _EXACT_CHUNK_ROWS]] = np.einsum(
+                "ij,j->i", mat, q_pca, dtype=np.float64
+            )
+        return out
 
     def probe_vector_fp(self, sample: int = 64) -> dict:
         """Is `vector_fp` the true pre-quantization projection, or a fallback?
