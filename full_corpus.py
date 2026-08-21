@@ -37,21 +37,19 @@ import time
 import lance
 import numpy as np
 
+import config
 import eps_bound
 import lance_writer
 import oci_s3
 
 LOGGER = logging.getLogger(__name__)
 
-# Pinned, NOT a caller/workflow input -- see the module docstring.
-CORPUS_TABLE_URI = (
+
+# The one corpus this app reads. Pinned, NOT a caller/workflow input -- see the
+# module docstring. Every other embedding source has been retired; anything that
+# needs "the corpus" resolves to this.
+DEFAULT_CORPUS_TABLE_URI = (
     "s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/video_embeddings.lance"
-)
-# Kept for reference only. The basis is read from the corpus's own field
-# metadata; this sibling table holds a copy that is verified to match today but
-# is not the source of truth.
-PCA_BASIS_URI = (
-    "s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/pca_basis.lance"
 )
 # Encoder whose column family this module scores against. Must match the model
 # the app encodes queries with, or every score is meaningless.
@@ -60,9 +58,10 @@ CORPUS_MODEL = "black_dwarf"
 # Rebuilt per hit rather than held resident: 34.4M source_media_uri strings are
 # ~4.5GB, and the value is a pure function of (dt, run_uuid, chunk_start_unix).
 # Verified against the corpus: reconstruction matched on every sampled row.
+# Shares NLS_MP4_PREFIX with gpu_corpus so the two cannot disagree about where
+# the clips live.
 _MEDIA_URI_TEMPLATE = (
-    "s3://neuron-prod-data-intelligence-exploratory/vlm/chunks_mp4_v2/"
-    "dt={dt}/{run_uuid}_t{chunk_start_unix}.mp4"
+    config.mp4_prefix() + "dt={dt}/{run_uuid}_t{chunk_start_unix}.mp4"
 )
 
 # Rows per take() when fetching exact vectors for an export. take() has a ~1.65s
@@ -222,7 +221,7 @@ class FullCorpus:
         # answered it rather than leaving "is this really the whole corpus?"
         # unanswerable. Set on the instance at load; defaulted here so a
         # directly-constructed corpus still has them.
-        self.corpus_uri = CORPUS_TABLE_URI
+        self.corpus_uri = DEFAULT_CORPUS_TABLE_URI
         self.dataset_version = None
         self.loaded_at = 0.0
         # Held open from load time. Row positions address THIS version; the table
@@ -796,11 +795,11 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     same canonical row order, so a position in one indexes the other.
     """
     so = oci_s3.lance_storage_options()
-    ds = lance.dataset(CORPUS_TABLE_URI, storage_options=so)
+    ds = lance.dataset(DEFAULT_CORPUS_TABLE_URI, storage_options=so)
     i8_col = embedding_column(model)
     if i8_col not in ds.schema.names:
         raise ValueError(
-            f"{CORPUS_TABLE_URI} has no column {i8_col!r} "
+            f"{DEFAULT_CORPUS_TABLE_URI} has no column {i8_col!r} "
             f"(available: {sorted(n for n in ds.schema.names if 'embedding' in n)})"
         )
     pca, scale, model_id = _read_field_pca(ds, model)
@@ -884,7 +883,7 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     )
     corpus.model_id = model_id
     corpus.dataset = ds
-    corpus.corpus_uri = CORPUS_TABLE_URI
+    corpus.corpus_uri = DEFAULT_CORPUS_TABLE_URI
     corpus.dataset_version = getattr(ds, "version", None)
     corpus.loaded_at = time.time()
     corpus.warm()

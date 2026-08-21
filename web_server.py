@@ -4688,7 +4688,7 @@ def full_corpus_status() -> dict:
     out = {
         "status": status,
         "error": error,
-        "corpus_uri": full_corpus.CORPUS_TABLE_URI,
+        "corpus_uri": full_corpus.DEFAULT_CORPUS_TABLE_URI,
         "model": full_corpus.CORPUS_MODEL,
         "num_rows": corpus.num_rows if corpus is not None else 0,
     }
