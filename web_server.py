@@ -4137,8 +4137,15 @@ def full_refine(req: FullRefineRequest) -> dict:
         mat[: len(pos)], mat[len(pos):], text_vec,
         req.negative_weight, req.text_weight,
     )
-    out = _full_rank(corpus, vec, req, label=req.query or "refined")
-    out["refined_from"] = {"num_up": len(pos), "num_down": len(neg)}
+    # Drop the rejected clips from the results. Rocchio moves the query direction
+    # away from the negative centroid, which is not the same as removing them: a
+    # thumbs-down clip that still sits near the positives came straight back at
+    # the top of the re-rank, so the feedback looked ignored. Positives are kept
+    # -- seeing them hold their place is how you tell the re-rank worked.
+    out = _full_rank(corpus, vec, req, label=req.query or "refined", exclude_rows=neg)
+    out["refined_from"] = {
+        "num_up": len(pos), "num_down": len(neg), "excluded": len(neg),
+    }
     return out
 
 
@@ -4179,7 +4186,7 @@ def _require_full_corpus():
     return corpus
 
 
-def _full_rank(corpus, vec: np.ndarray, req, *, label: str) -> dict:
+def _full_rank(corpus, vec: np.ndarray, req, *, label: str, exclude_rows=None) -> dict:
     """Shared ranking + response envelope for the full-corpus vector endpoints.
 
     Accepts either field name for the page size: the vector/refine requests use
@@ -4208,6 +4215,7 @@ def _full_rank(corpus, vec: np.ndarray, req, *, label: str) -> dict:
             },
             _full_lance_filter(req.filter_lance_uri),
         ),
+        exclude_rows=exclude_rows,
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(

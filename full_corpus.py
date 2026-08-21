@@ -341,16 +341,29 @@ class FullCorpus:
         date_range: "tuple[int | None, int | None] | None" = None,
         run_uuids: "set[str] | None" = None,
         segment_ids: "set[str] | frozenset[str] | None" = None,
+        exclude_rows: "list[int] | np.ndarray | None" = None,
     ) -> np.ndarray | None:
         """AND of the given filters; None when nothing was asked for.
 
         Unlike `threshold_search._filter_mask`, `vehicles` is a SET: the app's
         vehicle box accepts a list, and a single-value filter silently dropped
         every vehicle but one.
+
+        `exclude_rows` drops specific rows outright. Relevance feedback needs it:
+        Rocchio moves the query DIRECTION away from the negatives, which is not
+        the same as removing them, so a rejected clip that still sits near the
+        positive centroid comes back near the top of the very next re-rank.
         """
-        if not vehicles and date_range is None and not run_uuids and not segment_ids:
+        has_exclude = exclude_rows is not None and len(exclude_rows) > 0
+        if (
+            not vehicles and date_range is None and not run_uuids
+            and not segment_ids and not has_exclude
+        ):
             return None
         mask = np.ones(self.num_rows, dtype=bool)
+        if has_exclude:
+            idx = np.asarray(exclude_rows, dtype=np.int64)
+            mask[idx[(idx >= 0) & (idx < self.num_rows)]] = False
         if segment_ids:
             mask &= self.segment_mask(segment_ids)
         if vehicles:
@@ -411,6 +424,7 @@ class FullCorpus:
         date_range: "tuple[int | None, int | None] | None" = None,
         run_uuids: "set[str] | None" = None,
         segment_ids: "set[str] | frozenset[str] | None" = None,
+        exclude_rows: "list[int] | np.ndarray | None" = None,
     ) -> "tuple[list[Hit], int]":
         """`(hits, candidates)`: rows `offset`..`offset+limit`, best first.
 
@@ -425,7 +439,7 @@ class FullCorpus:
         if offset < 0:
             raise ValueError("offset must not be negative")
         scores, err = self.score(query)
-        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids)
+        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids, exclude_rows)
         depth = offset + limit
         if mask is None:
             candidates = self.num_rows
@@ -457,6 +471,7 @@ class FullCorpus:
         date_range: "tuple[int | None, int | None] | None" = None,
         run_uuids: "set[str] | None" = None,
         segment_ids: "set[str] | frozenset[str] | None" = None,
+        exclude_rows: "list[int] | np.ndarray | None" = None,
         max_rows: int = 0,
     ) -> "Selection":
         """Rows matching a top-`k` cut or a `tau` threshold, as plain arrays.
@@ -477,7 +492,7 @@ class FullCorpus:
         if k is not None and k <= 0:
             raise ValueError("k must be positive")
         scores, err = self.score(query)
-        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids)
+        mask = self.filter_mask(vehicles, date_range, run_uuids, segment_ids, exclude_rows)
         if mask is None:
             allowed = None
             candidates = self.num_rows
