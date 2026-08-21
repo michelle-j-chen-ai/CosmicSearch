@@ -63,7 +63,14 @@ async function loadPlatform() {
     const tag = $("brandTag");
     if (p && p.label) { tag.textContent = p.label; tag.className = "tag " + (p.name === "trucks" ? "trucking" : "cars"); }
   } catch (e) { /* cosmetic */ }
-  $("scansSection").style.display = state.offlineScan ? "block" : "none";
+  // The scan list is an archive of past runs and their output artifacts, so it
+  // shows regardless of whether new scans can still be launched. Gating it on
+  // `offline_scan` hid every historical parquet/segments.lance the moment the
+  // launcher was turned off.
+  $("scansSection").style.display = "block";
+  $("scansHint").textContent = state.offlineScan
+    ? ""
+    : "History only — exports now run in-app against the full corpus. Past outputs stay downloadable.";
   renderExportPanel();
 }
 
@@ -175,7 +182,7 @@ function setPage(which) {
     // particular, a render error must not prevent the Recent scans list from loading.
     try { renderTable(); } catch (e) { console.error("renderTable failed", e); }
     try { renderExportPanel(); } catch (e) { console.error("renderExportPanel failed", e); }
-    if (state.offlineScan) loadScanJobs();
+    loadScanJobs();
   }
 }
 
@@ -1241,7 +1248,6 @@ async function pollScan(execId, url) {
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
 let _scansRepollTimer = null;
 async function loadScanJobs(live) {
-  if (!state.offlineScan) return;
   clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
