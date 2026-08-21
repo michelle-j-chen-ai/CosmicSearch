@@ -196,6 +196,12 @@ _DDL = [
     # ({num_segments, num_clips_scanned, segments_per_tag, intervals_per_tag}); cached
     # here so the Recent-scans panel need not re-read the manifest on every list.
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS counts JSONB",
+    # Which mechanism produced the row: "lilypad" for an offline scan launch,
+    # "app" for an in-app full-corpus export. Both belong in the same list -- the
+    # panel is the shared record of what was produced and where it landed -- but
+    # they differ in what a reader can expect (an app export is already complete
+    # and has no console to open).
+    f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS source TEXT",
     # Threshold-tuning episodes: (score-distribution features, suggested tau, fitted
     # tau, metrics) captured each time a labeled fit is produced. Append-only training
     # data for a future learned threshold policy; no unique key (many tunes per tag).
@@ -881,11 +887,11 @@ def vectors_for_tags(tags: list[str], model_uri: str) -> dict[str, list[float]]:
 _INSERT_SCAN = text(
     f"""INSERT INTO {_SCAN_TABLE} (
         execution_id, user_email, tags, thresholds, output_dir, lance_uri, console_url,
-        status, register_segset, segset_name, filters, idem_key
+        status, register_segset, segset_name, filters, idem_key, source
     ) VALUES (
         :execution_id, :user_email, CAST(:tags AS JSONB), CAST(:thresholds AS JSONB),
         :output_dir, :lance_uri, :console_url, :status, :register_segset, :segset_name,
-        CAST(:filters AS JSONB), :idem_key
+        CAST(:filters AS JSONB), :idem_key, :source
     )
     ON CONFLICT (execution_id) DO UPDATE SET
         user_email = EXCLUDED.user_email, tags = EXCLUDED.tags,
@@ -893,6 +899,7 @@ _INSERT_SCAN = text(
         lance_uri = EXCLUDED.lance_uri, console_url = EXCLUDED.console_url,
         status = EXCLUDED.status, register_segset = EXCLUDED.register_segset,
         segset_name = EXCLUDED.segset_name, filters = EXCLUDED.filters,
+        source = EXCLUDED.source,
         idem_key = COALESCE({_SCAN_TABLE}.idem_key, EXCLUDED.idem_key), updated_at = now()
     RETURNING id"""
 )
@@ -911,7 +918,7 @@ _UPDATE_SCAN_SEGSET = text(
 
 _LIST_SCANS = text(
     f"""SELECT execution_id, created_at, updated_at, user_email, output_dir, lance_uri,
-               console_url, status, error,
+               console_url, status, error, source,
                register_segset, segset_name, segset_uuid, segset_label,
                tags::text       AS tags_json,
                thresholds::text AS thresholds_json,
@@ -944,6 +951,7 @@ def _scan_params(record: dict) -> dict:
         "segset_name": record.get("segset_name") or "",
         "filters": json.dumps(record.get("filters") or {}),
         "idem_key": record.get("idem_key") or None,
+        "source": record.get("source") or "lilypad",
     }
 
 
