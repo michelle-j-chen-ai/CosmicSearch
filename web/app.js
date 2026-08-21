@@ -307,10 +307,16 @@ async function runSearch(startOpts) {
 }
 async function runRefine(startOpts) {
   if (!state.query) return;
-  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, segment_id: m.segment_id, mark: m.mark, index: m.index, rank: m.rank, score: m.score }));
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, segment_id: m.segment_id, mark: m.mark, index: m.index, row: m.row, rank: m.rank, score: m.score }));
   if (!marks.some((m) => m.mark === "up")) { showToast("Mark at least one 👍 to re-rank"); return; }
   state.mode = "refine";
   showToast(`Re-ranking with ${marks.filter((m) => m.mark === "up").length} 👍 / ${marks.filter((m) => m.mark === "down").length} 👎…`);
+  if (_fullCorpusOn()) {
+    await _issueFullVector("/api/full_refine", {
+      query: state.query, marks, negative_weight: 0.5, text_weight: 0.3,
+    }, (startOpts && startOpts.page) || 0);
+    return;
+  }
   await _issue("/api/refine", { query: state.query, marks, negative_weight: 0.5, text_weight: 0.3, ...(startOpts || {}), ..._searchFilters() });
 }
 function _toNs(raw) {
@@ -416,6 +422,16 @@ async function handleUpload(file) {
 async function runVectorSearch(startOpts) {
   if (!state.resumeVec) return;
   state.mode = "resume";
+  // Resuming a saved search must cover the same corpus a fresh search does.
+  // Falling through to /api/search_by_vector ranked the reloaded tag over the
+  // 2M resident corpus while the identical text query covered 34M -- same UI,
+  // same wording, quietly different corpus.
+  if (_fullCorpusOn()) {
+    await _issueFullVector("/api/full_search_by_vector", {
+      vector: state.resumeVec, query: state.resumeLabel || state.query || "",
+    }, (startOpts && startOpts.page) || 0);
+    return;
+  }
   await _issue("/api/search_by_vector", { vector: state.resumeVec, query: state.resumeLabel || state.query || "", ...(startOpts || {}), ..._searchFilters() });
 }
 function reload(startOpts) {
@@ -446,34 +462,38 @@ async function refreshCorpusPill() {
 // and read the result as complete.
 function _fullCorpusOn() { return true; }
 function wireFullCorpusToggles() { refreshCorpusPill(); }
-async function _issueFullCorpus(q, page) {
-  // The corpus is read and decoded on first use (minutes, ~12GB), so the server
-  // answers 503 until it is resident. Kick the load, tell the user where it is
-  // up to, and poll rather than leaving the grid on "Searching...".
+// The corpus is read and decoded on first use (minutes, ~12GB), so the server
+// answers 503 until it is resident. Kick the load, show progress, and poll
+// rather than leaving the grid on "Searching...". Returns false if it failed.
+async function _ensureFullCorpus() {
   $("emptyState").style.display = "none";
   $("resultsState").style.display = "block";
   const status = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
-  // Paging hits this same path; when the corpus is already resident the poll
-  // below is skipped and the request goes straight out.
-  if (!status || status.status !== "ready") {
-    await fetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
-    $("gridStatus").textContent =
-      "Loading the full corpus (first use, a few minutes) — this search will start automatically.";
-    for (let i = 0; i < 60; i++) {
-      await new Promise((res) => setTimeout(res, 10000));
-      const s = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
-      if (!s) continue;
-      if (s.status === "error") { $("gridStatus").textContent = "Full corpus failed to load: " + s.error; return; }
-      if (s.status === "ready") break;
-      $("gridStatus").textContent = `Loading the full corpus… ${Math.round(s.elapsed_s || 0)}s`;
-    }
+  if (status && status.status === "ready") return true;
+  await fetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
+  $("gridStatus").textContent =
+    "Loading the full corpus (first use, a few minutes) — this search will start automatically.";
+  for (let i = 0; i < 60; i++) {
+    await new Promise((res) => setTimeout(res, 10000));
+    const s = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+    if (!s) continue;
+    if (s.status === "error") { $("gridStatus").textContent = "Full corpus failed to load: " + s.error; return false; }
+    if (s.status === "ready") return true;
+    $("gridStatus").textContent = `Loading the full corpus… ${Math.round(s.elapsed_s || 0)}s`;
   }
-  // Fetch one batch and page through it locally. A page is a slice of scores
-  // that are already in memory server-side, so re-requesting per page would be
-  // a fresh 34M-row scan for results we already hold. One batch also means the
-  // exact-score round trip can cover every page in a single fetch.
-  const body = {
-    query: q,
+  $("gridStatus").textContent = "Full corpus did not finish loading — try again.";
+  return false;
+}
+
+async function _issueFullCorpus(q, page) {
+  if (!(await _ensureFullCorpus())) return;
+  await _fullFetch("/api/full_search", { query: q }, page, _fullKey(q));
+}
+
+// The filter half of every full-corpus request body, so text search, resume,
+// upload and refine cannot drift apart on which filters they apply.
+function _fullFilterBody() {
+  return {
     page: 0,
     limit: FULL_BATCH,
     from_date: $("sf-dateFrom").value || null,
@@ -483,12 +503,19 @@ async function _issueFullCorpus(q, page) {
     segment_set_uuid: state.searchSegUuid,
     filter_lance_uri: _splitList($("sf-lance") ? $("sf-lance").value : ""),
   };
+}
+
+// Fetch one batch and page through it locally. A page is a slice of scores that
+// are already in memory server-side, so re-requesting per page would be a fresh
+// 34M-row scan for results we already hold. One batch also means the exact-score
+// round trip can cover every page in a single fetch.
+async function _fullFetch(endpoint, extra, page, key) {
   $("gridStatus").textContent = "Searching all clips…";
   let data;
   try {
-    data = await fetch("/api/full_search", {
+    data = await fetch(endpoint, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ..._fullFilterBody(), ...extra }),
     }).then((r) => {
       if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); });
       return r.json();
@@ -497,8 +524,18 @@ async function _issueFullCorpus(q, page) {
     $("gridStatus").textContent = "Search failed: " + e.message;
     return;
   }
-  state.fullBuf = { key: _fullKey(q), data, hits: data.hits || [] };
+  state.fullBuf = { key, data, hits: data.hits || [] };
   _renderFullPage(page || 0);
+}
+
+// Resume / upload / refine: same corpus, same filters, same envelope as a text
+// search. Keyed so a different vector or a different mark set never reuses the
+// previous buffer.
+async function _issueFullVector(endpoint, extra, page) {
+  if (!(await _ensureFullCorpus())) return;
+  const key = [endpoint, _fullKey(state.query || ""), JSON.stringify(extra.marks || extra.vector || "").length,
+               JSON.stringify(extra.marks || "")].join("|");
+  await _fullFetch(endpoint, extra, page, key);
 }
 
 // One request covers this many results; the pager slices them client-side.

@@ -4703,6 +4703,169 @@ def full_corpus_load() -> dict:
     return {"status": _full_corpus_begin_load()}
 
 
+class FullVectorSearchRequest(BaseModel):
+    """Rank the full corpus by a pre-computed vector (resume a saved search, or
+    search by an uploaded example). Mirrors FullSearchRequest minus the text."""
+
+    vector: list[float]
+    query: str = ""
+    limit: int = 50
+    page: int = 0
+    from_date: str | None = None
+    to_date: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
+
+
+class FullRefineRequest(BaseModel):
+    """Re-rank the full corpus from relevance feedback. Marks are addressed by
+    `row`; the marked clips' original embeddings are fetched to build the
+    prototype, since this corpus holds only the quantized screen."""
+
+    query: str = ""
+    marks: list[Mark] = []
+    negative_weight: float = 0.5
+    text_weight: float = 0.3
+    limit: int = 50
+    page: int = 0
+    from_date: str | None = None
+    to_date: str | None = None
+    vehicle: str | None = None
+    drive_id: str | None = None
+    segment_set_uuid: str | None = None
+    filter_lance_uri: str | None = None
+
+
+@app.post("/api/full_search_by_vector")
+def full_search_by_vector(req: FullVectorSearchRequest) -> dict:
+    """Rank the WHOLE corpus by a supplied vector.
+
+    Resuming a saved search used to fall through to the resident corpus, so a
+    reloaded tag was silently ranked over 2M clips while a fresh search of the
+    same text covered 34M -- same UI, same wording, different corpus.
+    """
+    if not req.vector:
+        raise HTTPException(400, "empty search vector")
+    corpus = _require_full_corpus()
+    vec = np.asarray(req.vector, dtype=np.float32)
+    if vec.ndim != 1 or vec.shape[0] != corpus.dim:
+        raise HTTPException(
+            400,
+            f"vector dim {vec.shape[0]} != corpus dim {corpus.dim} -- resume "
+            "against the corpus the search was originally run on",
+        )
+    return _full_rank(corpus, vec, req, label=req.query or "saved vector")
+
+
+@app.post("/api/full_refine")
+def full_refine(req: FullRefineRequest) -> dict:
+    """Re-rank the whole corpus from 👍/👎 marks (Rocchio prototype).
+
+    The marked clips' 768-d embeddings are read from S3 -- a handful of rows,
+    one round trip -- because the resident screen is quantized and PCA-reduced
+    and cannot reconstruct a query direction of the quality feedback needs.
+    """
+    corpus = _require_full_corpus()
+    pos = [int(m.row) for m in req.marks if m.mark == "up" and m.row is not None]
+    neg = [int(m.row) for m in req.marks if m.mark == "down" and m.row is not None]
+    pos = [r for r in dict.fromkeys(pos) if 0 <= r < corpus.num_rows]
+    neg = [r for r in dict.fromkeys(neg) if 0 <= r < corpus.num_rows]
+    if not pos:
+        raise HTTPException(400, "mark at least one positive to re-rank")
+
+    text_vec = None
+    if req.text_weight > 0 and (req.query or "").strip():
+        if not _state.get("model_ready"):
+            raise HTTPException(503, "model still loading")
+        text_vec = search_engine.encode_query(
+            req.query.strip(), _state["processor"], _state["model"],
+            _state["cfg"].device,
+        )
+    try:
+        mat = corpus.vectors_for(pos + neg)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    vec = _rocchio(
+        mat[: len(pos)], mat[len(pos):], text_vec,
+        req.negative_weight, req.text_weight,
+    )
+    out = _full_rank(corpus, vec, req, label=req.query or "refined")
+    out["refined_from"] = {"num_up": len(pos), "num_down": len(neg)}
+    return out
+
+
+def _rocchio(
+    pos: np.ndarray, neg: np.ndarray, text_vec, negative_weight: float,
+    text_weight: float,
+) -> np.ndarray:
+    """Unit-norm prototype: positive centroid, pushed away from the negative
+    centroid and optionally blended with the text direction.
+
+    Mirrors `search_engine.refine_query`, which reads vectors off a resident
+    Corpus this one does not have -- the arithmetic is the same, the source of
+    the vectors is not.
+    """
+    def _unit(v):
+        n = float(np.linalg.norm(v))
+        return v / n if n else v
+
+    w = _unit(np.asarray(pos, dtype=np.float32).mean(axis=0))
+    if neg.size:
+        w = _unit(w - negative_weight * _unit(np.asarray(neg, dtype=np.float32).mean(axis=0)))
+    if text_vec is not None and text_weight > 0:
+        w = _unit((1.0 - text_weight) * w + text_weight * _unit(np.asarray(text_vec, dtype=np.float32)))
+    return w.astype(np.float32)
+
+
+def _require_full_corpus():
+    """The resident full corpus, or a 503 that starts the load."""
+    with _FULL_LOCK:
+        corpus, status, error = _FULL["corpus"], _FULL["status"], _FULL["error"]
+    if corpus is None:
+        if status == "error":
+            raise HTTPException(503, f"full corpus load failed: {error}")
+        _full_corpus_begin_load()
+        raise HTTPException(
+            503, "full corpus is loading (~2 min); poll /api/full_corpus_status and retry"
+        )
+    return corpus
+
+
+def _full_rank(corpus, vec: np.ndarray, req, *, label: str) -> dict:
+    """Shared ranking + response envelope for the full-corpus vector endpoints."""
+    if req.limit <= 0 or req.limit > 1000:
+        raise HTTPException(400, "limit must be between 1 and 1000")
+    if req.page < 0:
+        raise HTTPException(400, "page must not be negative")
+    offset = req.page * req.limit
+    if offset + req.limit > _FULL_MAX_DEPTH:
+        raise HTTPException(400, f"full-corpus paging stops at {_FULL_MAX_DEPTH:,} results")
+    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
+    t0 = time.perf_counter()
+    hits, candidates = corpus.search(
+        vec,
+        limit=req.limit,
+        offset=offset,
+        **_merge_filters(
+            {
+                "vehicles": set(_parse_vehicles(req.vehicle)) or None,
+                "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
+                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
+                "segment_ids": _full_segment_ids(req.segment_set_uuid),
+            },
+            _full_lance_filter(req.filter_lance_uri),
+        ),
+    )
+    took_ms = round((time.perf_counter() - t0) * 1000, 1)
+    LOGGER.info(
+        "full vector search %r -> %d hits over %d rows in %.1fms",
+        label, len(hits), corpus.num_rows, took_ms,
+    )
+    return _full_payload(hits, candidates, corpus, req, took_ms, label)
+
+
 @app.post("/api/full_search")
 def full_search(req: FullSearchRequest) -> dict:
     """Top-`limit` clips over the ENTIRE corpus. No S3 access per query.
@@ -4764,10 +4927,17 @@ def full_search(req: FullSearchRequest) -> dict:
         "full search %r -> %d hits over %d rows in %.1fms",
         query, len(hits), corpus.num_rows, took_ms,
     )
-    # Same envelope /api/search returns, so the existing grid renders these with
-    # no special-casing. `index` is the corpus row position, carried for parity
-    # with the resident path; full-corpus refine is not wired, so marks made here
-    # cannot be re-ranked yet.
+    return _full_payload(hits, candidates, corpus, req, took_ms, query)
+
+
+def _full_payload(hits, candidates: int, corpus, req, took_ms: float, label: str) -> dict:
+    """The response envelope shared by every full-corpus ranking endpoint.
+
+    Identical in shape to what /api/search returns, so the grid renders these
+    with no special-casing. `index` is -1 because there is no resident-corpus
+    row to address; `row` is the full-corpus position, which is what
+    /api/full_rescore and /api/full_refine key on.
+    """
     scores = [float(h.score) for h in hits]
     payload = [
         {
@@ -4800,7 +4970,7 @@ def full_search(req: FullSearchRequest) -> dict:
         "page": req.page,
         "page_size": req.limit,
         "elapsed_ms": took_ms,
-        "label": query,
+        "label": label,
         "score_lo": round(min(scores), 4) if scores else 0.0,
         "score_hi": round(max(scores), 4) if scores else 0.0,
         "funnel": {"corpus_total": corpus.num_rows},
