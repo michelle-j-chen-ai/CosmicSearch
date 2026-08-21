@@ -560,6 +560,28 @@ class FullCorpus:
             )
         return out
 
+    def vectors_for(self, rows: "list[int] | np.ndarray") -> np.ndarray:
+        """The original 768-d embeddings for `rows`, in the order given.
+
+        Relevance feedback needs the actual vectors of the clips someone marked,
+        and this corpus holds only the int8/PCA screen. The marked set is a
+        handful of rows, so one `take()` is cheaper than holding 105GB of fp32
+        resident to avoid it.
+        """
+        if self.dataset is None:
+            raise RuntimeError("corpus has no dataset handle; vectors unavailable")
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size == 0:
+            return np.empty((0, 0), dtype=np.float32)
+        col = vector_full_column(CORPUS_MODEL)
+        order = np.argsort(rows, kind="stable")
+        tbl = self.dataset.take(rows[order], columns=[col])
+        flat = tbl.column(col).combine_chunks().values.to_numpy(zero_copy_only=False)
+        mat = np.asarray(flat, dtype=np.float32).reshape(rows.size, -1)
+        out = np.empty_like(mat)
+        out[order] = mat
+        return out
+
     def _verify_alignment(self, rows: np.ndarray, sample: int = 32) -> None:
         """Raise if `rows` no longer resolve to the clips this corpus holds.
 
