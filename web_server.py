@@ -48,9 +48,7 @@ for _tv in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 import analytics
 import botocore.exceptions
 import db
-import dora_client
 import local_cache
-import nls_launcher
 import oci_s3
 import search_engine
 from fastapi import FastAPI, HTTPException, Request
@@ -121,9 +119,6 @@ def _load_engine() -> None:
     threading.Thread(target=_warm_engine, name="engine-warmup", daemon=True).start()
     # Pre-warm the DORA gRPC channel + machine token now (independent of the
     # model), so the first segment-set selection doesn't pay channel/auth setup.
-    threading.Thread(
-        target=dora_client.prewarm, name="dora-prewarm", daemon=True
-    ).start()
 
 
 def _warm_engine() -> None:
@@ -193,21 +188,6 @@ def _is_frontier() -> bool:
     return "trucking" in svc.lower() or "frontier" in host.lower()
 
 
-def _offline_scan_enabled() -> bool:
-    """Whether the offline (Lilypad) full-corpus segment scan is offered.
-
-    Off by default: `/api/full_export` selects and writes over the same 34M rows
-    in-process, so a launch buys a wait and a second copy of the corpus. It also
-    scanned a DIFFERENT (staler) table than the app searched, which is how an
-    export could disagree with the results that produced it.
-
-    Kept behind ``NLS_OFFLINE_SCAN=on`` rather than deleted, for the one case the
-    online path refuses: a threshold so permissive that the match set exceeds
-    ``_FULL_EXPORT_MAX_ROWS``.
-    """
-    return os.getenv("NLS_OFFLINE_SCAN", "").strip().lower() in ("1", "on", "true", "yes")
-
-
 @app.get("/api/platform")
 def platform() -> dict:
     """Which deployment this is (cars vs trucking) -- both run the same image, so
@@ -219,7 +199,6 @@ def platform() -> dict:
         "name": "trucks" if is_trucks else "cars",
         "label": "TRUCKING" if is_trucks else "CARS",
         # Frontier holds the whole dataset in CPU memory, so the offline scan is hidden there.
-        "offline_scan": _offline_scan_enabled(),
     }
 
 
@@ -267,22 +246,6 @@ _SEG_MASK: dict[tuple[str, str], object] = {}
 _SEG_MASK_LOCK = threading.Lock()
 
 
-def _segment_mask(uri: str, uuid: str | None, corpus, allowed_ids):
-    """Cached corpus-aligned boolean mask for a segment set, or None if no set /
-    not yet loaded. Computed once per (uri, uuid); membership is immutable."""
-    if not uuid or allowed_ids is None:
-        return None
-    key = (uri, uuid)
-    with _SEG_MASK_LOCK:
-        m = _SEG_MASK.get(key)
-    if m is not None and len(m) == corpus.num_rows:
-        return m
-    m = search_engine.segment_mask(corpus, allowed_ids)
-    with _SEG_MASK_LOCK:
-        _SEG_MASK[key] = m
-    return m
-
-
 def _seg_cache_path(uuid: str):
     """On-disk location for a fetched segment-id set (gzipped, one id per line).
 
@@ -320,108 +283,9 @@ def _write_seg_cache(uuid: str, ids: frozenset[str]) -> None:
         LOGGER.warning("could not write segment-set disk cache for %s: %s", uuid, exc)
 
 
-def _segment_ids(uuid: str) -> frozenset[str] | None:
-    with _SEG_LOCK:
-        rec = _SEG.get(uuid)
-        if rec and rec["status"] == "done":
-            return rec["ids"]
-        if rec and rec["status"] == "loading":
-            return None
-        _SEG[uuid] = {"status": "loading", "ids": None, "count": 0, "err": None}
-
-    def _progress(n: int) -> None:
-        with _SEG_LOCK:
-            cur = _SEG.get(uuid)
-            if cur and cur["status"] == "loading":
-                cur["count"] = n
-
-    def _load() -> None:
-        try:
-            ids = _read_seg_cache(uuid)
-            if ids is None:
-                ids = dora_client.fetch_segment_ids(uuid, progress=_progress)
-                _write_seg_cache(uuid, ids)
-            rec = {"status": "done", "ids": ids, "count": len(ids), "err": None}
-        except Exception as exc:  # noqa: BLE001 -- background loader must never die silently
-            LOGGER.warning("segment-set load failed for %s: %s", uuid, exc)
-            rec = {"status": "error", "ids": None, "count": 0, "err": str(exc)}
-        with _SEG_LOCK:
-            _SEG[uuid] = rec
-        LOGGER.info("segment-set %s -> %s (%d ids)", uuid, rec["status"], rec["count"])
-
-    threading.Thread(target=_load, name=f"segload-{uuid[:8]}", daemon=True).start()
-    return None
-
-
-def _resolve_segment_filter(seg_uuid: str | None):
-    """Return (allowed_ids_or_None, pending: bool, count). pending=True means the
-    set is still loading in the background, so the search runs unfiltered."""
-    if not seg_uuid:
-        return None, False, 0
-    ids = _segment_ids(seg_uuid)
-    if ids is None:
-        with _SEG_LOCK:
-            count = _SEG.get(seg_uuid, {}).get("count", 0)
-        return None, True, count
-    return ids, False, len(ids)
-
-
 # Set cardinality of a bitmap-path segment set, cached for status/UI display
 # (the cached mask only knows matched-corpus-rows, not the full set size).
 _SEG_BM_COUNT: dict[str, int] = {}
-
-
-def _resolve_segment_mask(uri: str, seg_uuid: str | None, corpus):
-    """Corpus-aligned segment-set mask: ``(mask_or_None, pending, count)``.
-
-    Fast path -- when the corpus carries ``dx_internal_id``: fetch the set's
-    roaring bitmap in ONE ``DescribeDataSet(include_bitmap)`` call and AND it
-    against the corpus. No pagination, never pending; ``count`` is the set
-    cardinality. The mask is cached per ``(uri, uuid)`` like the legacy path.
-
-    Fallback -- older corpora without ``dx_internal_id``: the external_id
-    pagination path (background load, may report ``pending``).
-    """
-    if not seg_uuid:
-        return None, False, 0
-    if corpus.has_internal_ids():
-        key = (uri, seg_uuid)
-        with _SEG_MASK_LOCK:
-            m = _SEG_MASK.get(key)
-        if m is not None and len(m) == corpus.num_rows:
-            return m, False, _SEG_BM_COUNT.get(seg_uuid, int(m.sum()))
-        try:
-            set_bm = dora_client.fetch_segment_bitmap(seg_uuid)
-        except dora_client.DoraUnavailable as exc:
-            LOGGER.warning(
-                "bitmap segment filter unavailable for %s: %s", seg_uuid, exc
-            )
-            with _SEG_LOCK:
-                _SEG[seg_uuid] = {
-                    "status": "error",
-                    "ids": None,
-                    "count": 0,
-                    "err": str(exc),
-                }
-            return None, False, 0
-        m = search_engine.segment_mask_from_bitmap(corpus, set_bm)
-        count = len(set_bm)
-        with _SEG_MASK_LOCK:
-            _SEG_MASK[key] = m
-        _SEG_BM_COUNT[seg_uuid] = count
-        # Report through the same _SEG record the status/prefetch endpoints read.
-        with _SEG_LOCK:
-            _SEG[seg_uuid] = {
-                "status": "done",
-                "ids": None,
-                "count": count,
-                "err": None,
-            }
-        return m, False, count
-    # Fallback: external_id pagination path.
-    allowed, pending, count = _resolve_segment_filter(seg_uuid)
-    mask = _segment_mask(uri, seg_uuid, corpus, allowed)
-    return mask, pending, count
 
 
 # --- Lance/parquet downsample dataset --------------------------------------
@@ -485,25 +349,6 @@ def _lance_filter_ids(uri: str) -> tuple[str, frozenset[str]]:
 # the scan output and passed BY REFERENCE (filter_ids_uri / segment_set_ids_uri) -- the
 # worker reads them in one GET, so there is NO upper bound on the downsample size.
 _SCAN_INLINE_IDS_MAX = 10_000
-# Upper bound on how many segments a scan may auto-register as a DORA segment set. Beyond
-# this the set is corpus-sized (a symptom of too-low a threshold) and unusable, and the
-# DORA CreateDataSet call would hang -- so we skip + annotate instead of registering.
-_SEGSET_MAX_SEGMENTS = 300_000
-
-
-def _ids_by_reference(ids: list[str], out_root: str, basename: str) -> str:
-    """Write a downsample id set as a one-column parquet under the scan's output root
-    and return its URI. Pass-by-reference keeps arbitrarily large id sets out of the
-    workload config (inline they bloat the submit payload past gRPC limits)."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    buf = io.BytesIO()
-    pq.write_table(pa.table({"segment_id": pa.array(ids, type=pa.string())}), buf)
-    uri = f"{out_root.rstrip('/')}/{basename}.parquet"
-    oci_s3.put_bytes(uri, buf.getvalue(), oci_s3.s3_client(), "application/octet-stream")
-    LOGGER.info("scan downsample: wrote %d ids by reference to %s", len(ids), uri)
-    return uri
 
 
 def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
@@ -570,71 +415,6 @@ def _scan_counts_from_manifest(manifest: dict) -> dict:
         "per_tag": per_tag,
         "per_tag_is_segments": bool(per_tag_segments),
     }
-
-
-def _scan_counts(execution_id: str, status: str, lance_uri: str, cached) -> dict | None:
-    """Result counts for a scan row: return the cached copy, else (once the scan has
-    SUCCEEDED) read them from the manifest ONCE and cache the result.
-
-    Caching is the point: this runs on the polled /api/scans path, so a manifest must be
-    read at most once per scan. A missing/unreadable manifest is cached as an empty {}
-    sentinel so we never re-hit OCI for it on subsequent polls (an old scan's manifest
-    won't appear later). ``cached is not None`` distinguishes "already checked, nothing"
-    ({}) from "never checked" (None)."""
-    if cached is not None:
-        return cached or None
-    if "SUCCEEDED" not in (status or "").upper() or not lance_uri:
-        return None
-    manifest = _read_scan_manifest(lance_uri)
-    counts = _scan_counts_from_manifest(manifest) if manifest else {}
-    db.set_scan_counts(execution_id, counts)
-    return counts or None
-
-
-def _dx_bitmap_from_segment_ids(corpus, seg_ids):
-    """Roaring bitmap of the ``dx_internal_id``s of corpus rows whose ``segment_id``
-    is in ``seg_ids`` -- i.e. convert a segment-id downsample set to the dx-internal
-    bitmask the corpus already carries, so the mask is an int bitmap intersection."""
-    from pyroaring import BitMap
-
-    bm = BitMap()
-    dxs = corpus.dx_internal_id or []
-    for s, d in zip(corpus.segment_id, dxs):
-        if d is not None and s in seg_ids:
-            bm.add(int(d))
-    return bm
-
-
-def _lance_filter_mask(corpus_uri: str, lance_uri: str, corpus, key: str, ids):
-    """Cached corpus-aligned membership mask for a downsample dataset.
-
-    Prefers the dx_internal_id roaring-bitmap intersection (fast int membership):
-    directly when the dataset carries ``dx_internal_id``, else by converting a
-    ``segment_id`` set to dx ids via the corpus when it has them. Falls back to
-    string membership on ``segment_id``/``run_uuid`` for corpora without dx ids."""
-    cache_key = (corpus_uri, f"lance::{key}::{lance_uri}")
-    with _SEG_MASK_LOCK:
-        m = _SEG_MASK.get(cache_key)
-    if m is not None and len(m) == corpus.num_rows:
-        return m
-    if key == "dx_internal_id" and corpus.has_internal_ids():
-        from pyroaring import BitMap
-
-        m = search_engine.segment_mask_from_bitmap(corpus, BitMap(int(x) for x in ids))
-    elif key == "segment_id" and corpus.has_internal_ids():
-        m = search_engine.segment_mask_from_bitmap(
-            corpus, _dx_bitmap_from_segment_ids(corpus, ids)
-        )
-    else:
-        values = (
-            corpus.segment_id
-            if key in ("segment_id", "dx_internal_id")
-            else corpus.run_uuid
-        )
-        m = search_engine.value_mask(values, ids)
-    with _SEG_MASK_LOCK:
-        _SEG_MASK[cache_key] = m
-    return m
 
 
 def _parse_vehicles(vehicle: str | None) -> frozenset[str]:
@@ -725,7 +505,6 @@ class SearchRequest(BaseModel):
     start_score: float | None = None  # start at first clip scoring <= this
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -757,7 +536,6 @@ class RefineRequest(BaseModel):
     start_score: float | None = None
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -775,9 +553,7 @@ class ExportRequest(BaseModel):
     tag: str = ""
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -791,9 +567,6 @@ class ExportRequest(BaseModel):
     # segment_id (clips without one are kept as-is, never merged).
     dedupe_segment: bool = False
     # When true, also register the exported top-k segments as a DORA segment set
-    # ("dataset"), named after the export file. Distinct from segment_set_uuid/
-    # segment_set_name above, which are the input FILTER set.
-    create_segment_set: bool = False
     # Interval mode: instead of one row per fixed 8s mini-segment, project the
     # per-clip scores onto the 4s stride grid, threshold, merge contiguous cells
     # per drive, and export variable-length interpolated intervals (CSV+parquet
@@ -814,7 +587,6 @@ class ThresholdSearchRequest(BaseModel):
     query: str
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
@@ -843,7 +615,6 @@ class VectorSearchRequest(BaseModel):
     start_score: float | None = None
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -873,7 +644,6 @@ class WindowSearchRequest(BaseModel):
     start_score: float | None = None
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
@@ -900,9 +670,7 @@ class ConfigExportRequest(BaseModel):
     tag: str = ""
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -911,8 +679,6 @@ class ConfigExportRequest(BaseModel):
     drive_id: str | None = None
     embeddings_uri: str | None = None
     # Register the exported (deduped) segments as a DORA segment set, named after
-    # the export file. See ExportRequest.create_segment_set.
-    create_segment_set: bool = False
 
 
 class CurateRow(BaseModel):
@@ -936,9 +702,7 @@ class CurateExportRequest(BaseModel):
     but built from exactly these rows rather than re-running the queries."""
 
     rows: list[CurateRow] = []
-    create_segment_set: bool = False
     embeddings_uri: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     from_date: str | None = None
     to_date: str | None = None
@@ -1232,66 +996,6 @@ def search_by_window(req: WindowSearchRequest) -> dict:
     return out
 
 
-@app.get("/api/segment_set_prefetch")
-def segment_set_prefetch(uuid: str) -> dict:
-    """Start the background id-load for a segment set without running a search.
-
-    The frontend calls this the moment a set is selected, so the (cached) DORA
-    pull overlaps the user composing their query -- by search time the ids are
-    usually already resident, so the first filtered search needs no re-run.
-
-    When the resident corpus carries ``dx_internal_id``, this resolves the set
-    via the one-call roaring-bitmap path (synchronous, ~sub-second) instead of
-    paginating external_ids; either way the result is reported through ``_SEG``.
-    """
-    corpus = _resident_corpus()
-    if corpus is not None and corpus.has_internal_ids():
-        _full_segment_ids(uuid)
-    else:
-        _segment_ids(uuid)  # idempotent: starts the loader only if not cached/loading
-    with _SEG_LOCK:
-        rec = _SEG.get(uuid) or {"status": "loading", "count": 0, "err": None}
-    return {
-        "status": rec["status"],
-        "count": rec["count"],
-        "ready": rec["status"] == "done",
-        "error": rec.get("err"),
-    }
-
-
-@app.get("/api/segment_set_status")
-def segment_set_status(uuid: str) -> dict:
-    """Background-load status of a segment set's ids (ready / loading / error)."""
-    with _SEG_LOCK:
-        rec = _SEG.get(uuid) or {"status": "idle", "count": 0, "err": None}
-    return {
-        "status": rec["status"],
-        "count": rec["count"],
-        "ready": rec["status"] == "done",
-        "error": rec.get("err"),
-    }
-
-
-@app.get("/api/segment_sets")
-def segment_sets(name_filter: str = "") -> list[dict]:
-    if not name_filter.strip():
-        return []
-    try:
-        sets = dora_client.list_segment_sets(name_filter.strip())
-    except dora_client.DoraUnavailable as exc:
-        raise HTTPException(503, str(exc))
-    return [
-        {
-            "name": s.name,
-            "version": s.version,
-            "uuid": s.dataset_uuid,
-            "num_segments": s.num_segments,
-            "label": s.label(),
-        }
-        for s in sets[:200]
-    ]
-
-
 @app.get("/api/video")
 def video(uri: str) -> RedirectResponse:
     try:
@@ -1311,42 +1015,6 @@ def _export_base(label: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", label).strip("_") or "export"
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"{safe}_{stamp}_{uuid.uuid4().hex[:8]}"
-
-
-def _create_export_segment_set(
-    seg_ids, name: str, *, provenance: dict
-) -> tuple[str, str]:
-    """Register the exported segments as a DORA dataset. Returns ``(label, error)``.
-
-    ``seg_ids`` is any iterable of segment_id (DORA external_id) -- deduped here.
-    Best-effort: a DORA failure is reported via the error string (and logged), never
-    raised, so the CSV download is unaffected.
-    """
-    ids = sorted({s for s in seg_ids if s})
-    if not ids:
-        return "", "no segments to register"
-    # Same ceiling the scan path enforces. Beyond it the set is corpus-sized (a
-    # symptom of too low a threshold) and the DORA CreateDataSet call hangs, so
-    # report it instead of registering. Only the scan path checked this; an
-    # in-app export large enough to hit it would have hung the request.
-    if len(ids) > _SEGSET_MAX_SEGMENTS:
-        return "", (
-            f"not registered: {len(ids):,} segments exceeds "
-            f"{_SEGSET_MAX_SEGMENTS:,} cap (raise the threshold or lower k)"
-        )
-    meta = {k: v for k, v in provenance.items() if v not in (None, "", [])}
-    meta["num_segments"] = len(ids)
-    try:
-        uuid_str, version = dora_client.create_dataset(name, ids, custom_metadata=meta)
-    except Exception as exc:  # noqa: BLE001 -- optional add-on; must never fail the
-        # export/CSV download. Any failure (DORA unreachable, proto/SDK surprise) is
-        # reported back to the UI via the error string instead of 500-ing the export.
-        LOGGER.warning(
-            "export segment-set create failed (%s): %s", type(exc).__name__, exc,
-            exc_info=True,
-        )
-        return "", f"{type(exc).__name__}: {exc}"
-    return f"{uuid_str} v{version} ({len(ids)} segs)", ""
 
 
 def _write_export_parquet(hits: list, tag: str, name: str | None = None) -> str:
@@ -1488,9 +1156,7 @@ class SaveVectorRequest(BaseModel):
     # search context (date range / segment set / lance downsample / vehicle / drive).
     from_date: str | None = None
     to_date: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
@@ -1520,15 +1186,11 @@ class SegmentScanRequest(BaseModel):
     # the scan_jobs record. NB: the offline worker currently applies only the date window;
     # segment-set/lance/vehicle/drive ride along in the workflow config but are not yet
     # enforced by the scan (that needs a worker change). Preview/Download honor all of them.
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
-    segment_set_name: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
     # When true, register the scan's qualifying segments as a DORA segment set once it
-    # completes (browsable in Data Explorer). Opt-in, like the export's create_segment_set.
-    create_segment_set: bool = False
     # Output is always keyed by segment_id. merge_intervals=True (default) merges contiguous
     # above-threshold clips into variable-length spans per segment; False emits one best
     # (highest-scoring) clip per segment (no interval merge).
@@ -1572,8 +1234,6 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
             # Persist the full active filter set so Resume restores the exact context.
             "date_from": req.from_date,
             "date_to": req.to_date,
-            "segment_set_uuid": req.segment_set_uuid,
-            "segment_set_name": req.segment_set_name,
             "filter_lance_uri": req.filter_lance_uri,
             "vehicle": req.vehicle,
             "drive_id": req.drive_id,
@@ -1589,41 +1249,6 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
         raise HTTPException(502, "could not save vector (exp-db unavailable)")
     LOGGER.info("saved search vector under tag %r (dim %d)", tag, len(vec))
     return {"tag": tag, "dim": len(vec)}
-
-
-def _scan_idem_key(
-    req: "SegmentScanRequest", tags: list[str], model_uri: str, scan_uri: str,
-    client_key: str = "",
-) -> str:
-    """Stable dedup key for a segment-scan launch.
-
-    A client-supplied Idempotency-Key wins (lets a Spark job coalesce its own
-    retries); otherwise hash the canonicalized, output-determining request fields
-    so two identical scans share one workload. Excludes purely cosmetic fields
-    (segment_set_name) that don't change the produced Lance."""
-    if client_key.strip():
-        return hashlib.sha256(("ck:" + client_key.strip()).encode()).hexdigest()
-    canon = json.dumps(
-        {
-            "tags": sorted(tags),
-            "thresholds": {k: float(v) for k, v in sorted((req.thresholds or {}).items())},
-            "default_threshold": float(req.default_threshold),
-            "model_uri": model_uri or "",
-            "scan_embeddings_uri": scan_uri or "",
-            "filter_lance_uri": req.filter_lance_uri or "",
-            "from": req.from_date or "",
-            "to": req.to_date or "",
-            "segment_set_uuid": req.segment_set_uuid or "",
-            "vehicle": req.vehicle or "",
-            "drive_id": req.drive_id or "",
-            "merge_intervals": bool(req.merge_intervals),
-            "register_segset": bool(req.create_segment_set),
-            "top_k": int(req.top_k) if req.top_k else 0,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(canon.encode()).hexdigest()
 
 
 class _SingleFlightCall:
@@ -1669,323 +1294,6 @@ def _scan_single_flight(key: str, fn):
             _SF_CALLS.pop(key, None)
 
 
-@app.post("/api/launch_segment_scan")
-def launch_segment_scan(req: SegmentScanRequest, request: Request) -> dict:
-    """Launch the per-segment multi-tag scan over an arbitrary set of tags (the Curate
-    page's assembled queries). Each tag's vector is reused from exp-db when present
-    (db.vectors_for_tags, scoped to the active model) and otherwise encoded + persisted,
-    then the full corpus is scored into a per-segment Lance table (one interval column per
-    tag). Returns the Lilypad workload id."""
-    tags: list[str] = []
-    for t in req.tags:
-        t = t.strip()
-        if t and t not in tags:
-            tags.append(t)
-    if not tags:
-        raise HTTPException(400, "provide at least one non-empty tag")
-    # Top-K is only tractable/meaningful scoped to a segment set or lance downsample (the
-    # worker resolves that scope to member chunks and ranks within it). Reject otherwise.
-    if req.top_k is not None and req.top_k <= 0:
-        raise HTTPException(400, "top_k must be a positive integer")
-    if req.top_k and not (req.segment_set_uuid or req.filter_lance_uri):
-        raise HTTPException(400, "top_k requires a segment set or lance downsample scope")
-    if not _offline_scan_enabled():
-        raise HTTPException(
-            403,
-            "the offline scan is retired; /api/full_export selects and writes over "
-            "the whole corpus in-process. Set NLS_OFFLINE_SCAN=on only for a match "
-            "set too large for it.",
-        )
-    if not nls_launcher.available():
-        raise HTTPException(503, "scan launch unavailable (lilypad SDK / machine creds missing)")
-    cfg = _state["cfg"]
-    corpus = _require_full_corpus()
-    uri = corpus.corpus_uri
-
-    # Server-side launch dedup. Identical concurrent requests -- e.g. a Spark stage
-    # firing the same scan from every executor -- must coalesce to ONE Lilypad
-    # workload. Prefer a client-supplied Idempotency-Key header (so a job's retries
-    # across stages coalesce too), else hash the output-determining request fields.
-    # A deterministic scan_id from the key keeps the output Lance path stable.
-    client_key = request.headers.get("Idempotency-Key", "")
-    idem = _scan_idem_key(req, tags, cfg.model_artifact_uri, cfg.scan_embeddings_uri, client_key)
-    scan_id = idem[:32]
-    output_dir = f"s3://{cfg.scan_output_bucket}/{cfg.scan_output_prefix.rstrip('/')}"
-    user_email = _current_user(request)
-
-    def _launch_and_record() -> tuple[dict, dict]:
-        """The ONE real launch: resolve each tag's vector + the downsample id-set and
-        submit the workload. Runs once per idem_key (in-process single-flight + DB
-        advisory lock); duplicate requests never reach here -- they get the cached id."""
-        stored = db.vectors_for_tags(tags, cfg.model_artifact_uri)
-        search_vectors: dict[str, list[float]] = {}
-        encoded: list[str] = []
-        for tag in tags:
-            vec = stored.get(tag)
-            if vec is not None and len(vec) == corpus.dim:
-                search_vectors[tag] = [float(x) for x in vec]
-                continue
-            if not _state.get("model_ready"):
-                raise HTTPException(503, f"model still loading; cannot encode new tag {tag!r}")
-            v = search_engine.encode_query(
-                tag, _state["processor"], _state["model"], cfg.device
-            ).tolist()
-            search_vectors[tag] = v
-            encoded.append(tag)
-            # Persist the freshly-encoded vector under its tag so the next launch reuses
-            # it. Upserts on the unique tag key (refreshes the tag's one history row).
-            db.insert_export(
-                {
-                    "user_email": user_email,
-                    "query": tag,
-                    "tag": tag,
-                    "k": 0,
-                    "num_results": 0,
-                    "model_uri": cfg.model_artifact_uri,
-                    "embeddings_uri": uri,
-                    "search_vector": v,
-                    "parquet_uri": "",
-                }
-            )
-        # Per-tag cosine cutoff: each tag uses its own threshold (default for any unset).
-        thresholds = {
-            tag: float(req.thresholds.get(tag, req.default_threshold)) for tag in tags
-        }
-        # Remember each tag's threshold so the Export table pre-fills it next time (like k).
-        db.set_tag_thresholds(thresholds)
-        # Resolve the lance downsample HERE (the app reads the user's dataset; the
-        # worker only ever GETs by exact key). Small id sets travel inline in the
-        # workload config; larger ones are written as a parquet next to the scan
-        # output and passed by reference -- NO size cap either way.
-        filter_key, filter_ids = "", []
-        if req.filter_lance_uri:
-            try:
-                filter_key, filter_ids = _scan_downsample_ids(req.filter_lance_uri.strip())
-            except (ValueError, botocore.exceptions.ClientError) as exc:
-                raise HTTPException(400, f"could not read downsample dataset: {exc}")
-        # Resolve the DX segment set to its external segment_ids so the worker can restrict
-        # output to the set (the scan corpus has no dx column; matching is by segment_id).
-        seg_set_ids: list[str] = []
-        if req.segment_set_uuid:
-            try:
-                seg_set_ids = sorted(dora_client.fetch_segment_ids(req.segment_set_uuid))
-            except dora_client.DoraUnavailable as exc:
-                raise HTTPException(400, f"could not resolve segment set: {exc}")
-        filter_ids_uri, seg_set_ids_uri = "", ""
-        scan_out_root = f"{output_dir}/{scan_id}"
-        if len(filter_ids) > _SCAN_INLINE_IDS_MAX:
-            filter_ids_uri, filter_ids = (
-                _ids_by_reference(filter_ids, scan_out_root, "filter_ids"), []
-            )
-        if len(seg_set_ids) > _SCAN_INLINE_IDS_MAX:
-            seg_set_ids_uri, seg_set_ids = (
-                _ids_by_reference(seg_set_ids, scan_out_root, "segment_set_ids"), []
-            )
-        try:
-            res = nls_launcher.launch_segment_scan(
-                search_vectors=search_vectors,
-                thresholds=thresholds,
-                embeddings_uri=cfg.scan_embeddings_uri,
-                output_dir=output_dir,
-                scan_id=scan_id,
-                start_date=req.from_date or cfg.scan_default_from_date,
-                end_date=req.to_date or "",
-                segment_set_uuid=req.segment_set_uuid or "",
-                segment_set_name=req.segment_set_name or "",
-                filter_lance_uri=req.filter_lance_uri or "",
-                filter_key=filter_key,
-                filter_segment_ids=filter_ids,
-                filter_ids_uri=filter_ids_uri,
-                segment_set_ids=seg_set_ids,
-                segment_set_ids_uri=seg_set_ids_uri,
-                vehicle=req.vehicle or "",
-                drive_id=req.drive_id or "",
-                merge_intervals=bool(req.merge_intervals),
-                top_k=req.top_k,
-            )
-        except nls_launcher.LauncherUnavailable as exc:
-            # Logged as well as returned: the HTTPException body reaches the
-            # browser but never the service logs, so a launch failure was only
-            # diagnosable by asking the user to read their screen.
-            LOGGER.error("segment scan launch failed: %s", exc, exc_info=True)
-            raise HTTPException(502, f"could not launch segment scan: {exc}")
-        LOGGER.info(
-            "launched per-segment scan %s for %d tags (%d reused, %d encoded)",
-            res.get("execution_id"), len(tags), len(tags) - len(encoded), len(encoded),
-        )
-        # Segment-set name (used iff create_segment_set): readable, scan-unique.
-        segset_name = (
-            f"nls-scan-{tags[0]}-{scan_id[:8]}" if len(tags) == 1
-            else f"nls-scan-{scan_id[:8]}"
-        )
-        record = {
-            "execution_id": res.get("execution_id"),
-            "user_email": user_email,
-            "tags": tags,
-            "thresholds": thresholds,
-            "output_dir": output_dir,
-            "lance_uri": res.get("lance_uri") or "",
-            "console_url": res.get("url") or "",
-            "status": "LAUNCHED",
-            "register_segset": bool(req.create_segment_set),
-            "segset_name": segset_name,
-            # Full filter set the scan was launched with (date is applied by the worker
-            # today; the rest are recorded for provenance / future enforcement).
-            "filters": {
-                "from_date": req.from_date or cfg.scan_default_from_date,
-                "to_date": req.to_date or "",
-                "segment_set_uuid": req.segment_set_uuid or "",
-                "segment_set_name": req.segment_set_name or "",
-                "filter_lance_uri": req.filter_lance_uri or "",
-                "vehicle": req.vehicle or "",
-                "drive_id": req.drive_id or "",
-                "merge_intervals": bool(req.merge_intervals),
-                # Top-K vs threshold mode, so Recent scans can show which ranking the
-                # scan actually ran (the per-tag thresholds are recorded either way, but
-                # in Top-K mode the worker ignores them and ranks within the scope).
-                "top_k": int(req.top_k) if req.top_k else None,
-            },
-        }
-        res["tags"] = tags
-        res["encoded"] = encoded
-        res["thresholds"] = thresholds
-        return res, record
-
-    # In-process single-flight collapses the up-to-80 concurrent same-key requests on
-    # THIS instance to one db.launch_or_get; db.launch_or_get is the cross-instance
-    # authority (advisory lock on the key, then insert keyed by idem_key).
-    res, deduplicated = _scan_single_flight(
-        idem, lambda: db.launch_or_get(idem, _launch_and_record)
-    )
-    if deduplicated:
-        # A dedup hit must point at a LIVE (or succeeded) workload. The stored status
-        # can lag (it only advances when something polls), so check the live phase:
-        # if the existing execution actually FAILED, release its key and relaunch --
-        # otherwise an identical retry of a failed scan returns the dead workload
-        # (and a lance_uri that will never exist).
-        try:
-            live = nls_launcher.scan_status(res.get("execution_id") or "")
-        except nls_launcher.LauncherUnavailable:
-            live = {}
-        if live.get("done") and (live.get("phase") or "") != "SUCCEEDED":
-            db.update_scan_job(
-                res.get("execution_id") or "", live.get("phase") or "", live.get("error") or ""
-            )
-            db.release_scan_idem(idem)
-            LOGGER.info(
-                "dedup hit on FAILED workload %s (idem=%s); relaunching fresh",
-                res.get("execution_id"), scan_id,
-            )
-            res, deduplicated = db.launch_or_get(idem, _launch_and_record)
-    res["deduplicated"] = deduplicated
-    res.setdefault("workload_id", res.get("execution_id"))
-    # A dedup hit returns only the existing workload id; the output Lance path is
-    # deterministic (output_dir/scan_id/segments.lance -- scan_id derives from the
-    # idem key), so reconstruct it here. This keeps EVERY response (fresh or deduped)
-    # carrying lance_uri, so a blocking caller can read the same output Lance either way.
-    if not res.get("lance_uri"):
-        res["lance_uri"] = f"{output_dir}/{scan_id}/segments.lance"
-    if deduplicated:
-        LOGGER.info(
-            "deduplicated scan launch (idem=%s) -> existing workload %s",
-            scan_id, res.get("execution_id"),
-        )
-    return res
-
-
-def _maybe_register_scan_segset(execution: str, *, done: bool, phase: str) -> dict:
-    """If a COMPLETED scan was flagged to register a DORA segment set and hasn't yet,
-    read its output Lance ``segment_id``s and register the set (exactly once). Returns
-    ``{segset_uuid, segset_label}`` (may be empty). Best-effort -- any failure is recorded
-    on the job and never raised into the caller (the scan + its status are unaffected)."""
-    if not (done and phase == "SUCCEEDED"):
-        return {}
-    job = db.get_scan_job(execution)
-    if not job or not job.get("register_segset"):
-        return {}
-    if job.get("segset_uuid"):  # already registered
-        return {"segset_uuid": job["segset_uuid"], "segset_label": job.get("segset_label") or ""}
-    lance_uri = job.get("lance_uri") or ""
-    name = job.get("segset_name") or f"nls-scan-{execution}"
-    if not lance_uri:
-        return {}
-    # Cheap pre-check: the manifest already knows the segment count, so a corpus-sized
-    # result is skipped WITHOUT reading its (multi-million-row) lance at all.
-    manifest = _read_scan_manifest(lance_uri) or {}
-    n_manifest = manifest.get("num_segments")
-    if isinstance(n_manifest, int) and n_manifest > _SEGSET_MAX_SEGMENTS:
-        note = f"not registered: {n_manifest:,} segments exceeds {_SEGSET_MAX_SEGMENTS:,} cap (raise the tag's threshold)"
-        db.set_scan_segset(execution, "", note)
-        LOGGER.warning("scan segset: %s -> %s", execution, note)
-        return {"segset_label": note}
-    try:
-        import lance
-
-        tbl = lance.dataset(
-            lance_uri, storage_options=oci_s3.lance_storage_options()
-        ).to_table(columns=["segment_id"])
-        seg_ids = sorted({s for s in tbl.column("segment_id").to_pylist() if s})
-    except Exception as exc:  # noqa: BLE001 -- best-effort add-on
-        LOGGER.warning(
-            "scan segset: reading %s failed (%s): %s", lance_uri, type(exc).__name__, exc
-        )
-        return {"segset_label": f"read failed: {type(exc).__name__}"}
-    if not seg_ids:
-        db.set_scan_segset(execution, "", "no qualifying segments")
-        return {"segset_label": "no qualifying segments"}
-    # Guardrail: a corpus-sized result (e.g. a tag whose threshold is far too low) would
-    # try to push millions of ids into DORA CreateDataSet -- which hangs and, since the
-    # refresher is single-flight, jams every other pending registration behind it. Such a
-    # set is unusable anyway; skip it, record why, and stop it re-attempting on every poll.
-    if len(seg_ids) > _SEGSET_MAX_SEGMENTS:
-        note = f"not registered: {len(seg_ids):,} segments exceeds {_SEGSET_MAX_SEGMENTS:,} cap (raise the tag's threshold)"
-        db.set_scan_segset(execution, "", note)
-        LOGGER.warning("scan segset: %s -> %s", execution, note)
-        return {"segset_label": note}
-    label, err = _create_export_segment_set(
-        seg_ids,
-        name,
-        provenance={
-            "source": "nls-segment-scan",
-            "execution_id": execution,
-            "tags": job.get("tags") or [],
-        },
-    )
-    if err:
-        return {"segset_label": f"register failed: {err}"}
-    uuid_str = label.split()[0] if label else ""
-    db.set_scan_segset(execution, uuid_str, label)
-    LOGGER.info("scan %s registered DORA segment set %s (%s)", execution, uuid_str, name)
-    return {"segset_uuid": uuid_str, "segset_label": label}
-
-
-@app.get("/api/scan_status")
-def scan_status(execution: str) -> dict:
-    """Phase of a launched scan workload (for the UI to poll); {done, phase, error}.
-    Also refreshes the stored scan_jobs status, and -- when the scan has SUCCEEDED and was
-    flagged to register a DORA segment set -- registers it once (best-effort)."""
-    if not nls_launcher.available():
-        raise HTTPException(503, "scan status unavailable")
-    try:
-        status = nls_launcher.scan_status(execution)
-    except nls_launcher.LauncherUnavailable as exc:
-        raise HTTPException(502, f"could not fetch scan status: {exc}")
-    db.update_scan_job(execution, status.get("phase") or "", status.get("error") or "")
-    segset = _maybe_register_scan_segset(
-        execution, done=bool(status.get("done")), phase=status.get("phase") or ""
-    )
-    status.update(segset)
-    return status
-
-
-def _scan_status_terminal(status: str) -> bool:
-    """True iff a scan's stored status is a final phase (no more polling needed).
-    A launched scan progresses LAUNCHED -> RUNNING -> SUCCEEDED/FAILED/ABORTED; only
-    the last group is terminal (Lilypad reports failure as EXPERIMENT_FAILED)."""
-    up = (status or "").upper()
-    return any(t in up for t in ("SUCCEEDED", "FAILED", "ABORTED", "COMPLETED"))
-
-
 # Single-flight background refresher for the scans list. All the slow external work --
 # Lilypad status for in-flight jobs, manifest-count back-fill (OCI), and pending DORA
 # segment-set registration (reads the whole output lance; can take minutes per row) --
@@ -1995,103 +1303,6 @@ def _scan_status_terminal(status: str) -> bool:
 _SCAN_REFRESH_LOCK = threading.Lock()
 _SCAN_REFRESH = {"running": False, "last": 0.0}
 _SCAN_REFRESH_MIN_INTERVAL_S = 15.0
-
-
-def _row_needs_refresh(row: dict) -> bool:
-    """True if a scan row has anything a background refresh could advance: a non-final
-    status, missing result counts, or a pending segment-set registration."""
-    # In-app exports are already final when written: there is no workload to poll,
-    # no manifest.json beside the artifact, and the artifact is a parquet rather
-    # than a segments.lance. Feeding one to this worker made it retry a segment-set
-    # registration against interval rows on every poll, forever.
-    if (row.get("source") or "lilypad") == "app":
-        return False
-    status = (row.get("status") or "").upper()
-    if not _scan_status_terminal(status):
-        return True
-    if "SUCCEEDED" not in status:
-        return False
-    if row.get("counts") is None and row.get("lance_uri"):
-        return True
-    # Segment-set registration is settled once it has an outcome -- a uuid (registered) OR
-    # a recorded label (skipped as too large / no qualifying segments). Only a row with
-    # neither still needs a registration attempt; this stops a skipped set from re-reading
-    # its (huge) lance on every poll.
-    return (
-        bool(row.get("register_segset"))
-        and not (row.get("segset_uuid") or "")
-        and not (row.get("segset_label") or "")
-    )
-
-
-def _kick_scan_refresh(rows: list[dict], force: bool = False) -> bool:
-    """Start the background refresh for ``rows`` unless one is already running (or ran
-    very recently, unless forced). Returns True iff a refresh is now in flight."""
-    stale = [r for r in rows if _row_needs_refresh(r)]
-    if not stale:
-        return False
-    now = time.time()
-    with _SCAN_REFRESH_LOCK:
-        if _SCAN_REFRESH["running"]:
-            return True
-        if not force and now - _SCAN_REFRESH["last"] < _SCAN_REFRESH_MIN_INTERVAL_S:
-            return False
-        _SCAN_REFRESH["running"] = True
-    threading.Thread(
-        target=_refresh_scan_rows, args=(stale,), daemon=True, name="scan-refresh"
-    ).start()
-    return True
-
-
-def _refresh_scan_rows(rows: list[dict]) -> None:
-    """Background worker: bring each stale scan row up to live truth and persist it.
-
-    Three passes, fast-to-slow, so the quick wins land first: (1) ALL statuses (bounded
-    gRPC, ~seconds total) -- the panel's repoll picks these up in real time; (2) result
-    counts (one bounded OCI manifest read per scan, cached); (3) pending segment-set
-    registrations LAST (each reads the scan's whole output lance -- minutes per row) so
-    they can never delay a status update. Failures are logged and skipped so one bad row
-    never blocks the rest."""
-    launcher_up = nls_launcher.available()
-    rows = [r for r in rows if r.get("execution_id")]
-    try:
-        # Pass 1: statuses (fast, bounded).
-        n_status = 0
-        for row in rows:
-            status = row.get("status") or ""
-            if not launcher_up or _scan_status_terminal(status):
-                continue
-            try:
-                live = nls_launcher.scan_status(row["execution_id"], timeout=8.0)
-                phase = (live.get("phase") or "").strip()
-                if phase and phase != status:
-                    db.update_scan_job(row["execution_id"], phase, live.get("error") or "")
-                    row["status"] = phase
-                    n_status += 1
-            except nls_launcher.LauncherUnavailable as exc:
-                LOGGER.info("scan refresh: %s status unavailable: %s", row["execution_id"], exc)
-        LOGGER.info("scan refresh: %d/%d statuses advanced", n_status, len(rows))
-        # Pass 2: result counts (bounded manifest read, cached incl. negative sentinel).
-        for row in rows:
-            if (
-                "SUCCEEDED" in (row.get("status") or "").upper()
-                and row.get("counts") is None
-                and row.get("lance_uri")
-            ):
-                _scan_counts(row["execution_id"], row["status"], row["lance_uri"], None)
-        # Pass 3: pending segment-set registrations (slow; strictly last).
-        for row in rows:
-            if (
-                "SUCCEEDED" in (row.get("status") or "").upper()
-                and row.get("register_segset")
-                and not (row.get("segset_uuid") or "")
-            ):
-                LOGGER.info("scan refresh: registering segment set for %s", row["execution_id"])
-                _maybe_register_scan_segset(row["execution_id"], done=True, phase="SUCCEEDED")
-    finally:
-        with _SCAN_REFRESH_LOCK:
-            _SCAN_REFRESH["running"] = False
-            _SCAN_REFRESH["last"] = time.time()
 
 
 @app.get("/api/scans")
@@ -2106,7 +1317,7 @@ def scans(limit: int = 50, live: bool = False) -> dict:
     response tells the client to re-poll shortly to pick up the refreshed rows.
     ``live=1`` (the panel's Reload button) forces the kick past the throttle."""
     rows = db.list_scan_jobs(limit=limit)
-    refreshing = _kick_scan_refresh(rows, force=bool(live))
+    refreshing = False  # nothing to poll: every row is final when written
     jobs = [
         {
             "execution_id": row.get("execution_id"),
@@ -2343,8 +1554,6 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
                         "num_results": len(hits),
                         "model_uri": model_uri,
                         "embeddings_uri": uri,
-                        "segment_set_uuid": req.segment_set_uuid,
-                        "segment_set_name": req.segment_set_name,
                         "date_from": req.from_date,
                         "date_to": req.to_date,
                         "filter_lance_uri": req.filter_lance_uri,
@@ -2403,22 +1612,9 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
     base = _export_base("config_export")
     parquet_uri = _write_config_export_parquet(rows, name=base)
 
+    # Data Explorer registration is gone with the DORA dependency; exports
+    # are the parquet and the CSV, and the Recent scans row points at them.
     segset_label, segset_error = "", ""
-    if req.create_segment_set:
-        segset_label, segset_error = _create_export_segment_set(
-            (h.segment_id for _, h in rows),
-            base,
-            provenance={
-                "source": "nls_search_app",
-                "queries": sorted({q for q, _ in rows}),
-                "embeddings_uri": uri,
-                "model_uri": model_uri,
-                "segment_set_uuid": req.segment_set_uuid,
-                "filter_lance_uri": req.filter_lance_uri,
-                "date_from": req.from_date,
-                "date_to": req.to_date,
-            },
-        )
 
     # "saved" == every query's vector is in exp-db: any new insert succeeded, or
     # there were no new encodes (all reused -> already persisted).
@@ -2482,8 +1678,6 @@ def curate_preview(req: ConfigExportRequest, request: Request) -> dict:
                     "num_results": len(hits),
                     "model_uri": model_uri,
                     "embeddings_uri": uri,
-                    "segment_set_uuid": req.segment_set_uuid,
-                    "segment_set_name": req.segment_set_name,
                     "date_from": req.from_date,
                     "date_to": req.to_date,
                     "thumbs_up": [],
@@ -2532,22 +1726,9 @@ def curate_export(req: CurateExportRequest, request: Request) -> Response:
     base = _export_base("curate")
     parquet_uri = _write_config_export_parquet(rows, name=base)
 
+    # Data Explorer registration is gone with the DORA dependency; exports
+    # are the parquet and the CSV, and the Recent scans row points at them.
     segset_label, segset_error = "", ""
-    if req.create_segment_set:
-        segset_label, segset_error = _create_export_segment_set(
-            (h.segment_id for _, h in rows),
-            base,
-            provenance={
-                "source": "nls_search_app",
-                "queries": sorted({q for q, _ in rows}),
-                "embeddings_uri": uri,
-                "model_uri": _state["cfg"].model_artifact_uri,
-                "segment_set_uuid": req.segment_set_uuid,
-                "filter_lance_uri": req.filter_lance_uri,
-                "date_from": req.from_date,
-                "date_to": req.to_date,
-            },
-        )
 
     return Response(
         content=csv_text,
@@ -3243,12 +2424,10 @@ class FullExportRequest(BaseModel):
     exact: bool = False
     interval: bool = False
     dedupe_segment: bool = False
-    create_segment_set: bool = False
     from_date: str | None = None
     to_date: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
 
 
@@ -3274,7 +2453,6 @@ class FullThresholdRequest(BaseModel):
     to_date: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
 
 
@@ -3288,7 +2466,6 @@ class FullSearchRequest(BaseModel):
     # resident path, MULTIPLE vehicles are honoured here.
     vehicle: str | None = None
     drive_id: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
 
 
@@ -3297,36 +2474,6 @@ class FullSearchRequest(BaseModel):
 # set's mask cannot go stale under it; the cache is cleared when it reloads.
 _FULL_SEG_IDS: dict[str, frozenset] = {}
 _FULL_SEG_LOCK = threading.Lock()
-
-
-def _full_segment_ids(seg_uuid: str | None) -> frozenset | None:
-    """The segment_ids of a Data Explorer set, for filtering the full corpus.
-
-    Uses the external_id (segment_id) path rather than the dx_internal_id bitmap
-    the resident corpus prefers: dx_internal_id is populated on only ~0.3% of the
-    consolidated corpus, so a bitmap AND would drop nearly every row and look
-    exactly like a set that legitimately matched nothing.
-
-    Raises rather than returning None on failure. A filter that silently fails to
-    apply returns a confident result set over the whole corpus, which is worse
-    than an error because nothing in the answer looks wrong.
-    """
-    if not seg_uuid:
-        return None
-    with _FULL_SEG_LOCK:
-        cached = _FULL_SEG_IDS.get(seg_uuid)
-    if cached is not None:
-        return cached
-    allowed, pending, _count = _resolve_segment_filter(seg_uuid)
-    if pending:
-        raise HTTPException(503, "segment set is still loading; retry in a moment")
-    if allowed is None:
-        raise HTTPException(400, f"could not resolve segment set {seg_uuid}")
-    ids = frozenset(allowed)
-    with _FULL_SEG_LOCK:
-        _FULL_SEG_IDS[seg_uuid] = ids
-    LOGGER.info("full-corpus segment set %s: %d ids", seg_uuid, len(ids))
-    return ids
 
 
 def _full_lance_filter(lance_uri: str | None) -> dict:
@@ -3377,7 +2524,6 @@ def _full_filters(req) -> dict:
             "vehicles": set(_parse_vehicles(getattr(req, "vehicle", None))) or None,
             "run_uuids": set(_parse_drive_ids(getattr(req, "drive_id", None))) or None,
             "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-            "segment_ids": _full_segment_ids(getattr(req, "segment_set_uuid", None)),
         },
         _full_lance_filter(getattr(req, "filter_lance_uri", None)),
     )
@@ -3540,7 +2686,6 @@ def _full_export_selection(corpus, req: "FullExportRequest", vec) -> object:
         "vehicles": set(_parse_vehicles(req.vehicle)) or None,
         "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
         "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-        "segment_ids": _full_segment_ids(req.segment_set_uuid),
     }
     filters = _merge_filters(filters, _full_lance_filter(req.filter_lance_uri))
     if req.k is not None:
@@ -3587,13 +2732,11 @@ class RetrieveRequest(BaseModel):
     tag: str = ""
     interval: bool = False
     dedupe_segment: bool = False
-    create_segment_set: bool = False
 
     from_date: str | None = None
     to_date: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     # Marks do two jobs: downvoted rows are excluded from the results, and with
     # `refine_from_marks` they also build the query direction (Rocchio). Both,
@@ -3794,9 +2937,8 @@ def _retrieve_export(req: "RetrieveRequest", request: Request, corpus, vec, excl
             threshold=req.threshold, max_rows=req.max_rows or 300_000,
             exact=req.exact, interval=req.interval,
             dedupe_segment=req.dedupe_segment,
-            create_segment_set=req.create_segment_set,
             from_date=req.from_date, to_date=req.to_date, vehicle=req.vehicle,
-            drive_id=req.drive_id, segment_set_uuid=req.segment_set_uuid,
+            drive_id=req.drive_id,
             filter_lance_uri=req.filter_lance_uri,
         )
         if req.interval:
@@ -3919,22 +3061,9 @@ def _full_export_write(
 
     base = _export_base(req.tag or query)
     parquet_uri = _write_arrow_export(table, base)
+    # Data Explorer registration is gone with the DORA dependency; exports
+    # are the parquet and the CSV, and the Recent scans row points at them.
     segset_label, segset_error = "", ""
-    if req.create_segment_set:
-        segset_label, segset_error = _create_export_segment_set(
-            table.column("segment_id").to_pylist(),
-            base,
-            provenance={
-                "source": "nls_search_app_full_corpus",
-                "query": query,
-                "embeddings_uri": corpus.corpus_uri,
-                "model_uri": _state["cfg"].model_artifact_uri,
-                "date_from": req.from_date,
-                "date_to": req.to_date,
-                "vehicle": req.vehicle,
-                "drive_id": req.drive_id,
-            },
-        )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
         "full export %r -> %d rows (%s, %s) over %d rows in %.1fms",
@@ -3990,10 +3119,6 @@ def _full_export_intervals(
     # Recent scans.
     _publish_full_export(
         req, request, base, parquet_uri, "", sel, len(rows), corpus, score_kind,
-        segset_error=(
-            "intervals: segment-set export not supported yet"
-            if req.create_segment_set else ""
-        ),
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
@@ -4005,7 +3130,7 @@ def _full_export_intervals(
         media_type="text/csv",
         headers=_full_export_headers(
             base, parquet_uri, "",
-            "intervals: segment-set export not supported yet" if req.create_segment_set else "",
+            "",
             sel, len(rows), score_kind, took_ms,
         ) | {"X-NLS-Interval-Threshold": f"{tau:.6f}"},
     )
@@ -4194,14 +3319,13 @@ def _publish_full_export(
                 "lance_uri": parquet_uri,
                 "console_url": "",
                 "status": "SUCCEEDED",
-                "register_segset": bool(req.create_segment_set),
+                "register_segset": False,
                 "segset_name": segset_label,
                 "filters": {
                     "date_from": req.from_date,
                     "date_to": req.to_date,
                     "vehicle": req.vehicle,
                     "drive_id": req.drive_id,
-                    "segment_set_uuid": req.segment_set_uuid,
                     "filter_lance_uri": req.filter_lance_uri,
                 },
                 "source": "app",
@@ -4218,15 +3342,8 @@ def _publish_full_export(
                     "score_kind": score_kind,
                 },
             )
-        # Always record an OUTCOME, even a negative one. The panel treats
-        # "registration requested, nothing recorded" as still-in-progress, so a
-        # blank here shows as "pending..." for an export that will never register
-        # anything.
-        outcome = segset_label or segset_error or (
-            "not registered" if req.create_segment_set else ""
-        )
-        if outcome:
-            db.set_scan_segset(base, "", outcome)
+        if segset_error:
+            db.set_scan_segset(base, "", segset_error)
     except Exception as exc:  # noqa: BLE001 - never fail a completed download
         LOGGER.warning("full export not published to Recent scans: %s", exc)
 
@@ -4263,8 +3380,7 @@ def full_threshold(req: FullThresholdRequest, request: Request) -> dict:
                 "vehicles": set(_parse_vehicles(req.vehicle)) or None,
                 "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
                 "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
-                "segment_ids": _full_segment_ids(req.segment_set_uuid),
-            },
+                    },
             _full_lance_filter(req.filter_lance_uri),
         )
     )
@@ -4386,7 +3502,6 @@ class FullVectorSearchRequest(BaseModel):
     to_date: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
 
 
@@ -4405,7 +3520,6 @@ class FullRefineRequest(BaseModel):
     to_date: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
-    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
 
 
@@ -4534,8 +3648,7 @@ def _full_rank(corpus, vec: np.ndarray, req, *, label: str, exclude_rows=None) -
                 "vehicles": set(_parse_vehicles(req.vehicle)) or None,
                 "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
                 "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-                "segment_ids": _full_segment_ids(req.segment_set_uuid),
-            },
+                    },
             _full_lance_filter(req.filter_lance_uri),
         ),
         exclude_rows=exclude_rows,
@@ -4598,8 +3711,7 @@ def full_search(req: FullSearchRequest) -> dict:
                 "vehicles": set(_parse_vehicles(req.vehicle)) or None,
                 "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
                 "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-                "segment_ids": _full_segment_ids(req.segment_set_uuid),
-            },
+                    },
             _full_lance_filter(req.filter_lance_uri),
         ),
     )
@@ -4693,7 +3805,6 @@ def _full_payload(
             "drive_id": sorted(_parse_drive_ids(req.drive_id)) or None,
             "from_date": req.from_date or None,
             "to_date": req.to_date or None,
-            "segment_set_uuid": req.segment_set_uuid or None,
             "filter_lance_uri": req.filter_lance_uri or None,
         },
     }
