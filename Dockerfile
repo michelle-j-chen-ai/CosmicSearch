@@ -22,32 +22,6 @@ COPY requirements.lock .
 RUN uv pip install -r requirements.lock
 
 FROM deps AS runtime
-# lilypad_py (the Lilypad submit client, nls_launcher.py) lives on the AUTHENTICATED Applied
-# (ursa) index, not public PyPI, and its declared deps include ray/wandb/oci (heavy, unused
-# by the submit path). So it is VENDORED and installed WITHOUT deps -- the light
-# import-closure it actually needs is already covered by requirements.lock. Its bundled
-# `adp.services.lilypad` protos merge with the DORA `adp` vendored below (namespace pkgs).
-COPY vendor ./vendor
-COPY scripts/retag_pure_wheel.py ./scripts/
-# The vendored wheel is tagged cp310-cp310-linux_x86_64, so an installer on this
-# 3.13 base rejects it on the tag alone. It ships no compiled extensions, so it
-# is pure Python and imports unmodified; the script retags it py3-none-any and
-# refuses to do so if it ever does gain an extension module. Kept as a script
-# rather than an inline heredoc so the build does not depend on BuildKit.
-RUN python scripts/retag_pure_wheel.py "vendor/lilypad_py-*-cp*.whl" \
-    && uv pip install --no-deps ./vendor/lilypad_py-2.26.0-py3-none-any.whl
-
-# DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
-# image builds on a plain Cloud Build with NO internal pip index / BuildKit
-# secret. Like tag_backfill_dashboard's `ursa/` stubs, `adp/` is .gitignored (not
-# committed) but present in the working tree and uploaded at deploy. Populate it
-# once with:  cp -r <venv>/lib/python*/site-packages/adp ./adp
-# dora_client uses only the proto stubs + raw grpc -- it does NOT import the heavy
-# `adp.public.strada.dora` helper (which pulls job_metadata -> simian -> ...), so
-# the public deps in requirements.lock (grpcio, protobuf, googleapis-common-protos)
-# suffice. /app is on sys.path, so `import adp` resolves to this vendored copy.
-COPY adp/ ./adp/
-
 # interval_core.py: dependency-light (numpy) interval-projection + arrow helpers,
 # shared with the offline Spark scan workflow; search_engine imports it.
 COPY config.py oci_s3.py local_cache.py interval_core.py search_engine.py analytics.py app.py ./
@@ -60,7 +34,7 @@ COPY gpu_corpus.py ./
 # call time rather than at build -- hence copying them explicitly.
 COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
-COPY web_server.py dora_client.py db.py machine_auth.py nls_launcher.py ./
+COPY web_server.py db.py machine_auth.py ./
 COPY web ./web
 
 # Cosmos-Embed loads custom remote code via trust_remote_code; allow the HF
