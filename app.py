@@ -29,6 +29,7 @@ import uuid
 
 import analytics
 import botocore.exceptions
+import full_corpus
 import local_cache
 import oci_s3
 import search_engine
@@ -329,6 +330,20 @@ def _inject_chrome() -> None:
         "matches.</div></div>",
         unsafe_allow_html=True,
     )
+
+
+@st.cache_resource(show_spinner="Loading text encoder (one-time)...")
+def get_model(model_artifact_uri: str, device: str) -> tuple[object, object]:
+    """Load + cache the encoder once per process, keyed by model URI."""
+    return search_engine.load_model(model_artifact_uri, device)
+@st.cache_resource(show_spinner=False)
+def get_corpus(embeddings_uri: str, matrix_dtype: str) -> search_engine.Corpus:
+    """Download (cached) + load a corpus once per process, keyed by its URI.
+
+    Across user sessions in one instance this is an in-memory hit; the first
+    load also populates the on-disk download cache shared across instances.
+    """
+    return search_engine.load_corpus(embeddings_uri, matrix_dtype)
 
 
 def main() -> None:

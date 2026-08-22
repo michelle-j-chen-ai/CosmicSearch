@@ -833,7 +833,7 @@ def search(req: SearchRequest, request: Request) -> dict:
     nothing, and quietly serving the full corpus from here would change the
     result set under a client that never asked for it.
     """
-    raise _gone("/api/full_search")
+    raise _gone("/api/retrieve with k")
 
 
 @app.post("/api/refine")
@@ -844,7 +844,7 @@ def refine(req: RefineRequest, request: Request) -> dict:
     nothing, and quietly serving the full corpus from here would change the
     result set under a client that never asked for it.
     """
-    raise _gone("/api/full_refine")
+    raise _gone("/api/retrieve with marks and refine_from_marks")
 
 
 @app.get("/api/search_session/{session_id}")
@@ -895,7 +895,25 @@ def search_by_vector(req: VectorSearchRequest) -> dict:
     nothing, and quietly serving the full corpus from here would change the
     result set under a client that never asked for it.
     """
-    raise _gone("/api/full_search_by_vector")
+    raise _gone("/api/retrieve with vector")
+
+
+# Cap on how many frames a client may send per upload (video sends ~8; the encoder
+# resamples to the model's fixed 8 either way). Bounds the request + decode work.
+_UPLOAD_MAX_FRAMES = 16
+_UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg is tiny)
+class UploadEncodeRequest(BaseModel):
+    """A user-supplied image OR video (decoded to frames) to encode into the corpus's
+    video/text space. The client sends base64 frames (data-URL prefix tolerated) as
+    JSON -- no python-multipart dependency, and for video only the extracted frames
+    travel, never the whole file. Provide ``frames_b64`` (image: 1 frame; video: the
+    browser-extracted frames from a duration-capped window) or the legacy single
+    ``image_b64``."""
+
+    frames_b64: list[str] = []
+    image_b64: str = ""  # legacy single-image convenience
+    filename: str = ""
+    content_type: str = ""
 
 
 @app.post("/api/search_by_upload")
@@ -1169,37 +1187,6 @@ class SaveVectorRequest(BaseModel):
     # (0 = top-k). The Export table pre-fills these for the tag.
     k: int = 0
     threshold: float = 0.0
-
-
-class SegmentScanRequest(BaseModel):
-    # Tags to scan for (the Export page sends its assembled query lines). Each tag's
-    # vector is resolved from the DB (db.vectors_for_tags, reusing the saved/refined
-    # vector); a tag with no stored vector is encoded with the active model and saved.
-    # thresholds is the PER-TAG cosine cutoff ({tag: float}); a tag missing from it
-    # falls back to ``default_threshold``. (No single global scan threshold.)
-    tags: list[str]
-    thresholds: dict[str, float] = {}
-    default_threshold: float = 0.3
-    from_date: str | None = None
-    to_date: str | None = None
-    # Active filter set: forwarded into the workflow inputs (nls_launcher) AND persisted on
-    # the scan_jobs record. NB: the offline worker currently applies only the date window;
-    # segment-set/lance/vehicle/drive ride along in the workflow config but are not yet
-    # enforced by the scan (that needs a worker change). Preview/Download honor all of them.
-    filter_lance_uri: str | None = None
-    filter_lance_uri: str | None = None
-    vehicle: str | None = None
-    drive_id: str | None = None
-    # When true, register the scan's qualifying segments as a DORA segment set once it
-    # Output is always keyed by segment_id. merge_intervals=True (default) merges contiguous
-    # above-threshold clips into variable-length spans per segment; False emits one best
-    # (highest-scoring) clip per segment (no interval merge).
-    merge_intervals: bool = True
-    # Top-K retrieval: when set, return the K highest-scoring distinct segments per tag
-    # (ranked by best-clip score) instead of everything above a threshold. Requires a
-    # downsample/segment-set scope (the worker resolves it to member chunks and ranks
-    # within it); rejected otherwise. null => ordinary threshold scan.
-    top_k: int | None = None
 
 
 @app.post("/api/save_vector")
@@ -1497,7 +1484,7 @@ def export(req: ExportRequest, request: Request) -> Response:
     nothing, and quietly serving the full corpus from here would change the
     result set under a client that never asked for it.
     """
-    raise _gone("/api/full_export")
+    raise _gone('/api/retrieve with output="csv"')
 
 
 @app.post("/api/export_config")
@@ -1697,7 +1684,6 @@ def curate_export(req: CurateExportRequest, request: Request) -> Response:
     _require_ready()
     if not req.rows:
         raise HTTPException(400, "no rows selected to export")
-    uri = _state["active_uri"]
 
     def _sec(ns: int | None) -> int | None:
         return int(ns) // 1_000_000_000 if ns is not None else None
@@ -2157,7 +2143,6 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
     fb_total_up = fb["up"]
     fb_total_down = fb["down"]
     fb_queries = fb["queries"]
-    fb_tags = sorted({e.get("tag") for e in episodes if e.get("tag")})
     fb_rows = (
         "".join(
             f"<tr><td>{_fmt_ts(e.get('created_at'))}</td>"
@@ -3139,8 +3124,6 @@ def _full_export_intervals(
 def _interval_rows_full(intervals: list, corpus, query: str) -> list[dict]:
     """`_interval_rows` for the full corpus: same output columns, but the peak
     clip's identifiers come from the resident arrays rather than a Corpus."""
-    import pyarrow as pa
-
     peaks = np.asarray([iv.peak_index for iv in intervals], dtype=np.int64)
     valid = peaks >= 0
     lookup = corpus.to_arrow(peaks[valid], np.zeros(int(valid.sum()))).to_pydict()
