@@ -34,7 +34,7 @@ COPY gpu_corpus.py ./
 # call time rather than at build -- hence copying them explicitly.
 COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
-COPY web_server.py db.py machine_auth.py ./
+COPY web_server.py db.py ./
 COPY web ./web
 
 # Cosmos-Embed loads custom remote code via trust_remote_code; allow the HF
