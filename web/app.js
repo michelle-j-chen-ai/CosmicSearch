@@ -13,7 +13,6 @@ const escapeHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
 
 const state = {
   platform: null,
-  offlineScan: true,
   corpus: null,
   embeddingsUri: null,
   query: "",
@@ -29,8 +28,6 @@ const state = {
   resumeVec: null,
   resumeLabel: "",
   // filters resolved from the search-page panel + the saved-searches (export) panel
-  searchSegUuid: null, searchSegName: null,
-  exportSegUuid: null, exportSegName: null,
   // threshold
   tempTau: null, confirmedTau: null, suggestedTau: null,
   tauUserSet: false,         // true once the user drags/confirms τ (then labels stop moving it)
@@ -59,7 +56,6 @@ async function loadPlatform() {
   try {
     const p = await fetch("/api/platform").then((r) => r.json());
     state.platform = p;
-    state.offlineScan = !p || p.offline_scan !== false;
     const tag = $("brandTag");
     if (p && p.label) { tag.textContent = p.label; tag.className = "tag " + (p.name === "trucks" ? "trucking" : "cars"); }
   } catch (e) { /* cosmetic */ }
@@ -123,7 +119,6 @@ function wireEvents() {
 
   $("filtersChip").onclick = toggleSearchFilters;
   $("applyFiltersBtn").onclick = applySearchFilters;
-  wireDxCombo();
   wireFullCorpusToggles();
 
   $("pagePrev").onclick = () => reload({ page: state.page - 1 });
@@ -248,18 +243,6 @@ function _makeDxCombo(cfg) {
   inp.addEventListener("focus", () => { if (items.length && inp.value.trim().length >= 2 && !combo.classList.contains("chosen")) show(); });
   inp.addEventListener("blur", () => setTimeout(hide, 150));
 }
-function wireDxCombo() {
-  _makeDxCombo({
-    inputId: "sf-dxset", comboId: "sf-dxset-combo", menuId: "sf-dxset-menu", noteId: "sf-dxset-note",
-    onClear: () => { state.searchSegUuid = null; state.searchSegName = null; },
-    onChoose: (s) => { state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`; if (state.query) reload({ page: 0 }); },
-  });
-  _makeDxCombo({
-    inputId: "ex-dxset", comboId: "ex-dxset-combo", menuId: "ex-dxset-menu", noteId: "ex-dxset-note",
-    onClear: () => { state.exportSegUuid = null; state.exportSegName = null; },
-    onChoose: (s) => { state.exportSegUuid = s.uuid; state.exportSegName = `${s.name} v${s.version}`; },
-  });
-}
 
 function applySearchFilters() {
   $("filtersChip").classList.add("active");
@@ -273,7 +256,6 @@ function _searchFilters() {
     page_size: state.pageSize,
     from_date: $("sf-dateFrom").value || null,
     to_date: $("sf-dateTo").value || null,
-    segment_set_uuid: state.searchSegUuid,
     filter_lance_uri: _splitList($("sf-lance").value),
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
@@ -497,7 +479,6 @@ function _fullFilterBody() {
     to_date: $("sf-dateTo").value || null,
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
-    segment_set_uuid: state.searchSegUuid,
     filter_lance_uri: _splitList($("sf-lance") ? $("sf-lance").value : ""),
   };
 }
@@ -541,7 +522,6 @@ const FULL_BATCH = 200;
 function _fullKey(q) {
   return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
           $("sf-vehicle").value, $("sf-drive").value,
-          state.searchSegUuid || "",
           $("sf-lance") ? $("sf-lance").value : ""].join("|");
 }
 
@@ -954,7 +934,6 @@ async function finalSave() {
     const r = await fetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       tag, query: state.query, k: 50, threshold: tau,
       from_date: $("sf-dateFrom").value || null, to_date: $("sf-dateTo").value || null,
-      segment_set_uuid: state.searchSegUuid, segment_set_name: state.searchSegName,
       filter_lance_uri: _splitList($("sf-lance").value), vehicle: _splitList($("sf-vehicle").value), drive_id: _splitList($("sf-drive").value),
       thumbs_up, thumbs_down,
     }) });
@@ -1044,8 +1023,6 @@ async function resumeSession(id) {
   if (s.from_date) $("sf-dateFrom").value = s.from_date;
   if (s.to_date) $("sf-dateTo").value = s.to_date;
   $("sf-lance").value = s.filter_lance_uri || ""; $("sf-vehicle").value = s.vehicle || ""; $("sf-drive").value = s.drive_id || "";
-  state.searchSegUuid = s.segment_set_uuid || null; state.searchSegName = s.segment_set_name || null;
-  $("sf-dxset").value = s.segment_set_name || "";
   if (s.segment_set_uuid) fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.segment_set_uuid)).catch(() => {});
   state.resumeVec = s.vector; state.resumeLabel = s.query || ""; state.mode = "resume";
   updateRail();
@@ -1155,14 +1132,13 @@ function _exportFilters() {
   return {
     from_date: $("ex-dateFrom").value || null, to_date: $("ex-dateTo").value || null,
     filter_lance_uri: _splitList($("ex-lance").value), vehicle: _splitList($("ex-vehicle").value), drive_id: _splitList($("ex-drive").value),
-    segment_set_uuid: state.exportSegUuid, segment_set_name: state.exportSegName,
   };
 }
 function _exportFilename(resp, fb) { const n = resp.headers.get("X-NLS-Export-Name") || ""; return n ? n + ".csv" : fb; }
 
 function doExport() {
   if (state.selected.size === 0) return;
-  if (_fullCorpusOn()) fullExport(); else if (state.offlineScan) launchScan(); else downloadCsv();
+  fullExport();
 }
 // Threshold fitting follows whichever corpus the results came from. The two
 // endpoints address marks differently -- the resident one by `index`, the
@@ -1191,7 +1167,6 @@ async function fullExport() {
         query: e.query || e.tag, tag, output: "csv",
         interval: state.sampleMode === "interval",
         dedupe_segment: $("dedupInput").checked,
-        create_segment_set: $("segsetInput").checked,
         exact: !!$("exactInput") && $("exactInput").checked,
         from_date: filters.from_date, to_date: filters.to_date,
         vehicle: filters.vehicle, drive_id: filters.drive_id,
@@ -1239,69 +1214,6 @@ async function fullExport() {
   } finally { btn.disabled = false; }
 }
 
-async function downloadCsv() {
-  const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
-  const topk = state.cutoffMode === "topk";
-  // Top-K uses a per-search K (kForRow: the tag's own input when >1 selected,
-  // else the single global K); threshold mode keeps each tag's saved k cap.
-  const queries = rows.map((e) => ({ query: e.query || e.tag, k: topk ? kForRow(e) : (e.k || 50), threshold: topk ? 0 : (e.threshold || 0) }));
-  const btn = $("exportBtn"); btn.disabled = true; $("exportNote").textContent = `Exporting ${queries.length} tag(s) from the loaded corpus…`;
-  try {
-    const resp = await fetch("/api/export_config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-      queries, dedupe: true, dedupe_segment: $("dedupInput").checked, create_segment_set: $("segsetInput").checked, embeddings_uri: state.embeddingsUri, ..._exportFilters(),
-    }) });
-    if (!resp.ok) { let d; try { d = (await resp.json()).detail; } catch (_e) { } throw new Error(d || ("export " + resp.status)); }
-    const parquet = resp.headers.get("X-NLS-Parquet") || "";
-    const blob = await resp.blob(); const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = _exportFilename(resp, "export.csv");
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-    $("exportNote").textContent = `Downloaded CSV for ${queries.length} tag(s)` + (parquet ? ` · parquet → ${parquet}` : " · ⚠ parquet not written");
-    showToast("CSV downloaded");
-  } catch (e) { $("exportNote").textContent = "Export failed: " + e.message; }
-  finally { btn.disabled = false; }
-}
-async function launchScan() {
-  const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
-  const tags = rows.map((e) => e.tag);
-  const defThr = 0.3;
-  const thresholds = {}; rows.forEach((e) => { thresholds[e.tag] = e.threshold > 0 ? e.threshold : defThr; });
-  // Top-K offline scan: only when a segment set / lance downsample scopes the scan (the
-  // worker ranks within that set). Otherwise Top-K is meaningless offline -- guide the user.
-  const topk = state.cutoffMode === "topk";
-  const hasScope = !!(state.exportSegUuid || ($("ex-lance") && ($("ex-lance").value || "").trim()));
-  if (topk && !hasScope) {
-    const jsg = $("jobStatus"); jsg.classList.add("show");
-    jsg.innerHTML = `<span style="color:var(--neg)">Top-K needs a segment set (or lance downsample) to rank within — pick one under Filters, or switch Cutoff to Threshold.</span>`;
-    return;
-  }
-  const topK = topk ? (parseInt($("kInput").value, 10) || 50) : null;
-  const btn = $("exportBtn"); btn.disabled = true; btn.textContent = "⏳ Job queued…";
-  const js = $("jobStatus"); js.classList.add("show"); js.innerHTML = `<span>launching per-segment scan over ${tags.length} tag(s)…</span>`;
-  try {
-    const r = await fetch("/api/launch_segment_scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-      tags, thresholds, default_threshold: defThr, create_segment_set: $("segsetInput").checked, merge_intervals: state.sampleMode === "interval", ..._exportFilters(),
-      ...(topK ? { top_k: topK } : {}),
-    }) });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
-    const { execution_id, url, deduplicated } = await r.json();
-    // A dedup hit launches nothing and returns an existing workload; say so rather
-    // than reporting it as a fresh launch (only possible with an Idempotency-Key).
-    const verb = deduplicated ? "reused (nothing relaunched)" : "launched";
-    js.innerHTML = `<span>job <b><a href="${url}" target="_blank" rel="noopener">${escapeHtml(execution_id)}</a></b> ${verb}</span><span>polling…</span>`;
-    showToast(deduplicated ? "Reused an existing scan — see Recent scans" : "Scan launched — see Recent scans");
-    loadScanJobs();
-    pollScan(execution_id, url);
-  } catch (e) { js.innerHTML = `<span style="color:var(--neg)">launch failed: ${escapeHtml(e.message)}</span>`; }
-  finally { btn.disabled = false; renderExportPanel(); }
-}
-async function pollScan(execId, url) {
-  for (let i = 0; i < 90; i++) {
-    await new Promise((res) => setTimeout(res, 20000));
-    let s; try { s = await fetch("/api/scan_status?execution=" + encodeURIComponent(execId)).then((r) => r.json()); } catch (e) { continue; }
-    loadScanJobs();
-    if (s.done) return;
-  }
-}
 
 /* ===================== recent scans ===================== */
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
@@ -1310,7 +1222,7 @@ async function loadScanJobs(live) {
   clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
-    body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
   }
   // The list is a pure DB read server-side (never blocks on Lilypad/DORA/OCI); live=1
   // (Reload) forces the server's background refresher to kick. The timeout is a belt --
@@ -1327,7 +1239,7 @@ async function loadScanJobs(live) {
   } catch (e) {
     console.error("loadScanJobs failed", e);
     const msg = e.name === "AbortError" ? "timed out" : e.message;
-    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(msg)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="7" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(msg)}</td></tr>`;
     return;
   } finally { clearTimeout(timer); }
   renderScans();
@@ -1344,7 +1256,7 @@ function renderScans() {
     // One malformed row must not blank the whole archive -- this panel is the
     // only place some artifacts are discoverable.
     console.error("renderScans failed", e);
-    $("scansBody").innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
+    $("scansBody").innerHTML = `<tr><td colspan="7" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 function _renderScans() {
@@ -1379,9 +1291,6 @@ function _renderScans() {
       ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(_uriShort(j.lance_uri))}</span>`
         + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}</div>`
       : "—";
-    let dx = `<span class="scan-dx none">—</span>`;
-    if (j.segset_label) dx = `<span class="scan-dx">${escapeHtml(j.segset_label)}</span>`;
-    else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
     return `<tr>
       <td class="scan-time">${escapeHtml(j.created_at || "")}</td>
       <td>${srcBadge}${id}</td>
@@ -1390,8 +1299,8 @@ function _renderScans() {
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
       <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}${truncNote}</td>
       <td>${out}</td>
-      <td>${dx}</td></tr>`;
-  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
+      </tr>`;
+  }).join("") : `<tr><td colspan="7" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
 }
 // Result counts (total segments + per-tag breakdown), mirroring the Data Explorer view.
 function _fmtScanCounts(c, status) {
