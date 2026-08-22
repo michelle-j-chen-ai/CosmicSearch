@@ -496,24 +496,6 @@ def _hit_dict(h) -> dict:
     }
 
 
-# --- request models ---------------------------------------------------------
-class SearchRequest(BaseModel):
-    query: str
-    page: int = 0
-    page_size: int = 24
-    start_rank: int | None = None  # 1-based; overrides page when set
-    start_score: float | None = None  # start at first clip scoring <= this
-    from_date: str | None = None
-    to_date: str | None = None
-    filter_lance_uri: str | None = None
-    # Vehicle-id filter: comma/space-separated ids matched against the corpus
-    # vehicle column (inert if the corpus has none). AND'd with the other filters.
-    vehicle: str | None = None
-    # Drive-id (run_uuid) filter: comma/space-separated; keeps only those drives.
-    drive_id: str | None = None
-    embeddings_uri: str | None = None
-
-
 class Mark(BaseModel):
     chunk_id: str
     segment_id: str = ""
@@ -525,26 +507,6 @@ class Mark(BaseModel):
     row: int | None = None
     rank: int | None = None
     score: float | None = None
-
-
-class RefineRequest(BaseModel):
-    query: str  # original text query (label + optional text anchor)
-    marks: list[Mark] = []
-    page: int = 0
-    page_size: int = 24
-    start_rank: int | None = None
-    start_score: float | None = None
-    from_date: str | None = None
-    to_date: str | None = None
-    filter_lance_uri: str | None = None
-    # Vehicle-id filter: comma/space-separated ids matched against the corpus
-    # vehicle column (inert if the corpus has none). AND'd with the other filters.
-    vehicle: str | None = None
-    # Drive-id (run_uuid) filter: comma/space-separated; keeps only those drives.
-    drive_id: str | None = None
-    embeddings_uri: str | None = None
-    negative_weight: float = 0.5
-    text_weight: float = 0.0
 
 
 class ExportRequest(BaseModel):
@@ -576,52 +538,6 @@ class ExportRequest(BaseModel):
     # "score": threshold = ``interval_score``.
     interval_mode: str = "k"
     interval_score: float | None = None
-
-
-class ThresholdSearchRequest(BaseModel):
-    """Fit a per-tag score cutoff from labeled 👍/👎 marks, and return a batch of
-    UNLABELED boundary clips to keep labeling (active learning). Carries the same
-    query + filters as the other search endpoints so the scores it tunes against
-    are exactly the ones the app will select with."""
-
-    query: str
-    from_date: str | None = None
-    to_date: str | None = None
-    filter_lance_uri: str | None = None
-    vehicle: str | None = None
-    drive_id: str | None = None
-    embeddings_uri: str | None = None
-    marks: list[Mark] = []
-    # "f1" (max F-beta) | "youden" (max TPR-FPR) | "precision" (max recall s.t.
-    # precision >= min_precision). See search_engine.fit_threshold.
-    objective: str = "f1"
-    beta: float = 1.0
-    min_precision: float = 0.9
-    # >0 holds out a fraction of labels so the reported metrics aren't optimistic.
-    val_fraction: float = 0.0
-    # How many boundary clips to hand back for the next labeling round.
-    sample_size: int = 12
-    band: float = 0.08
-
-
-class VectorSearchRequest(BaseModel):
-    """Rank by a pre-computed query vector -- used to RESUME a saved search."""
-
-    vector: list[float]
-    query: str = ""  # the NL text the vector came from (label only)
-    page: int = 0
-    page_size: int = 24
-    start_rank: int | None = None
-    start_score: float | None = None
-    from_date: str | None = None
-    to_date: str | None = None
-    filter_lance_uri: str | None = None
-    # Vehicle-id filter: comma/space-separated ids matched against the corpus
-    # vehicle column (inert if the corpus has none). AND'd with the other filters.
-    vehicle: str | None = None
-    # Drive-id (run_uuid) filter: comma/space-separated; keeps only those drives.
-    drive_id: str | None = None
-    embeddings_uri: str | None = None
 
 
 class WindowSearchRequest(BaseModel):
@@ -825,28 +741,6 @@ def _window(corpus, scores, order, page, page_size, start_rank, start_score, t0,
     }
 
 
-@app.post("/api/search")
-def search(req: SearchRequest, request: Request) -> dict:
-    """Retired. This ranked the 2M resident corpus, which no longer exists.
-
-    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
-    nothing, and quietly serving the full corpus from here would change the
-    result set under a client that never asked for it.
-    """
-    raise _gone("/api/retrieve with k")
-
-
-@app.post("/api/refine")
-def refine(req: RefineRequest, request: Request) -> dict:
-    """Retired. This ranked the 2M resident corpus, which no longer exists.
-
-    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
-    nothing, and quietly serving the full corpus from here would change the
-    result set under a client that never asked for it.
-    """
-    raise _gone("/api/retrieve with marks and refine_from_marks")
-
-
 @app.get("/api/search_session/{session_id}")
 def search_session(session_id: int) -> dict:
     """The stored query + search vector + filters for a past export, by row id.
@@ -885,17 +779,6 @@ def search_session(session_id: int) -> dict:
         "thumbs_up": _json_list("thumbs_up_json"),
         "thumbs_down": _json_list("thumbs_down_json"),
     }
-
-
-@app.post("/api/search_by_vector")
-def search_by_vector(req: VectorSearchRequest) -> dict:
-    """Retired. This ranked the 2M resident corpus, which no longer exists.
-
-    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
-    nothing, and quietly serving the full corpus from here would change the
-    result set under a client that never asked for it.
-    """
-    raise _gone("/api/retrieve with vector")
 
 
 # Cap on how many frames a client may send per upload (video sends ~8; the encoder
@@ -1463,28 +1346,6 @@ def refit_policy(request: Request) -> dict:
     return {"fitted": True, "embeddings_uri": uri, "feature_names": pol["feature_names"],
             "weights": pol["weights"], "n_episodes": pol["n_episodes"],
             "mae_policy": pol["mae_policy"], "mae_heuristic": pol["mae_heuristic"]}
-
-
-@app.post("/api/threshold_search")
-def threshold_search(req: ThresholdSearchRequest, request: Request) -> dict:
-    """Retired. This ranked the 2M resident corpus, which no longer exists.
-
-    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
-    nothing, and quietly serving the full corpus from here would change the
-    result set under a client that never asked for it.
-    """
-    raise _gone("/api/full_threshold")
-
-
-@app.post("/api/export")
-def export(req: ExportRequest, request: Request) -> Response:
-    """Retired. This ranked the 2M resident corpus, which no longer exists.
-
-    Kept as an explicit 410 rather than deleted: a 404 tells an external caller
-    nothing, and quietly serving the full corpus from here would change the
-    result set under a client that never asked for it.
-    """
-    raise _gone('/api/retrieve with output="csv"')
 
 
 @app.post("/api/export_config")
@@ -2511,20 +2372,6 @@ def _full_filters(req) -> dict:
             "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
         },
         _full_lance_filter(getattr(req, "filter_lance_uri", None)),
-    )
-
-
-def _gone(replacement: str) -> "HTTPException":
-    """410 for an endpoint that ranked the retired 2M corpus.
-
-    Deleting these outright would give an external caller a 404 and no idea why;
-    returning a plausible answer from a different corpus would be worse. The
-    replacement is named so a caller can move.
-    """
-    return HTTPException(
-        410,
-        f"this endpoint ranked the retired 2M corpus; use {replacement}, which "
-        "covers the whole table",
     )
 
 
