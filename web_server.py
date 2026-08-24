@@ -954,49 +954,6 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
     return {"tag": tag, "dim": len(vec)}
 
 
-class _SingleFlightCall:
-    __slots__ = ("done", "result", "exc")
-
-    def __init__(self) -> None:
-        self.done = threading.Event()
-        self.result = None
-        self.exc: BaseException | None = None
-
-
-_SF_LOCK = threading.Lock()
-_SF_CALLS: dict[str, _SingleFlightCall] = {}
-
-
-def _scan_single_flight(key: str, fn):
-    """Coalesce concurrent same-key calls on THIS instance to one execution of ``fn``.
-
-    The first caller (leader) runs ``fn``; the rest wait and share its result or
-    exception. This spares the DB a thundering herd of one transaction per executor;
-    cross-instance dedup is still enforced by ``db.launch_or_get``. The key is freed
-    as soon as the leader finishes, so a later (non-concurrent) identical request
-    re-leads and hits the DB dedup (returns the persisted workload id)."""
-    with _SF_LOCK:
-        call = _SF_CALLS.get(key)
-        leader = call is None
-        if leader:
-            call = _SF_CALLS[key] = _SingleFlightCall()
-    if not leader:
-        call.done.wait()
-        if call.exc is not None:
-            raise call.exc
-        return call.result
-    try:
-        call.result = fn()
-        return call.result
-    except BaseException as exc:  # propagate identically to all waiters
-        call.exc = exc
-        raise
-    finally:
-        call.done.set()
-        with _SF_LOCK:
-            _SF_CALLS.pop(key, None)
-
-
 # Single-flight background refresher for the scans list. All the slow external work --
 # Lilypad status for in-flight jobs, manifest-count back-fill (OCI), and pending DORA
 # segment-set registration (reads the whole output lance; can take minutes per row) --

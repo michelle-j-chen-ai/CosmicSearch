@@ -409,95 +409,6 @@ _INSERT_MARK = text(
 )
 
 
-def insert_threshold_episode(record: dict) -> bool:
-    """Append one threshold-tuning episode (features + fitted tau + metrics).
-
-    Best-effort training-data capture for a future learned threshold policy;
-    swallows connection/SQL errors so tuning never breaks when the DB is
-    unreachable. Returns True iff the row was committed."""
-    params = {
-        "user_email": record.get("user_email"),
-        "query": record.get("query"),
-        "tag": record.get("tag"),
-        "model_uri": record.get("model_uri"),
-        "embeddings_uri": record.get("embeddings_uri"),
-        "features": json.dumps(record.get("features", {})),
-        "suggested_tau": record.get("suggested_tau"),
-        "fit_tau": record.get("fit_tau"),
-        "f1": record.get("f1"),
-        "precision": record.get("precision"),
-        "recall": record.get("recall"),
-        "average_precision": record.get("average_precision"),
-        "objective": record.get("objective"),
-        "n_pos": record.get("n_pos"),
-        "n_neg": record.get("n_neg"),
-    }
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            row_id = conn.execute(_INSERT_EPISODE, params).scalar_one()
-        logger.info("DB: threshold_episode row %s written (tag=%r)", row_id, params["tag"])
-        return True
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: insert_threshold_episode failed (%s): %s", type(exc).__name__, exc)
-        return False
-
-
-def record_marks(
-    marks: list[dict],
-    *,
-    query: str,
-    user_email: str | None,
-    source: str,
-    embeddings_uri: str | None = None,
-    model_uri: str | None = None,
-) -> int:
-    """Upsert one feedback-ledger row per mark (👍/👎). Best-effort.
-
-    ``marks`` is a list of dicts with ``chunk_id``, ``segment_id`` (may be empty),
-    and ``mark`` ("up"/"down"). Called wherever marks are used (refine, threshold
-    sweep, export) so every judgment is captured with its segment id the moment
-    it happens -- not only on Download. Returns the number of rows written.
-    """
-    qkey = normalize_query(query)
-    if not qkey:
-        return 0
-    rows = []
-    for m in marks:
-        mk = (m.get("mark") or "").lower()
-        if mk not in ("up", "down"):
-            continue
-        seg = (m.get("segment_id") or "").strip() or (m.get("chunk_id") or "").strip()
-        if not seg:
-            continue
-        rows.append({
-            "user_email": (user_email or "").strip(),
-            "query": (query or "").strip(),
-            "query_key": qkey,
-            "segment_id": seg,
-            "chunk_id": (m.get("chunk_id") or "").strip() or None,
-            "label": mk == "up",
-            "source": source,
-            "embeddings_uri": embeddings_uri,
-            "model_uri": model_uri,
-        })
-    if not rows:
-        return 0
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            conn.execute(_INSERT_MARK, rows)
-        logger.info("DB: recorded %d feedback marks (source=%s, query=%r)", len(rows), source, query)
-        return len(rows)
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: record_marks failed (%s): %s", type(exc).__name__, exc)
-        return 0
-
-
 def feedback_totals() -> dict:
     """Distinct human feedback counts from the ledger -- the HONEST totals.
 
@@ -638,28 +549,6 @@ def tags_catalog(limit: int = 500) -> list[dict]:
         return []
 
 
-def set_tag_thresholds(thresholds: dict[str, float]) -> bool:
-    """Remember each tag's last-used scan threshold (Export table pre-fills it). Best-effort;
-    updates only existing tagged rows, leaving other columns intact."""
-    rows = [
-        {"tag": t.strip(), "threshold": float(v)}
-        for t, v in (thresholds or {}).items()
-        if t and t.strip() and v is not None and float(v) > 0
-    ]
-    if not rows:
-        return False
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            conn.execute(_SET_TAG_THRESHOLD, rows)
-        return True
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: set_tag_thresholds failed (%s): %s", type(exc).__name__, exc)
-        return False
-
-
 def threshold_episodes(limit: int = 10000) -> list[dict]:
     """All logged threshold-tuning episodes, newest-first. Training data for the
     offline threshold-policy fit (scripts/fit_threshold_policy.py). Best-effort:
@@ -764,36 +653,6 @@ _FIND_BY_QUERY = text(
 )
 
 
-def find_vector_by_query(
-    query: str, embeddings_uri: str, model_uri: str
-) -> list[float] | None:
-    """The most recent stored search_vector for an exact (query, corpus, model),
-    or None if there is none / exp-db is unreachable (best-effort: never raises
-    into the request -- callers re-encode on None)."""
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            row = (
-                conn.execute(
-                    _FIND_BY_QUERY,
-                    {"q": query, "uri": embeddings_uri, "model": model_uri},
-                )
-                .mappings()
-                .first()
-            )
-        if not row or not row.get("search_vector_json"):
-            return None
-        val = json.loads(row["search_vector_json"])
-        return val if isinstance(val, list) and val else None
-    except (SQLAlchemyError, OSError, ValueError) as exc:
-        logger.warning(
-            "DB: find_vector_by_query failed (%s): %s", type(exc).__name__, exc
-        )
-        return None
-
-
 # Newest stored search vector for an exact (TAG, corpus, model). Backs config-export
 # reuse: the per-query tag IS the query text, so a prior config run's persisted row is
 # reused without re-encoding (and not re-appended). corpus+model match keeps a vector
@@ -850,36 +709,6 @@ _VECTORS_FOR_TAGS = text(
               AND jsonb_array_length(search_vector) > 0
         ORDER BY tag, created_at DESC"""
 ).bindparams(bindparam("tags", expanding=True))
-
-
-def vectors_for_tags(tags: list[str], model_uri: str) -> dict[str, list[float]]:
-    """``{tag: vector}`` for the given tags in the given model's space -- the newest stored
-    vector per tag. Best-effort: returns only the tags it found (missing/unreachable -> absent),
-    so callers re-encode the gaps."""
-    wanted = sorted({t.strip() for t in tags if t and t.strip()})
-    if not wanted:
-        return {}
-    out: dict[str, list[float]] = {}
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            rows = (
-                conn.execute(_VECTORS_FOR_TAGS, {"tags": wanted, "model": model_uri})
-                .mappings()
-                .all()
-            )
-        for row in rows:
-            sv = row.get("search_vector_json")
-            if not sv:
-                continue
-            val = json.loads(sv)
-            if isinstance(val, list) and val:
-                out[row["tag"]] = val
-    except (SQLAlchemyError, OSError, ValueError) as exc:
-        logger.warning("DB: vectors_for_tags failed (%s): %s", type(exc).__name__, exc)
-    return out
 
 
 # ----- launched per-segment scans (Lilypad workloads) -----------------------------
@@ -988,90 +817,6 @@ _RELEASE_SCAN_IDEM = text(
 )
 
 
-def launch_or_get(idem_key: str, launch_and_record) -> tuple[dict, bool]:
-    """Single-flight a scan launch across all instances on ``idem_key``.
-
-    Holds an advisory lock on the key, then: if a row already carries this key,
-    return its existing workload id (dedup hit); otherwise call
-    ``launch_and_record() -> (result, record)`` -- the ONE real launch -- and
-    persist the record (with ``idem_key``) in the SAME transaction. Returns
-    ``(result, deduplicated)``. On a dedup hit ``result`` is
-    ``{"execution_id": <existing>}``.
-
-    Raises if the DB is unreachable (so the caller fails loudly rather than
-    double-launching) or if ``launch_and_record`` raises (the transaction rolls
-    back, the lock releases, and the next caller retries cleanly -- nothing is
-    recorded).
-    """
-    if not _schema_ready:
-        init_schema()
-    with _get_engine().begin() as conn:
-        conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-        conn.execute(_SCAN_ADVISORY_LOCK, {"k": idem_key})
-        row = conn.execute(_SELECT_SCAN_BY_IDEM, {"idem": idem_key}).first()
-        if row and row.execution_id:
-            # A FAILED/ABORTED execution must not satisfy dedup -- returning it hands
-            # the caller a dead workload (and a lance_uri that will never exist).
-            # Release its key (the row stays for history) and fall through to a
-            # fresh launch that takes over the key.
-            up = (row.status or "").upper()
-            if any(t in up for t in ("FAILED", "ABORTED")):
-                conn.execute(_RELEASE_SCAN_IDEM, {"idem": idem_key})
-            else:
-                return {"execution_id": row.execution_id}, True
-        result, record = launch_and_record()
-        params = _scan_params({**record, "idem_key": idem_key})
-        if params["execution_id"]:
-            conn.execute(_INSERT_SCAN, params)
-        return result, False
-
-
-def release_scan_idem(idem_key: str) -> bool:
-    """Release a (dead) execution's idempotency key so an identical relaunch can own
-    it. The row keeps its history; only the dedup key is cleared. Best-effort."""
-    if not idem_key:
-        return False
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            conn.execute(_RELEASE_SCAN_IDEM, {"idem": idem_key})
-        return True
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: release_scan_idem failed (%s): %s", type(exc).__name__, exc)
-        return False
-
-
-def get_scan_job(execution_id: str) -> dict | None:
-    """One scan job by workload id (parsed tags/thresholds), or None. Best-effort."""
-    if not execution_id:
-        return None
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            row = (
-                conn.execute(_LIST_SCANS, {"limit": 500})
-                .mappings()
-                .all()
-            )
-        for r in row:
-            if r.get("execution_id") == execution_id:
-                d = dict(r)
-                try:
-                    d["tags"] = json.loads(d.pop("tags_json") or "[]")
-                except ValueError:
-                    d["tags"] = []
-                d.pop("thresholds_json", None)
-                return d
-        return None
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: get_scan_job failed (%s): %s", type(exc).__name__, exc)
-        return None
-
-
 def set_scan_segset(execution_id: str, segset_uuid: str, segset_label: str) -> bool:
     """Record the DORA segment set registered from a completed scan. Best-effort."""
     if not execution_id:
@@ -1092,25 +837,6 @@ def set_scan_segset(execution_id: str, segset_uuid: str, segset_label: str) -> b
         return True
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: set_scan_segset failed (%s): %s", type(exc).__name__, exc)
-        return False
-
-
-def update_scan_job(execution_id: str, status: str, error: str = "") -> bool:
-    """Update a scan job's last-polled status/error. Best-effort."""
-    if not execution_id:
-        return False
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            conn.execute(
-                _UPDATE_SCAN,
-                {"execution_id": execution_id, "status": status, "error": error or ""},
-            )
-        return True
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: update_scan_job failed (%s): %s", type(exc).__name__, exc)
         return False
 
 
