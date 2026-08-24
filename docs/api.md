@@ -293,9 +293,9 @@ These predate `/api/retrieve` and keep their own artifact writers. They work, bu
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/full_corpus_status` | `status`, `num_rows`, `corpus_uri`, `elapsed_s`. |
+| `GET /api/full_corpus_status` | `status`, `num_rows`, `corpus_uri`, `corpus_version`, `loaded_utc`, `elapsed_s`, and the `refresh` schedule. |
 | `POST /api/full_corpus_load` | Start the load; returns immediately. |
-| `POST /api/full_corpus_refresh` | Drop and reload, picking up clips added since. Retrieval is unavailable during the reload. |
+| `POST /api/full_corpus_refresh` | Drop and reload, picking up clips added since. Retrieval is unavailable during the reload. `?if_changed=1` reloads only if the table's version has moved. |
 | `GET /api/corpus` | Row count, dimensions, date span, active encoder. |
 | `GET /api/model` | The active encoder. |
 | `GET /healthz` | Liveness. `ready` flips when the model is up. |
@@ -303,6 +303,18 @@ These predate `/api/retrieve` and keep their own artifact writers. They work, bu
 The corpus URI is fixed. `GET /api/corpus?uri=…` with anything else returns
 `400` rather than silently ranking against a table the queries were not encoded
 for.
+
+The corpus is read into memory once and served from there, so it is a snapshot
+of the table as of `loaded_utc`. Each instance refreshes itself daily at
+`NLS_CORPUS_REFRESH_UTC` (default `10:00` UTC, plus up to 30 minutes of
+per-instance jitter), and skips the reload when the table's version has not
+moved. `refresh` in the status response reports the next wake-up and the result
+of the last one.
+
+Refreshing per instance rather than by an external trigger is deliberate: a
+request reaches one instance, the service runs more than one, and a row position
+is only valid against the corpus version that issued it — so a partial refresh
+would make `rows` handles fail on some requests and not others.
 
 ---
 

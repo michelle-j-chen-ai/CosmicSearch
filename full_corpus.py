@@ -1025,6 +1025,19 @@ class FullCorpus:
         )
 
 
+def latest_version(uri: str = DEFAULT_CORPUS_TABLE_URI) -> "int | None":
+    """The table's current version, read from its metadata alone.
+
+    A refresh costs minutes and takes full-corpus search offline for all of
+    them, so it is worth one metadata round-trip to find out whether the table
+    has actually moved since this process read it. Returns None if the reader
+    does not expose a version, which the caller must treat as "unknown" rather
+    than as "unchanged".
+    """
+    ds = lance.dataset(uri, storage_options=oci_s3.lance_storage_options())
+    return getattr(ds, "version", None)
+
+
 def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     """Read the pinned corpus into memory. ~2 minutes, ~12GB resident.
 

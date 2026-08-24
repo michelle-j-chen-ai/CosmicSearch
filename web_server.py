@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -147,6 +148,7 @@ def _warm_engine() -> None:
         try:
             _full_corpus_begin_load()
             LOGGER.info("full corpus load started in the background")
+            _start_corpus_refresh_schedule()
         except Exception as exc:  # noqa: BLE001 -- warm-up must not wedge startup
             LOGGER.warning("full corpus pre-warm could not start: %s", exc)
         _state["ready"] = True
@@ -1899,10 +1901,10 @@ def fmtint(n) -> str:
 # fp32 vectors: 8.8GB rather than the ~105GB the same rows would cost as fp32,
 # swept in ~180ms on this instance's 8 cores.
 #
-# Loaded ON DEMAND, never at startup: the read+decode costs ~2 minutes and
-# ~12GB, which nobody should pay unless they ask for full-corpus search. The
-# load runs on a background thread so the request that triggers it returns
-# immediately and the UI can poll `/api/full_corpus_status`.
+# The load costs ~2 minutes and ~12GB. It is started by the warm-up thread (and
+# by the first request that needs it, if that lands first) rather than in the
+# startup event, so uvicorn binds the port immediately and the UI can poll
+# `/api/full_corpus_status` while it runs.
 _FULL_LOCK = threading.Lock()
 _FULL: dict = {"corpus": None, "status": "idle", "error": "", "started": 0.0}
 
@@ -1977,12 +1979,17 @@ def _full_refresh_worker() -> None:
 
 
 @app.post("/api/full_corpus_refresh")
-def full_corpus_refresh() -> dict:
+def full_corpus_refresh(if_changed: bool = False) -> dict:
     """Reload the full corpus from the current Lance, picking up new rows.
 
-    Intended for a scheduler: the corpus grows daily and a resident copy is a
-    snapshot. Returns immediately; the reload runs on a background thread and is
-    observable through /api/full_corpus_status.
+    Returns immediately; the reload runs on a background thread and is
+    observable through /api/full_corpus_status. This instance only: see
+    `_corpus_refresh_scheduler` for why the daily refresh is not driven by
+    calling this from outside.
+
+    `if_changed=1` reloads only if the table's version has moved since this copy
+    was read -- the same gate the scheduler applies, exposed so the check can be
+    run on demand without paying for an outage that changes nothing.
 
     A refresh already in flight is not restarted -- a second trigger would drop a
     half-built corpus and start over, which is strictly worse than letting the
@@ -1991,10 +1998,141 @@ def full_corpus_refresh() -> dict:
     with _FULL_LOCK:
         if _FULL["status"] == "loading":
             return {"status": "loading", "note": "refresh already in progress"}
+        resident = _FULL["corpus"]
+    if if_changed:
+        verdict = _corpus_version_check(resident)
+        if not verdict["changed"]:
+            return {"status": "ready", **verdict}
     threading.Thread(
         target=_full_refresh_worker, name="full-corpus-refresh", daemon=True
     ).start()
     return {"status": "refreshing"}
+
+
+# ------------------------- daily corpus refresh -----------------------------
+# The table this app serves grows by append, and the resident copy is a snapshot
+# taken when the instance loaded it. Without a refresh, clips added after a
+# deploy stay invisible to every search and export until the next one.
+#
+# In-process rather than driven by Cloud Scheduler: Cloud Run routes a request
+# to ONE instance, and this service runs up to `max_instances`. An HTTP trigger
+# would refresh whichever instance the load balancer happened to pick and leave
+# the others serving an older version. That is worse than uniform staleness,
+# because a row position is only valid against the version it was issued from
+# (see Hit.row) -- so a `rows` handle from one instance draws a 409 on another,
+# intermittently, depending on routing. Every instance waking on its own timer
+# has no addressing problem to get wrong.
+#
+# NLS_CORPUS_REFRESH_UTC is "HH:MM" in UTC; empty disables the schedule. The
+# default is 10:00 UTC (~3am US Pacific), when a few minutes without
+# full-corpus search costs least.
+_REFRESH_AT = os.getenv("NLS_CORPUS_REFRESH_UTC", "10:00").strip()
+
+# Spread across instances so they do not all drop their corpus in the same
+# window: a refresh takes full-corpus search offline on the instance running it,
+# and simultaneous refreshes would take the service offline instead of a slice
+# of its capacity. Drawn once per process, so each instance keeps a stable time.
+_REFRESH_JITTER_S = float(os.getenv("NLS_CORPUS_REFRESH_JITTER_S", "1800"))
+
+_REFRESH: dict = {
+    "scheduled_at": "", "next_utc": "", "last_check_utc": "", "last_result": "",
+    "refreshes": 0, "skipped": 0, "table_version": None, "error": "",
+}
+
+
+def _seconds_until(hhmm: str, now: float) -> float:
+    """Seconds from `now` to the next UTC occurrence of `hhmm`.
+
+    UTC deliberately: it has no DST, so the gap between two runs is always 24h
+    and never silently 23 or 25.
+    """
+    hh, mm = (int(part) for part in hhmm.split(":", 1))
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        raise ValueError(f"not a UTC time of day: {hhmm!r}")
+    t = time.gmtime(now)
+    midnight = now - (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec)
+    target = midnight + hh * 3600 + mm * 60
+    return target - now if target > now else target + 86400 - now
+
+
+def _corpus_version_check(resident) -> dict:
+    """Has the table moved since `resident` was read? One metadata call."""
+    import full_corpus
+
+    held = getattr(resident, "dataset_version", None)
+    latest = full_corpus.latest_version()
+    _REFRESH["table_version"] = latest
+    _REFRESH["last_check_utc"] = _utc(int(time.time()))
+    # An unknown version is not evidence of sameness. Refresh rather than skip:
+    # the cost of a needless reload is minutes of one instance, the cost of a
+    # wrongly skipped one is a day of serving clips that no longer match.
+    changed = latest is None or held is None or latest != held
+    return {"changed": changed, "held_version": held, "table_version": latest}
+
+
+def _corpus_refresh_tick() -> str:
+    """One scheduled check. Reloads only if the table has actually moved."""
+    with _FULL_LOCK:
+        status, resident = _FULL["status"], _FULL["corpus"]
+    if status == "loading":
+        return "skipped: a load is already in flight"
+    if resident is None:
+        # Nothing resident to make stale. Starting a load here would be a
+        # surprise on an instance that has not been asked for one.
+        return "skipped: no corpus resident"
+    verdict = _corpus_version_check(resident)
+    if not verdict["changed"]:
+        _REFRESH["skipped"] += 1
+        return f"skipped: version {verdict['table_version']} unchanged"
+    _full_refresh_worker()  # inline: this thread has nothing else to do
+    with _FULL_LOCK:
+        after = _FULL["corpus"]
+    if after is None:
+        return f"failed: {_FULL['error']}"
+    _REFRESH["refreshes"] += 1
+    return (
+        f"reloaded {verdict['held_version']} -> {after.dataset_version} "
+        f"({after.num_rows} rows)"
+    )
+
+
+def _corpus_refresh_scheduler() -> None:
+    """Wake once a day and refresh this instance's corpus if the table moved."""
+    jitter = random.uniform(0, _REFRESH_JITTER_S)
+    while True:
+        delay = _seconds_until(_REFRESH_AT, time.time()) + jitter
+        _REFRESH["next_utc"] = _utc(int(time.time() + delay))
+        time.sleep(delay)
+        try:
+            result = _corpus_refresh_tick()
+            _REFRESH["last_result"] = result
+            _REFRESH["error"] = ""
+            LOGGER.info("daily corpus refresh: %s", result)
+        except Exception as exc:  # noqa: BLE001 -- a bad night must not end the schedule
+            _REFRESH["error"] = f"{type(exc).__name__}: {exc}"
+            _REFRESH["last_result"] = "error"
+            LOGGER.exception("daily corpus refresh failed")
+
+
+def _start_corpus_refresh_schedule() -> None:
+    """Start the daily schedule, or explain in the log why there isn't one."""
+    if not _REFRESH_AT:
+        LOGGER.info("daily corpus refresh disabled (NLS_CORPUS_REFRESH_UTC empty)")
+        return
+    try:
+        _seconds_until(_REFRESH_AT, time.time())  # validate before promising it
+    except Exception as exc:  # noqa: BLE001
+        _REFRESH["error"] = f"invalid NLS_CORPUS_REFRESH_UTC: {exc}"
+        LOGGER.error("daily corpus refresh not scheduled: %s", _REFRESH["error"])
+        return
+    _REFRESH["scheduled_at"] = f"{_REFRESH_AT} UTC"
+    threading.Thread(
+        target=_corpus_refresh_scheduler, name="corpus-refresh", daemon=True
+    ).start()
+    LOGGER.info(
+        "daily corpus refresh scheduled at %s UTC (+ up to %.0fs jitter)",
+        _REFRESH_AT, _REFRESH_JITTER_S,
+    )
 
 
 def full_corpus_module():
@@ -3184,6 +3322,9 @@ def full_corpus_status() -> dict:
         "corpus_uri": full_corpus.DEFAULT_CORPUS_TABLE_URI,
         "model": full_corpus.CORPUS_MODEL,
         "num_rows": corpus.num_rows if corpus is not None else 0,
+        "corpus_version": getattr(corpus, "dataset_version", None),
+        "loaded_utc": _utc(int(corpus.loaded_at)) if corpus is not None else "",
+        "refresh": dict(_REFRESH),
     }
     if status == "loading":
         out["elapsed_s"] = round(time.time() - started, 1)
