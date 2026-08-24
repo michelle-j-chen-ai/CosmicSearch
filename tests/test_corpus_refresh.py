@@ -1,0 +1,149 @@
+"""The daily corpus refresh: when it wakes, and when it decides to do nothing.
+
+The refresh itself (drop + reload of 34M rows) is not exercised here -- these
+cover the decisions around it, which are what a bad night would get wrong.
+"""
+
+from __future__ import annotations
+
+import calendar
+import time
+
+import pytest
+
+import web_server as ws
+
+
+def _utc_epoch(y, mo, d, h, mi, s=0) -> float:
+    return float(calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0)))
+
+
+class _Corpus:
+    def __init__(self, version, rows=10, loaded_at=0.0):
+        self.dataset_version = version
+        self.num_rows = rows
+        self.loaded_at = loaded_at
+
+
+# --------------------------------- schedule ---------------------------------
+
+@pytest.mark.parametrize(
+    "now, expected_h",
+    [
+        (_utc_epoch(2026, 8, 24, 9, 0), 1.0),    # later today
+        (_utc_epoch(2026, 8, 24, 10, 30), 23.5),  # already past: tomorrow
+        (_utc_epoch(2026, 8, 24, 23, 59), 601 / 60),  # across midnight
+    ],
+)
+def test_seconds_until_next_occurrence(now, expected_h):
+    assert ws._seconds_until("10:00", now) == pytest.approx(expected_h * 3600, abs=1)
+
+
+def test_seconds_until_is_never_zero_or_negative():
+    """Exactly on the mark must mean tomorrow, not a zero sleep spinning the
+    scheduler through repeated refreshes for a whole minute."""
+    assert ws._seconds_until("10:00", _utc_epoch(2026, 8, 24, 10, 0)) == 86400
+
+
+def test_consecutive_runs_are_24h_apart_across_a_dst_boundary():
+    """UTC has no DST, so the gap is 24h even across a US transition."""
+    before = _utc_epoch(2026, 11, 1, 5, 0)  # US DST ends 2026-11-01
+    first = before + ws._seconds_until("10:00", before)
+    second = first + ws._seconds_until("10:00", first)
+    assert second - first == 86400
+
+
+@pytest.mark.parametrize("bad", ["25:00", "10:61", "noon", "", "10"])
+def test_invalid_times_are_rejected(bad):
+    with pytest.raises(Exception):
+        ws._seconds_until(bad, time.time())
+
+
+def test_bad_config_disables_the_schedule_rather_than_crashing(monkeypatch):
+    monkeypatch.setattr(ws, "_REFRESH_AT", "half past ten")
+    started = []
+    monkeypatch.setattr(ws.threading, "Thread", lambda **kw: started.append(kw))
+    ws._start_corpus_refresh_schedule()
+    assert not started
+    assert "invalid" in ws._REFRESH["error"]
+
+
+# ------------------------------ version gate --------------------------------
+
+def test_unchanged_version_skips_the_reload(monkeypatch):
+    resident = _Corpus(version=7)
+    monkeypatch.setattr(ws, "_FULL", {"status": "ready", "corpus": resident,
+                                      "error": "", "started": 0.0})
+    monkeypatch.setitem(ws._REFRESH, "skipped", 0)
+    _no_reload(monkeypatch)
+    _table_at(monkeypatch, 7)
+    assert "unchanged" in ws._corpus_refresh_tick()
+    assert ws._REFRESH["skipped"] == 1
+
+
+def test_moved_version_triggers_the_reload(monkeypatch):
+    resident = _Corpus(version=7)
+    full = {"status": "ready", "corpus": resident, "error": "", "started": 0.0}
+    monkeypatch.setattr(ws, "_FULL", full)
+    _table_at(monkeypatch, 8)
+
+    def _reload():
+        full["corpus"] = _Corpus(version=8, rows=99)
+    monkeypatch.setattr(ws, "_full_refresh_worker", _reload)
+
+    assert ws._corpus_refresh_tick() == "reloaded 7 -> 8 (99 rows)"
+
+
+def test_unknown_version_reloads_rather_than_assuming_sameness(monkeypatch):
+    """A reader that reports no version is not evidence the table stood still."""
+    full = {"status": "ready", "corpus": _Corpus(version=None), "error": "",
+            "started": 0.0}
+    monkeypatch.setattr(ws, "_FULL", full)
+    _table_at(monkeypatch, None)
+    called = []
+    monkeypatch.setattr(ws, "_full_refresh_worker",
+                        lambda: called.append(True) or full.update(
+                            corpus=_Corpus(version=None, rows=5)))
+    ws._corpus_refresh_tick()
+    assert called
+
+
+def test_no_resident_corpus_is_left_alone(monkeypatch):
+    """Nothing is stale, and loading here would surprise an idle instance."""
+    monkeypatch.setattr(ws, "_FULL", {"status": "idle", "corpus": None,
+                                      "error": "", "started": 0.0})
+    _no_reload(monkeypatch)
+    assert ws._corpus_refresh_tick() == "skipped: no corpus resident"
+
+
+def test_a_load_in_flight_is_not_restarted(monkeypatch):
+    """Dropping a half-built corpus to start over is strictly worse than waiting."""
+    monkeypatch.setattr(ws, "_FULL", {"status": "loading", "corpus": None,
+                                      "error": "", "started": 0.0})
+    _no_reload(monkeypatch)
+    assert "already in flight" in ws._corpus_refresh_tick()
+
+
+def test_a_failed_reload_is_reported_not_counted(monkeypatch):
+    full = {"status": "error", "corpus": _Corpus(version=7), "error": "boom",
+            "started": 0.0}
+    monkeypatch.setattr(ws, "_FULL", full)
+    _table_at(monkeypatch, 8)
+    monkeypatch.setattr(ws, "_full_refresh_worker",
+                        lambda: full.update(corpus=None))
+    monkeypatch.setitem(ws._REFRESH, "refreshes", 0)
+    assert ws._corpus_refresh_tick() == "failed: boom"
+    assert ws._REFRESH["refreshes"] == 0
+
+
+# --------------------------------- helpers ----------------------------------
+
+def _table_at(monkeypatch, version):
+    import full_corpus
+    monkeypatch.setattr(full_corpus, "latest_version", lambda *a, **k: version)
+
+
+def _no_reload(monkeypatch):
+    def _boom():
+        raise AssertionError("reloaded when it should not have")
+    monkeypatch.setattr(ws, "_full_refresh_worker", _boom)
