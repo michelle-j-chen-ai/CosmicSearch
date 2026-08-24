@@ -3081,11 +3081,34 @@ def _full_export_intervals(
     rows = _interval_rows_full(intervals, corpus, req.query.strip())
     base = _export_base(req.tag or "intervals")
     parquet_uri = _write_interval_export_parquet(rows, name=base)
+    # An interval names the segment its peak clip belongs to, so the set is the
+    # distinct segments the intervals landed in -- the same registration the clip
+    # path does, over the rows this path actually produced.
+    segset_label, segset_error = "", ""
+    if req.create_segment_set:
+        segset_label, segset_error = _create_export_segment_set(
+            (r["segment_id"] for r in rows),
+            base,
+            provenance={
+                "source": "nls_search_app_full_corpus_intervals",
+                "query": req.query.strip(),
+                "embeddings_uri": corpus.corpus_uri,
+                "model_uri": _state["cfg"].model_artifact_uri,
+                "segment_set_uuid": req.segment_set_uuid,
+                "filter_lance_uri": req.filter_lance_uri,
+                "date_from": req.from_date,
+                "date_to": req.to_date,
+                "vehicle": req.vehicle,
+                "drive_id": req.drive_id,
+                "num_intervals": len(rows),
+            },
+        )
     # Same publish as the clip path: this branch returns early, so leaving it out
     # meant interval exports -- the mode the app defaults to -- never appeared in
     # Recent scans.
     _publish_full_export(
-        req, request, base, parquet_uri, "", sel, len(rows), corpus, score_kind,
+        req, request, base, parquet_uri, segset_label, sel, len(rows), corpus,
+        score_kind, segset_error=segset_error,
     )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
@@ -3096,8 +3119,7 @@ def _full_export_intervals(
         content=_interval_csv(rows),
         media_type="text/csv",
         headers=_full_export_headers(
-            base, parquet_uri, "",
-            "",
+            base, parquet_uri, segset_label, segset_error,
             sel, len(rows), score_kind, took_ms,
         ) | {"X-NLS-Interval-Threshold": f"{tau:.6f}"},
     )
