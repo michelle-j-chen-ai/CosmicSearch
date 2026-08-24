@@ -34,7 +34,16 @@ COPY gpu_corpus.py ./
 # call time rather than at build -- hence copying them explicitly.
 COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
-COPY web_server.py db.py ./
+# DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
+# image builds on a plain Cloud Build with NO internal pip index. `adp/` is
+# .gitignored (not committed) but present in the working tree and uploaded at
+# deploy. Populate it once with:  cp -r <venv>/lib/python*/site-packages/adp ./adp
+# dora_client uses only the proto stubs + raw grpc, so the public deps already in
+# requirements.lock (grpcio, protobuf, googleapis-common-protos, pyroaring)
+# suffice. /app is on sys.path, so `import adp` resolves to this vendored copy.
+COPY adp/ ./adp/
+
+COPY web_server.py db.py dora_client.py machine_auth.py ./
 COPY web ./web
 
 # Cosmos-Embed loads custom remote code via trust_remote_code; allow the HF

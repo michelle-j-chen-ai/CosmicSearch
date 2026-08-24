@@ -49,6 +49,7 @@ for _tv in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 import analytics
 import botocore.exceptions
 import db
+import dora_client
 import local_cache
 import oci_s3
 import search_engine
@@ -120,6 +121,7 @@ def _load_engine() -> None:
     threading.Thread(target=_warm_engine, name="engine-warmup", daemon=True).start()
     # Pre-warm the DORA gRPC channel + machine token now (independent of the
     # model), so the first segment-set selection doesn't pay channel/auth setup.
+    threading.Thread(target=dora_client.prewarm, name="dora-prewarm", daemon=True).start()
 
 
 def _warm_engine() -> None:
@@ -283,6 +285,57 @@ def _write_seg_cache(uuid: str, ids: frozenset[str]) -> None:
         tmp.replace(path)  # atomic publish so readers never see a partial file
     except OSError as exc:  # disk cache is best-effort; never fail the load
         LOGGER.warning("could not write segment-set disk cache for %s: %s", uuid, exc)
+
+
+def _segment_ids(uuid: str) -> "frozenset[str] | None":
+    """The set's segment_ids if resident, else None while a loader runs.
+
+    Fetched in the BACKGROUND and never inline: a large Data Explorer set is
+    millions of ids over thousands of gRPC pages, and a search must not block on
+    it. The caller runs unfiltered and the UI re-polls; by the time the user has
+    composed a query the ids are usually already here.
+    """
+    with _SEG_LOCK:
+        rec = _SEG.get(uuid)
+        if rec and rec["status"] == "done":
+            return rec["ids"]
+        if rec and rec["status"] == "loading":
+            return None
+        _SEG[uuid] = {"status": "loading", "ids": None, "count": 0, "err": None}
+
+    def _progress(n: int) -> None:
+        with _SEG_LOCK:
+            cur = _SEG.get(uuid)
+            if cur and cur["status"] == "loading":
+                cur["count"] = n
+
+    def _load() -> None:
+        try:
+            ids = _read_seg_cache(uuid)
+            if ids is None:
+                ids = dora_client.fetch_segment_ids(uuid, progress=_progress)
+                _write_seg_cache(uuid, ids)
+            rec = {"status": "done", "ids": ids, "count": len(ids), "err": None}
+        except Exception as exc:  # noqa: BLE001 -- a background loader must not die silently
+            LOGGER.warning("segment-set load failed for %s: %s", uuid, exc)
+            rec = {"status": "error", "ids": None, "count": 0, "err": str(exc)}
+        with _SEG_LOCK:
+            _SEG[uuid] = rec
+        LOGGER.info("segment-set %s -> %s (%d ids)", uuid, rec["status"], rec["count"])
+
+    threading.Thread(target=_load, name=f"segload-{uuid[:8]}", daemon=True).start()
+    return None
+
+
+def _seg_state(uuid: str) -> dict:
+    with _SEG_LOCK:
+        rec = _SEG.get(uuid) or {"status": "idle", "count": 0, "err": None}
+    return {
+        "status": rec["status"],
+        "count": rec["count"],
+        "ready": rec["status"] == "done",
+        "error": rec.get("err"),
+    }
 
 
 # Set cardinality of a bitmap-path segment set, cached for status/UI display
@@ -532,6 +585,8 @@ class ConfigExportRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     filter_lance_uri: str | None = None
+    segment_set_uuid: str | None = None
+    create_segment_set: bool = False
     filter_lance_uri: str | None = None
     # Vehicle-id filter: comma/space-separated ids matched against the corpus
     # vehicle column (inert if the corpus has none). AND'd with the other filters.
@@ -565,6 +620,8 @@ class CurateExportRequest(BaseModel):
     rows: list[CurateRow] = []
     embeddings_uri: str | None = None
     filter_lance_uri: str | None = None
+    segment_set_uuid: str | None = None
+    create_segment_set: bool = False
     from_date: str | None = None
     to_date: str | None = None
 
@@ -732,6 +789,44 @@ _UPLOAD_MAX_FRAMES = 16
 _UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg is tiny)
 
 
+@app.get("/api/segment_sets")
+def segment_sets(name_filter: str = "") -> list[dict]:
+    """Data Explorer sets whose name matches, for the downsample picker."""
+    if not name_filter.strip():
+        return []
+    try:
+        sets = dora_client.list_segment_sets(name_filter.strip())
+    except dora_client.DoraUnavailable as exc:
+        raise HTTPException(503, str(exc))
+    return [
+        {
+            "name": s.name,
+            "version": s.version,
+            "uuid": s.dataset_uuid,
+            "num_segments": s.num_segments,
+            "label": s.label(),
+        }
+        for s in sets[:200]
+    ]
+
+
+@app.get("/api/segment_set_prefetch")
+def segment_set_prefetch(uuid: str) -> dict:
+    """Start the background id-load without running a search.
+
+    Called the moment a set is picked, so the DORA pull overlaps the user
+    composing their query and the first filtered search does not have to re-run.
+    """
+    _segment_ids(uuid)  # idempotent: starts a loader only if not cached/loading
+    return _seg_state(uuid)
+
+
+@app.get("/api/segment_set_status")
+def segment_set_status(uuid: str) -> dict:
+    """Whether a set's ids are resident yet (ready / loading / error)."""
+    return _seg_state(uuid)
+
+
 @app.get("/api/video")
 def video(uri: str) -> RedirectResponse:
     try:
@@ -893,6 +988,7 @@ class SaveVectorRequest(BaseModel):
     from_date: str | None = None
     to_date: str | None = None
     filter_lance_uri: str | None = None
+    segment_set_uuid: str | None = None
     filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
@@ -1218,9 +1314,22 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
     base = _export_base("config_export")
     parquet_uri = _write_config_export_parquet(rows, name=base)
 
-    # Data Explorer registration is gone with the DORA dependency; exports
-    # are the parquet and the CSV, and the Recent scans row points at them.
     segset_label, segset_error = "", ""
+    if req.create_segment_set:
+        segset_label, segset_error = _create_export_segment_set(
+            (h.segment_id for _, h in rows),
+            base,
+            provenance={
+                "source": "nls_search_app",
+                "queries": sorted({q for q, _ in rows}),
+                "embeddings_uri": uri,
+                "model_uri": model_uri,
+                "segment_set_uuid": req.segment_set_uuid,
+                "filter_lance_uri": req.filter_lance_uri,
+                "date_from": req.from_date,
+                "date_to": req.to_date,
+            },
+        )
 
     # "saved" == every query's vector is in exp-db: any new insert succeeded, or
     # there were no new encodes (all reused -> already persisted).
@@ -1331,9 +1440,22 @@ def curate_export(req: CurateExportRequest, request: Request) -> Response:
     base = _export_base("curate")
     parquet_uri = _write_config_export_parquet(rows, name=base)
 
-    # Data Explorer registration is gone with the DORA dependency; exports
-    # are the parquet and the CSV, and the Recent scans row points at them.
     segset_label, segset_error = "", ""
+    if req.create_segment_set:
+        segset_label, segset_error = _create_export_segment_set(
+            (h.segment_id for _, h in rows),
+            base,
+            provenance={
+                "source": "nls_search_app",
+                "queries": sorted({q for q, _ in rows}),
+                "embeddings_uri": _state["active_uri"],
+                "model_uri": _state["cfg"].model_artifact_uri,
+                "segment_set_uuid": req.segment_set_uuid,
+                "filter_lance_uri": req.filter_lance_uri,
+                "date_from": req.from_date,
+                "date_to": req.to_date,
+            },
+        )
 
     return Response(
         content=csv_text,
@@ -2120,6 +2242,8 @@ class FullExportRequest(BaseModel):
     vehicle: str | None = None
     drive_id: str | None = None
     filter_lance_uri: str | None = None
+    segment_set_uuid: str | None = None
+    create_segment_set: bool = False
 
 
 class CalibrateRequest(BaseModel):
@@ -2145,6 +2269,7 @@ class CalibrateRequest(BaseModel):
     vehicle: str | None = None
     drive_id: str | None = None
     filter_lance_uri: str | None = None
+    segment_set_uuid: str | None = None
 
 
 class FullSearchRequest(BaseModel):
@@ -2211,13 +2336,41 @@ def _full_filters(req) -> dict:
         getattr(req, "from_date", None), getattr(req, "to_date", None), corpus
     )
     return _merge_filters(
-        {
-            "vehicles": set(_parse_vehicles(getattr(req, "vehicle", None))) or None,
-            "run_uuids": set(_parse_drive_ids(getattr(req, "drive_id", None))) or None,
-            "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-        },
+        _merge_filters(
+            {
+                "vehicles": set(_parse_vehicles(getattr(req, "vehicle", None))) or None,
+                "run_uuids": set(_parse_drive_ids(getattr(req, "drive_id", None))) or None,
+                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
+            },
+            _segment_set_filter(getattr(req, "segment_set_uuid", None)),
+        ),
         _full_lance_filter(getattr(req, "filter_lance_uri", None)),
     )
+
+
+def _segment_set_filter(uuid: "str | None") -> dict:
+    """Filter kwargs restricting the corpus to a Data Explorer segment set.
+
+    A set whose ids are still loading raises 503 rather than returning no filter.
+    Running unfiltered would answer a narrower question than the one asked, in the
+    same wording and with no indication that the set was ignored -- the caller
+    should retry once ``/api/segment_set_status`` reports ready.
+    """
+    if not uuid or not uuid.strip():
+        return {}
+    uuid = uuid.strip()
+    ids = _segment_ids(uuid)
+    if ids is None:
+        state = _seg_state(uuid)
+        if state["status"] == "error":
+            raise HTTPException(502, f"segment set could not be read: {state['error']}")
+        raise HTTPException(
+            503,
+            f"segment set still loading ({state['count']:,} ids so far); retry shortly",
+        )
+    if not ids:
+        raise HTTPException(400, "segment set is empty")
+    return {"segment_ids": frozenset(ids)}
 
 
 def _query_vector(query: str, uri: str, model_uri: str, corpus):
@@ -2441,6 +2594,8 @@ class RetrieveRequest(BaseModel):
     vehicle: str | None = None
     drive_id: str | None = None
     filter_lance_uri: str | None = None
+    segment_set_uuid: str | None = None
+    create_segment_set: bool = False
     # Marks do two jobs: downvoted rows are excluded from the results, and with
     # `refine_from_marks` they also build the query direction (Rocchio). Both,
     # because moving the vector away from a rejection is not the same as
@@ -2858,9 +3013,24 @@ def _full_export_write(
 
     base = _export_base(req.tag or query)
     parquet_uri = _write_arrow_export(table, base)
-    # Data Explorer registration is gone with the DORA dependency; exports
-    # are the parquet and the CSV, and the Recent scans row points at them.
     segset_label, segset_error = "", ""
+    if req.create_segment_set:
+        segset_label, segset_error = _create_export_segment_set(
+            table.column("segment_id").to_pylist(),
+            base,
+            provenance={
+                "source": "nls_search_app_full_corpus",
+                "query": query,
+                "embeddings_uri": corpus.corpus_uri,
+                "model_uri": _state["cfg"].model_artifact_uri,
+                "segment_set_uuid": req.segment_set_uuid,
+                "filter_lance_uri": req.filter_lance_uri,
+                "date_from": req.from_date,
+                "date_to": req.to_date,
+                "vehicle": req.vehicle,
+                "drive_id": req.drive_id,
+            },
+        )
     took_ms = round((time.perf_counter() - t0) * 1000, 1)
     LOGGER.info(
         "full export %r -> %d rows (%s, %s) over %d rows in %.1fms",
@@ -3014,6 +3184,39 @@ def _arrow_csv(table) -> str:
     return ",".join(table.column_names) + "\n" + sink.getvalue().decode()
 
 
+# A set this large is a symptom (a threshold far too low), and DORA's
+# CreateDataSet hangs rather than refusing it -- so report instead of registering.
+_SEGSET_MAX_SEGMENTS = int(os.getenv("NLS_SEGSET_MAX_SEGMENTS", "500000"))
+
+
+def _create_export_segment_set(seg_ids, name: str, *, provenance: dict) -> tuple[str, str]:
+    """Register the exported segments as a DORA dataset. Returns ``(label, error)``.
+
+    Best-effort by construction: a DORA failure comes back in the error string and
+    is logged, never raised, so a Data Explorer outage cannot fail the export the
+    user actually asked for.
+    """
+    ids = sorted({s for s in seg_ids if s})
+    if not ids:
+        return "", "no segments to register"
+    if len(ids) > _SEGSET_MAX_SEGMENTS:
+        return "", (
+            f"not registered: {len(ids):,} segments exceeds "
+            f"{_SEGSET_MAX_SEGMENTS:,} cap (raise the threshold or lower k)"
+        )
+    meta = {k: v for k, v in provenance.items() if v not in (None, "", [])}
+    meta["num_segments"] = len(ids)
+    try:
+        uuid_str, version = dora_client.create_dataset(name, ids, custom_metadata=meta)
+    except Exception as exc:  # noqa: BLE001 -- see the docstring: never fail the export
+        LOGGER.warning(
+            "export segment-set create failed (%s): %s", type(exc).__name__, exc,
+            exc_info=True,
+        )
+        return "", f"{type(exc).__name__}: {exc}"
+    return f"{uuid_str} v{version} ({len(ids)} segs)", ""
+
+
 def _write_arrow_export(table, name: str) -> str:
     """Write an export table as parquet under the OCI export prefix. Returns the
     URI, or "" if export is unconfigured or the upload fails (best-effort, so a
@@ -3114,13 +3317,14 @@ def _publish_full_export(
                 "lance_uri": parquet_uri,
                 "console_url": "",
                 "status": "SUCCEEDED",
-                "register_segset": False,
+                "register_segset": bool(getattr(req, "create_segment_set", False)),
                 "segset_name": segset_label,
                 "filters": {
                     "date_from": req.from_date,
                     "date_to": req.to_date,
                     "vehicle": req.vehicle,
                     "drive_id": req.drive_id,
+                    "segment_set_uuid": req.segment_set_uuid,
                     "filter_lance_uri": req.filter_lance_uri,
                 },
                 "source": "app",
@@ -3137,8 +3341,12 @@ def _publish_full_export(
                     "score_kind": score_kind,
                 },
             )
+        # The DX column reads segset_uuid/label off the row, so record either the
+        # set that was created or the reason there isn't one.
         if segset_error:
             db.set_scan_segset(base, "", segset_error)
+        elif segset_label:
+            db.set_scan_segset(base, segset_label.split()[0], segset_label)
     except Exception as exc:  # noqa: BLE001 - never fail a completed download
         LOGGER.warning("full export not published to Recent scans: %s", exc)
 

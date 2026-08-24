@@ -36,6 +36,8 @@ const state = {
   sweepSample: [],           // active-learning batch from /api/threshold_search
   rendered: [],              // clips currently in the grid (for vote lookup)
   // saved searches
+  searchSegUuid: null, searchSegName: null,
+  exportSegUuid: null, exportSegName: null,
   savedRows: [], selected: new Set(),
   scanJobs: [],
   cutoffMode: "threshold",
@@ -75,6 +77,7 @@ function applyCorpus(c) {
   // The pill reported the resident browse corpus even while searches ran against
   // the full one, so it read as though the app only held ~2M clips. Correct it
   // whenever full-corpus mode is the active path.
+  wireDxCombo();
   refreshCorpusPill();
   if ($("embeddings-uri")) $("embeddings-uri").value = c.embeddings_uri || "";
   if ($("model-uri") && c.model_uri !== undefined) $("model-uri").value = c.model_uri || "";
@@ -207,6 +210,18 @@ function toggleSearchFilters() {
 // Data Explorer segment-set combobox: type -> live DORA search -> dropdown -> pick.
 // A factory so both the Search filter and the Saved-searches (export) filter get
 // the same type-ahead dropdown, each writing to its own state.
+function wireDxCombo() {
+  _makeDxCombo({
+    inputId: "sf-dxset", comboId: "sf-dxset-combo", menuId: "sf-dxset-menu", noteId: "sf-dxset-note",
+    onClear: () => { state.searchSegUuid = null; state.searchSegName = null; },
+    onChoose: (s) => { state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`; if (state.query) reload({ page: 0 }); },
+  });
+  _makeDxCombo({
+    inputId: "ex-dxset", comboId: "ex-dxset-combo", menuId: "ex-dxset-menu", noteId: "ex-dxset-note",
+    onClear: () => { state.exportSegUuid = null; state.exportSegName = null; },
+    onChoose: (s) => { state.exportSegUuid = s.uuid; state.exportSegName = `${s.name} v${s.version}`; },
+  });
+}
 function _makeDxCombo(cfg) {
   const inp = $(cfg.inputId), combo = $(cfg.comboId), menu = $(cfg.menuId), note = $(cfg.noteId);
   if (!inp) return;
@@ -259,6 +274,7 @@ function _searchFilters() {
     filter_lance_uri: _splitList($("sf-lance").value),
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
+    segment_set_uuid: state.searchSegUuid,
     embeddings_uri: state.embeddingsUri,
   };
 }
@@ -1010,8 +1026,8 @@ function renderTable() {
     </tr>`;
   }).join("");
   let html = body;
-  if (!body) html = `<tr><td colspan="7" style="color:var(--muted-2)">${all.length ? "No saved searches for this model / filter — pick another model above." : "No saved searches yet — run a search and Save."}</td></tr>`;
-  if (hidden > 0 && modelSel !== "__all__") html += `<tr><td colspan="7" style="color:var(--muted-2);font-size:12px;">${hidden} search${hidden === 1 ? "" : "es"} from other models hidden — choose “All models” above to see them.</td></tr>`;
+  if (!body) html = `<tr><td colspan="8" style="color:var(--muted-2)">${all.length ? "No saved searches for this model / filter — pick another model above." : "No saved searches yet — run a search and Save."}</td></tr>`;
+  if (hidden > 0 && modelSel !== "__all__") html += `<tr><td colspan="8" style="color:var(--muted-2);font-size:12px;">${hidden} search${hidden === 1 ? "" : "es"} from other models hidden — choose “All models” above to see them.</td></tr>`;
   $("tbody").innerHTML = html;
 }
 async function resumeSession(id) {
@@ -1028,6 +1044,8 @@ async function resumeSession(id) {
   if (s.from_date) $("sf-dateFrom").value = s.from_date;
   if (s.to_date) $("sf-dateTo").value = s.to_date;
   $("sf-lance").value = s.filter_lance_uri || ""; $("sf-vehicle").value = s.vehicle || ""; $("sf-drive").value = s.drive_id || "";
+  state.searchSegUuid = s.segment_set_uuid || null; state.searchSegName = s.segment_set_name || null;
+  if ($("sf-dxset")) $("sf-dxset").value = s.segment_set_name || "";
   if (s.segment_set_uuid) fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.segment_set_uuid)).catch(() => {});
   state.resumeVec = s.vector; state.resumeLabel = s.query || ""; state.mode = "resume";
   updateRail();
@@ -1137,6 +1155,7 @@ function _exportFilters() {
   return {
     from_date: $("ex-dateFrom").value || null, to_date: $("ex-dateTo").value || null,
     filter_lance_uri: _splitList($("ex-lance").value), vehicle: _splitList($("ex-vehicle").value), drive_id: _splitList($("ex-drive").value),
+    segment_set_uuid: state.exportSegUuid, segment_set_name: state.exportSegName,
   };
 }
 function _exportFilename(resp, fb) { const n = resp.headers.get("X-NLS-Export-Name") || ""; return n ? n + ".csv" : fb; }
@@ -1177,6 +1196,7 @@ async function fullExport() {
         vehicle: filters.vehicle, drive_id: filters.drive_id,
         segment_set_uuid: filters.segment_set_uuid,
         filter_lance_uri: filters.filter_lance_uri,
+        create_segment_set: !!$("segsetInput") && $("segsetInput").checked,
       };
       if (topk) body.k = kForRow(e) || 50;
       else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
@@ -1227,7 +1247,7 @@ async function loadScanJobs(live) {
   clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
-    body.innerHTML = `<tr><td colspan="7" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
   }
   // The list is a pure DB read server-side (never blocks on Lilypad/DORA/OCI); live=1
   // (Reload) forces the server's background refresher to kick. The timeout is a belt --
@@ -1244,7 +1264,7 @@ async function loadScanJobs(live) {
   } catch (e) {
     console.error("loadScanJobs failed", e);
     const msg = e.name === "AbortError" ? "timed out" : e.message;
-    if (body) body.innerHTML = `<tr><td colspan="7" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(msg)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(msg)}</td></tr>`;
     return;
   } finally { clearTimeout(timer); }
   renderScans();
@@ -1261,7 +1281,7 @@ function renderScans() {
     // One malformed row must not blank the whole archive -- this panel is the
     // only place some artifacts are discoverable.
     console.error("renderScans failed", e);
-    $("scansBody").innerHTML = `<tr><td colspan="7" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
+    $("scansBody").innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 function _renderScans() {
@@ -1292,6 +1312,11 @@ function _renderScans() {
     const dl = isParquet
       ? `<a class="scan-copy" href="/api/export_file?uri=${encodeURIComponent(j.lance_uri)}" title="Download this parquet">download</a>`
       : "";
+    // Data Explorer: the registered set, or why there isn't one. "pending" only
+    // appears for a row that asked for registration and hasn't reported back.
+    let dx = `<span class="scan-dx none">—</span>`;
+    if (j.segset_label) dx = `<span class="scan-dx">${escapeHtml(j.segset_label)}</span>`;
+    else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
     const out = j.lance_uri
       ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(_uriShort(j.lance_uri))}</span>`
         + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}</div>`
@@ -1304,8 +1329,8 @@ function _renderScans() {
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
       <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}${truncNote}</td>
       <td>${out}</td>
-      </tr>`;
-  }).join("") : `<tr><td colspan="7" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
+      <td>${dx}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
 }
 // Result counts (total segments + per-tag breakdown), mirroring the Data Explorer view.
 function _fmtScanCounts(c, status) {

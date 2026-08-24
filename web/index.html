@@ -133,6 +133,13 @@
           <div class="field"><label>Date to</label><input type="date" id="sf-dateTo"></div>
           <div class="field"><label>Vehicle ID</label><input id="sf-vehicle" placeholder="e.g. truck-808, truck-810"></div>
           <div class="field"><label>Drive ID (run_uuid)</label><input id="sf-drive" placeholder="e.g. 019eb27f-…"></div>
+          <div class="field"><label>Data Explorer segment set</label>
+            <div class="combo" id="sf-dxset-combo">
+              <input id="sf-dxset" autocomplete="off" placeholder="type a keyword to search sets…">
+              <div class="combo-menu hidden" id="sf-dxset-menu" role="listbox"></div>
+            </div>
+            <div class="hint" id="sf-dxset-note"></div>
+          </div>
           <div class="field"><label>Lance dataset downsample</label><input id="sf-lance" placeholder="s3://…/seg_map.parquet"><div class="hint" id="sf-lance-note">preview only this downsample while browsing</div></div>
         </div>
         <button class="rail-btn primary" style="width:auto; padding:9px 22px; margin-top:14px;" id="applyFiltersBtn">Apply — update view</button>
@@ -225,6 +232,13 @@
         <div class="field"><label>Date to</label><input type="date" id="ex-dateTo"><div class="hint">blank = full corpus</div></div>
         <div class="field"><label>Vehicle ID</label><input id="ex-vehicle" placeholder="e.g. truck-808, truck-810"></div>
         <div class="field"><label>Drive ID (run_uuid)</label><input id="ex-drive" placeholder="e.g. 019eb27f-…"></div>
+        <div class="field"><label>Data Explorer segment set (superset)</label>
+          <div class="combo" id="ex-dxset-combo">
+            <input id="ex-dxset" autocomplete="off" placeholder="type a keyword to search sets…">
+            <div class="combo-menu hidden" id="ex-dxset-menu" role="listbox"></div>
+          </div>
+          <div class="hint" id="ex-dxset-note">keeps only chunks whose segment_id is in this dataset</div>
+        </div>
         <div class="field"><label>Lance dataset downsample</label><input id="ex-lance" placeholder="s3://…/seg_map.parquet"><div class="hint">segment cross-ref — keeps only chunks present in this downsample</div></div>
       </div>
     </div>
@@ -262,6 +276,10 @@
         <label class="switch" id="dedupSwitch"><input type="checkbox" id="dedupInput" checked><span class="slider-toggle"></span></label>
       </div>
       <div class="toggle-row">
+        <div><div class="toggle-label">Register as Data Explorer segment set</div><div class="toggle-sub">Makes the export browsable and cross-referenceable in DX</div></div>
+        <label class="switch"><input type="checkbox" id="segsetInput" checked><span class="slider-toggle"></span></label>
+      </div>
+      <div class="toggle-row">
         <div><div class="toggle-label">Exact scores</div><div class="toggle-sub">Re-scores the exported rows against the original 768-d embeddings instead of the quantized screen. Adds an S3 read, ~3s per 10,000 rows; refused if projected past 5 minutes.</div></div>
         <label class="switch"><input type="checkbox" id="exactInput"><span class="slider-toggle"></span></label>
       </div>
@@ -280,7 +298,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Launched</th><th>Scan</th><th>Tags (@threshold)</th><th>Filters</th><th>Status</th><th>Results</th><th>Output (parquet / segments.lance)</th></tr></thead>
+          <thead><tr><th>Launched</th><th>Scan</th><th>Tags (@threshold)</th><th>Filters</th><th>Status</th><th>Results</th><th>Output (parquet / segments.lance)</th><th>Data Explorer (segment set)</th></tr></thead>
           <tbody id="scansBody"></tbody>
         </table>
       </div>
