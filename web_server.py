@@ -509,63 +509,6 @@ class Mark(BaseModel):
     score: float | None = None
 
 
-class ExportRequest(BaseModel):
-    query: str
-    k: int = 100
-    tag: str = ""
-    from_date: str | None = None
-    to_date: str | None = None
-    filter_lance_uri: str | None = None
-    filter_lance_uri: str | None = None
-    # Vehicle-id filter: comma/space-separated ids matched against the corpus
-    # vehicle column (inert if the corpus has none). AND'd with the other filters.
-    vehicle: str | None = None
-    # Drive-id (run_uuid) filter: comma/space-separated; keeps only those drives.
-    drive_id: str | None = None
-    embeddings_uri: str | None = None
-    marks: list[Mark] = []
-    # When true, collapse the ranking to one row per segment_id -- the best (highest-scoring)
-    # clip per 30s source segment -- before taking the top-k. Inert when the corpus has no
-    # segment_id (clips without one are kept as-is, never merged).
-    dedupe_segment: bool = False
-    # When true, also register the exported top-k segments as a DORA segment set
-    # Interval mode: instead of one row per fixed 8s mini-segment, project the
-    # per-clip scores onto the 4s stride grid, threshold, merge contiguous cells
-    # per drive, and export variable-length interpolated intervals (CSV+parquet
-    # only; segment-set registration is not yet supported for intervals).
-    interval: bool = False
-    # "k": threshold = the k-th largest grid-cell score (uses ``k`` above).
-    # "score": threshold = ``interval_score``.
-    interval_mode: str = "k"
-    interval_score: float | None = None
-
-
-class WindowSearchRequest(BaseModel):
-    """Search by an example video window already embedded in the corpus.
-
-    The user names a drive (``run_uuid``) or 30s source segment (``segment_id``)
-    and an optional [start_ns, end_ns] window; the matching pre-embedded chunks
-    are mean-pooled into the query vector. Carries the same date / segment-set /
-    vehicle / drive filters as the other search endpoints.
-    """
-
-    run_uuid: str = ""
-    segment_id: str = ""
-    start_ns: int = 0  # window start, unix nanoseconds (0 = open on this side)
-    end_ns: int = 0  # window end, unix nanoseconds (0 = open on this side)
-    query: str = ""  # optional label for search history
-    page: int = 0
-    page_size: int = 24
-    start_rank: int | None = None
-    start_score: float | None = None
-    from_date: str | None = None
-    to_date: str | None = None
-    filter_lance_uri: str | None = None
-    vehicle: str | None = None
-    drive_id: str | None = None
-    embeddings_uri: str | None = None
-
-
 class ConfigQuery(BaseModel):
     query: str
     k: int = 100
@@ -785,116 +728,6 @@ def search_session(session_id: int) -> dict:
 # resamples to the model's fixed 8 either way). Bounds the request + decode work.
 _UPLOAD_MAX_FRAMES = 16
 _UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg is tiny)
-class UploadEncodeRequest(BaseModel):
-    """A user-supplied image OR video (decoded to frames) to encode into the corpus's
-    video/text space. The client sends base64 frames (data-URL prefix tolerated) as
-    JSON -- no python-multipart dependency, and for video only the extracted frames
-    travel, never the whole file. Provide ``frames_b64`` (image: 1 frame; video: the
-    browser-extracted frames from a duration-capped window) or the legacy single
-    ``image_b64``."""
-
-    frames_b64: list[str] = []
-    image_b64: str = ""  # legacy single-image convenience
-    filename: str = ""
-    content_type: str = ""
-
-
-@app.post("/api/search_by_upload")
-def search_by_upload(req: UploadEncodeRequest) -> dict:
-    """Encode a dragged-and-dropped image or short video into the joint space and
-    return its query vector. The client then ranks with it via /api/search_by_vector,
-    so paging, refine, save, and offline-scan export all work on the uploaded vector
-    unchanged -- an uploaded example is just another query vector (video-to-video
-    retrieval, the corpus's own modality). Returns {vector, dim, label, n_frames}."""
-    _require_ready()
-    if not _state.get("model_ready"):
-        raise HTTPException(503, "model still loading; try again in a moment")
-    raw = list(req.frames_b64) if req.frames_b64 else ([req.image_b64] if req.image_b64 else [])
-    if not raw:
-        raise HTTPException(400, "no frames provided")
-    if len(raw) > _UPLOAD_MAX_FRAMES:
-        raise HTTPException(413, f"too many frames ({len(raw)} > {_UPLOAD_MAX_FRAMES})")
-    frames: list[bytes] = []
-    for f in raw:
-        b64 = f.split(",", 1)[-1]  # tolerate a data-URL prefix
-        try:
-            data = base64.b64decode(b64, validate=False)
-        except (ValueError, binascii.Error):
-            raise HTTPException(400, "invalid base64 frame data")
-        if not data:
-            raise HTTPException(400, "empty frame")
-        if len(data) > _UPLOAD_MAX_FRAME_BYTES:
-            raise HTTPException(413, "a frame is too large (max 8MB each)")
-        frames.append(data)
-    try:
-        vec = search_engine.encode_frames_list(
-            frames, _state["processor"], _state["model"], _state["cfg"].device
-        )
-    except ModuleNotFoundError as exc:  # Pillow absent in the serving image
-        raise HTTPException(501, f"image decoding unavailable on this deployment: {exc}")
-    except Exception as exc:  # noqa: BLE001 -- surface any decode/encode failure cleanly
-        raise HTTPException(400, f"could not encode upload: {type(exc).__name__}: {exc}")
-    LOGGER.info("encoded upload %r (%d frames) -> %d-d query vector",
-                req.filename, len(frames), len(vec))
-    return {"vector": [float(x) for x in vec], "dim": len(vec),
-            "label": (req.filename or "uploaded example"), "n_frames": len(frames)}
-
-
-@app.post("/api/search_by_window")
-def search_by_window(req: WindowSearchRequest) -> dict:
-    """Search by an example video window (query-by-example over the whole corpus).
-
-    Resolve the mini-segment chunks already embedded for the given drive/segment
-    and time window, mean-pool their ORIGINAL embeddings into a query vector,
-    then rank the full corpus. The pooling reads the matched clips' 768-d vectors
-    from S3 -- a handful of rows -- because the resident screen is quantized and
-    PCA-reduced and cannot reconstruct a usable query direction.
-    """
-    if not req.run_uuid.strip() and not req.segment_id.strip():
-        raise HTTPException(400, "provide a run_uuid or segment_id for the query window")
-    if not _state.get("model_ready"):
-        raise HTTPException(503, "model still loading")
-    corpus = _require_full_corpus()
-    # UI works in unix nanoseconds (like the result timestamps); the corpus
-    # chunk bounds are unix seconds. 0 leaves that side of the window open.
-    start_s = int(req.start_ns) // 1_000_000_000 if req.start_ns else 0
-    end_s = int(req.end_ns) // 1_000_000_000 if req.end_ns else 0
-    try:
-        rows = corpus.window_rows(
-            run_uuid=req.run_uuid, segment_id=req.segment_id,
-            start_unix=start_s, end_unix=end_s,
-        )
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    if rows.size == 0:
-        key = req.run_uuid.strip() or req.segment_id.strip()
-        raise HTTPException(404, f"no embedded clips for {key!r} in that window")
-    try:
-        mat = corpus.vectors_for(rows[:_WINDOW_MAX_POOL])
-    except RuntimeError as exc:
-        raise HTTPException(409, str(exc))
-    pooled = mat.mean(axis=0)
-    norm = float(np.linalg.norm(pooled))
-    if norm == 0.0:
-        raise HTTPException(422, "the window's embeddings cancelled to a zero vector")
-    vec = (pooled / norm).astype(np.float32)
-
-    out = _full_rank(corpus, vec, req, label=req.run_uuid.strip() or req.segment_id.strip())
-    # Filmstrip preview of the clips the query was pooled from.
-    preview = corpus.to_arrow(rows[:12], np.zeros(min(12, rows.size))).to_pydict()
-    out["query_clips"] = [
-        {
-            "chunk_id": preview["chunk_id"][i],
-            "run_uuid": preview["run_uuid"][i],
-            "segment_id": preview["segment_id"][i],
-            "start_timestamp_ns": preview["start_timestamp_ns"][i],
-            "end_timestamp_ns": preview["end_timestamp_ns"][i],
-            "source_media_uri": preview["source_media_uri"][i],
-        }
-        for i in range(len(preview["chunk_id"]))
-    ]
-    out["query_clip_count"] = int(rows.size)
-    return out
 
 
 @app.get("/api/video")
@@ -1245,40 +1078,6 @@ def _score_histogram(scores: np.ndarray, tau: float | None, bins: int = 50) -> d
         "tau": (round(float(tau), 6) if tau is not None else None),
         "above_tau": (int(np.count_nonzero(finite >= tau)) if tau is not None else None),
     }
-
-
-@app.post("/api/score_distribution")
-def score_distribution(req: ExportRequest, request: Request) -> dict:
-    """Similarity-score histogram across the entire corpus for the current query,
-    INDEPENDENT of interval preview/export. Marks the interval threshold tau the
-    current mode/k/cutoff would produce, so it doubles as a threshold picker."""
-    if not _state.get("model_ready"):
-        raise HTTPException(503, "model still loading")
-    corpus = _require_full_corpus()
-    vec = search_engine.encode_query(
-        req.query.strip(), _state["processor"], _state["model"], _state["cfg"].device
-    )
-    scores, err = corpus.score(vec)
-    mask = corpus.filter_mask(**_full_filters(req))
-    allowed = mask if mask is not None else np.ones(corpus.num_rows, dtype=bool)
-    mode = "score" if req.interval_mode == "score" else "k"
-    if mode == "score":
-        tau = float(req.interval_score or 0.0)
-    else:
-        # k-th best score among the rows that passed the filters -- the cutoff a
-        # top-k export would use, which is what makes this a threshold picker.
-        sub = scores[allowed]
-        k = max(1, min(int(req.k), int(sub.size)))
-        tau = float(np.partition(sub, sub.size - k)[sub.size - k]) if sub.size else 0.0
-    dist = _score_histogram(scores, tau)
-    if dist is None:
-        raise HTTPException(400, "no finite scores to summarize")
-    dist["mode"] = mode
-    dist["score_kind"] = "bounded_approx"
-    dist["score_error_bound"] = round(float(err), 4)
-    dist["num_rows_searched"] = corpus.num_rows
-    dist["candidates"] = int(allowed.sum())
-    return dist
 
 
 # --- learned threshold policy: cached weights per embedding space -----------
@@ -2198,55 +1997,6 @@ def full_corpus_refresh() -> dict:
     return {"status": "refreshing"}
 
 
-class FullRescoreRequest(BaseModel):
-    query: str
-    rows: list[int]
-
-
-@app.post("/api/full_rescore")
-def full_rescore(req: FullRescoreRequest) -> dict:
-    """Exact 768-d cosine for rows already returned by /api/full_search.
-
-    The search answers from a quantized, PCA-reduced screen, so its scores carry
-    a +/-eps bound and are not comparable to thresholds calibrated on the float
-    corpus. This reads the original embeddings for the rows on screen and returns
-    the real cosine.
-
-    Separate from the search because it is one S3 round trip with a ~1.65s floor
-    whatever the row count: folding it in would turn a 190ms search into nearly
-    two seconds for every caller, including those who never look at the score.
-    """
-    if not req.rows:
-        raise HTTPException(400, "rows must not be empty")
-    if len(req.rows) > 1000:
-        raise HTTPException(400, "at most 1000 rows per rescore")
-    if not _state.get("model_ready"):
-        raise HTTPException(503, "model still loading")
-    with _FULL_LOCK:
-        corpus = _FULL["corpus"]
-    if corpus is None:
-        raise HTTPException(503, "full corpus is not resident; run a search first")
-    vec = search_engine.encode_query(
-        (req.query or "").strip(), _state["processor"], _state["model"],
-        _state["cfg"].device,
-    )
-    t0 = time.perf_counter()
-    try:
-        exact = corpus.rescore(req.rows, vec)
-    except RuntimeError as exc:
-        # Raised when a row no longer resolves to the clip the search reported,
-        # i.e. the snapshot moved. Better a 409 than a confident wrong number.
-        raise HTTPException(409, str(exc))
-    took_ms = round((time.perf_counter() - t0) * 1000, 1)
-    LOGGER.info("full rescore: %d rows in %.1fms", len(exact), took_ms)
-    return {
-        "took_ms": took_ms,
-        "score_kind": "exact",
-        "source_column": full_corpus_module().vector_full_column(),
-        "scores": [{"row": r, "score": round(sc, 4)} for r, sc in exact.items()],
-    }
-
-
 def full_corpus_module():
     import full_corpus
 
@@ -2277,7 +2027,7 @@ class FullExportRequest(BaseModel):
     filter_lance_uri: str | None = None
 
 
-class FullThresholdRequest(BaseModel):
+class CalibrateRequest(BaseModel):
     """Fit a cutoff for a full-corpus query from labeled marks.
 
     Separate from `/api/threshold_search` because that one addresses marks by
@@ -2530,6 +2280,19 @@ def _full_export_selection(corpus, req: "FullExportRequest", vec) -> object:
     )
 
 
+class WindowRef(BaseModel):
+    """Footage already in the corpus, used as the query.
+
+    Its clips' original embeddings are mean-pooled into one direction, so this
+    is query-by-example without re-encoding anything.
+    """
+
+    run_uuid: str = ""
+    segment_id: str = ""
+    start_ns: int = 0
+    end_ns: int = 0
+
+
 class RetrieveRequest(BaseModel):
     """The one retrieval interface: a query, a cutoff, and how to return it.
 
@@ -2539,9 +2302,15 @@ class RetrieveRequest(BaseModel):
     attachment (plus parquet, segment set and a Recent-scans row) for export.
     """
 
-    # Query: text, or a pre-computed vector (resume / query-by-example).
+    # A vector source. Text, a saved vector, a window of footage, uploaded
+    # frames, or the marks themselves -- these are five ways to arrive at one
+    # 768-d direction, not five kinds of search, so they are inputs here rather
+    # than endpoints of their own.
     query: str = ""
     vector: list[float] | None = None
+    window: "WindowRef | None" = None
+    image_b64: str = ""
+    frames_b64: list[str] = []
 
     # Cutoff -- exactly one.
     k: int | None = None
@@ -2555,7 +2324,14 @@ class RetrieveRequest(BaseModel):
     # from membership, and a separate S3 read.
     exact: bool = False
 
-    output: str = "hits"          # "hits" (JSON page) | "csv" (file + artifacts)
+    # What to return. All four run on the same resolved vector; only the last
+    # two touch the corpus.
+    #   vector -> the query direction, encoded and nothing else
+    #   scores -> exact 768-d cosine for `rows` you already hold
+    #   hits   -> a JSON page of matches
+    #   csv    -> a file, plus parquet and a Recent scans row
+    output: str = "hits"
+    rows: list[int] = []          # output="scores" only
     page: int = 0
     limit: int = 50
     max_rows: int = 0             # threshold-mode ceiling; 0 = the global one
@@ -2589,12 +2365,37 @@ def retrieve(req: RetrieveRequest, request: Request):
     other. Now there is one `full_corpus.select` underneath and this endpoint
     chooses only how to serialize it.
     """
-    if (req.k is None) == (req.threshold is None):
+    if req.output not in ("hits", "csv", "vector", "scores"):
+        raise HTTPException(400, "output must be hits, csv, vector or scores")
+    if req.output in ("hits", "csv") and (req.k is None) == (req.threshold is None):
         raise HTTPException(400, "pass exactly one of k or threshold")
-    if req.output not in ("hits", "csv"):
-        raise HTTPException(400, "output must be 'hits' or 'csv'")
     corpus = _require_full_corpus()
     vec = _retrieve_vector(req, corpus)
+
+    if req.output == "vector":
+        # Encode and stop. Saving a refined or uploaded direction needs the
+        # vector itself, not the clips it happens to match today.
+        return {"vector": [float(x) for x in vec], "dim": int(vec.shape[0]),
+                "label": req.query or "uploaded example",
+                "n_frames": len(req.frames_b64) or (1 if req.image_b64 else 0)}
+
+    if req.output == "scores":
+        # Exact scores for clips already in hand -- sharpening a page without
+        # re-running the search that produced it.
+        if not req.rows:
+            raise HTTPException(400, "output=scores needs rows")
+        if len(req.rows) > 1000:
+            raise HTTPException(400, "at most 1000 rows per scores request")
+        t0 = time.perf_counter()
+        try:
+            exact = corpus.exact_scores(np.asarray(req.rows, dtype=np.int64), vec)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+        took = round((time.perf_counter() - t0) * 1000, 1)
+        LOGGER.info("retrieve scores: %d rows in %.1fms", len(req.rows), took)
+        return {"took_ms": took, "score_kind": "exact",
+                "scores": [{"row": int(r), "score": round(float(s), 4)}
+                           for r, s in zip(req.rows, exact)]}
     exclude = [
         int(m.row) for m in req.marks
         if m.mark == "down" and m.row is not None and 0 <= int(m.row) < corpus.num_rows
@@ -2615,6 +2416,66 @@ def retrieve(req: RetrieveRequest, request: Request):
             "num_up": ups, "num_down": len(exclude), "excluded": len(exclude),
         }
     return out
+
+
+def _window_vector(win: "WindowRef", corpus) -> np.ndarray:
+    """Mean-pool the embeddings of the clips inside a window.
+
+    The window's clips are resolved against the resident metadata, then their
+    ORIGINAL 768-d embeddings are read: the screen is quantized and PCA-reduced
+    and cannot reconstruct a direction of the quality query-by-example needs.
+    """
+    if not win.run_uuid.strip() and not win.segment_id.strip():
+        raise HTTPException(400, "window needs a run_uuid or a segment_id")
+    start_s = int(win.start_ns) // 1_000_000_000 if win.start_ns else 0
+    end_s = int(win.end_ns) // 1_000_000_000 if win.end_ns else 0
+    try:
+        rows = corpus.window_rows(
+            run_uuid=win.run_uuid, segment_id=win.segment_id,
+            start_unix=start_s, end_unix=end_s,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if rows.size == 0:
+        key = win.run_uuid.strip() or win.segment_id.strip()
+        raise HTTPException(404, f"no embedded clips for {key!r} in that window")
+    try:
+        mat = corpus.vectors_for(rows[:_WINDOW_MAX_POOL])
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    pooled = mat.mean(axis=0)
+    norm = float(np.linalg.norm(pooled))
+    if norm == 0.0:
+        raise HTTPException(422, "the window's embeddings cancelled to a zero vector")
+    return (pooled / norm).astype(np.float32)
+
+
+def _encode_upload(frames_b64: list, image_b64: str) -> np.ndarray:
+    """Encode uploaded frames into the joint space.
+
+    A single image is copied into the encoder's 8 slots, so an image query is a
+    still clip with no motion in it -- it matches appearance, not movement.
+    """
+    raw = list(frames_b64) if frames_b64 else ([image_b64] if image_b64 else [])
+    if len(raw) > _UPLOAD_MAX_FRAMES:
+        raise HTTPException(413, f"too many frames ({len(raw)} > {_UPLOAD_MAX_FRAMES})")
+    frames: list[bytes] = []
+    for f in raw:
+        try:
+            data = base64.b64decode(f.split(",", 1)[-1], validate=False)
+        except (ValueError, binascii.Error):
+            raise HTTPException(400, "invalid base64 frame data")
+        if not data:
+            raise HTTPException(400, "empty frame")
+        if len(data) > _UPLOAD_MAX_FRAME_BYTES:
+            raise HTTPException(413, "a frame is too large (max 8MB each)")
+        frames.append(data)
+    try:
+        return search_engine.encode_frames_list(
+            frames, _state["processor"], _state["model"], _state["cfg"].device
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced as a 400, not a 500
+        raise HTTPException(400, f"could not encode upload: {type(exc).__name__}: {exc}")
 
 
 def _retrieve_vector(req: "RetrieveRequest", corpus) -> np.ndarray:
@@ -2652,8 +2513,17 @@ def _retrieve_vector(req: "RetrieveRequest", corpus) -> np.ndarray:
                 400, f"vector dim {vec.shape[0]} != corpus dim {corpus.dim}"
             )
         return vec
+    if req.window is not None:
+        return _window_vector(req.window, corpus)
+    if req.image_b64 or req.frames_b64:
+        if not _state.get("model_ready"):
+            raise HTTPException(503, "model still loading")
+        return _encode_upload(req.frames_b64, req.image_b64)
     if not req.query.strip():
-        raise HTTPException(400, "provide a query or a vector")
+        raise HTTPException(
+            400, "provide one of: query, vector, window, image_b64/frames_b64, "
+            "or marks with refine_from_marks"
+        )
     if not _state.get("model_ready"):
         raise HTTPException(503, "model still loading")
     return search_engine.encode_query(
@@ -3178,10 +3048,16 @@ def _publish_full_export(
         LOGGER.warning("full export not published to Recent scans: %s", exc)
 
 
-@app.post("/api/full_threshold")
-def full_threshold(req: FullThresholdRequest, request: Request) -> dict:
-    """Fit a cutoff for a full-corpus query from labeled marks, and return the
-    next batch of boundary clips to label.
+@app.post("/api/calibrate")
+def calibrate(req: CalibrateRequest, request: Request) -> dict:
+    """What a cutoff would do, and which cutoff to use.
+
+    One endpoint rather than two: a score histogram over the whole corpus is the
+    same computation whether or not you have labels. With marks it also fits an
+    operating point and returns the next clips worth labelling; without them it
+    reports the label-free suggestion over the same distribution. Splitting that
+    into `threshold_search` and `score_distribution` meant two endpoints scoring
+    34.4M rows to produce overlapping answers.
 
     Same operating-point selection as `/api/threshold_search`, against the full
     corpus's screening scores. Marks are addressed by `row` (a position in the
