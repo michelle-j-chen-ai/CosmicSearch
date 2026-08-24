@@ -2884,15 +2884,18 @@ def _retrieve_export(req: "RetrieveRequest", request: Request, corpus, vec, excl
 
         # Delegate the artifact half to the existing writer, which already
         # handles intervals, dedupe, parquet, segment sets and publishing.
+        # Field-by-field, so a field added to one model and not the other is a
+        # test failure rather than a silently dropped request option -- which is
+        # how create_segment_set went missing between the endpoint and the writer.
         shim = FullExportRequest(
-            query=req.query or "vector", tag=req.tag, k=req.k,
-            threshold=req.threshold, max_rows=req.max_rows or 300_000,
-            exact=req.exact, interval=req.interval,
-            dedupe_segment=req.dedupe_segment,
-            from_date=req.from_date, to_date=req.to_date, vehicle=req.vehicle,
-            drive_id=req.drive_id,
-            filter_lance_uri=req.filter_lance_uri,
+            **{
+                name: getattr(req, name)
+                for name in FullExportRequest.model_fields
+                if hasattr(req, name)
+            }
         )
+        shim.query = req.query or "vector"
+        shim.max_rows = req.max_rows or 300_000
         if req.interval:
             return _full_export_intervals(
                 shim, request, corpus, sel, vec, t0, exact_scores, score_kind
