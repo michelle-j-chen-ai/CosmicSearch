@@ -145,6 +145,11 @@ def build(source_dir: Path, out_dir: Path) -> str:
     n_rows = embeddings.shape[0]
     print(f"corpus: {n_rows:,} rows x {embeddings.shape[1]} dims ({embeddings.dtype})")
 
+    # Resolve the scalar metadata before the fit: it is the cheap half, and a
+    # missing file or a row-count mismatch should not cost a full PCA pass first.
+    metadata = build_metadata(source_dir / lance_writer.METADATA_FILE, n_rows)
+    print(f"metadata: {metadata.num_rows:,} rows, columns {metadata.column_names}")
+
     worst = assert_rows_normalized(embeddings)
     print(f"rows are unit-norm (worst deviation {worst:.2e})")
 
@@ -161,10 +166,7 @@ def build(source_dir: Path, out_dir: Path) -> str:
     np.save(artifact_dir / lance_writer.SCALE_FILE, scale)
     np.save(artifact_dir / lance_writer.CORPUS_INT8_FILE, corpus_i8)
     np.save(artifact_dir / lance_writer.PRE_QUANT_FP32_FILE, projected)
-    pq.write_table(
-        build_metadata(source_dir / lance_writer.METADATA_FILE, n_rows),
-        artifact_dir / lance_writer.METADATA_FILE,
-    )
+    pq.write_table(metadata, artifact_dir / lance_writer.METADATA_FILE)
     print(f"artifacts written to {artifact_dir}")
 
     corpus_uri = str(out_dir / "corpus.lance")
