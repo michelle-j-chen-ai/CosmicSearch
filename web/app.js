@@ -309,7 +309,9 @@ async function runWindowSearch(startOpts) {
     state.windowReq = { run_uuid, segment_id, start_ns: _toNs($("vs-start").value), end_ns: _toNs($("vs-end").value), query: "video clip: " + (run_uuid || segment_id) };
   }
   state.mode = "window"; state.query = state.windowReq.query;
-  await _issue("/api/search_by_window", { ...state.windowReq, ...(startOpts || {}), ..._searchFilters() });
+  await _issueFullVector("/api/retrieve", {
+    window: state.windowReq, k: FULL_BATCH, output: "hits",
+  }, (startOpts && startOpts.page) || 0);
 }
 /* ===================== search by uploaded image (drag & drop) ===================== */
 function wireUploadSearch() {
@@ -382,9 +384,9 @@ async function handleUpload(file) {
       _uploadNote(`Encoding ${frames.length} frames sampled from ${span.toFixed(1)}s${dur > span ? ` (of ${dur.toFixed(0)}s)` : ""}…`);
       noteAfter = dur > _UPLOAD_SAMPLE_WINDOW_S ? `Sampled a ${span.toFixed(0)}s window — clips match best at ~2-4s.` : "";
     }
-    const enc = await fetch("/api/search_by_upload", {
+    const enc = await fetch("/api/retrieve", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ frames_b64, filename: file.name, content_type: file.type }),
+      body: JSON.stringify({ frames_b64, output: "vector" }),
     }).then((r) => r.ok ? r.json() : r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); }));
     // The uploaded example is now just a query vector -> reuse the resume path so
     // paging, refine, sweep, save, and offline-scan export all work unchanged.
@@ -584,9 +586,9 @@ async function rescoreVisible() {
   if (!rows.length) return;
   let data;
   try {
-    data = await fetch("/api/full_rescore", {
+    data = await fetch("/api/retrieve", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: state.query, rows }),
+      body: JSON.stringify({ query: state.query, rows, output: "scores" }),
     }).then((r) => (r.ok ? r.json() : null));
   } catch (e) { return; }
   if (!data || !data.scores) return;
@@ -803,7 +805,10 @@ async function refreshSweep() {
   const f = _searchFilters();
   try {
     const [dist, thr] = await Promise.all([
-      fetch("/api/score_distribution", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, k: 2000, ...f, interval_mode: "k", interval_score: null }) }).then((r) => r.ok ? r.json() : null),
+      // The histogram comes back from /api/calibrate itself; a second call to a
+      // separate distribution endpoint scored the same 34.4M rows for the same
+      // answer.
+      Promise.resolve(null),
       fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
     ]);
     const hist = (dist && dist.edges) ? dist : (thr && thr.histogram) ? thr.histogram : null;
@@ -1145,7 +1150,7 @@ function doExport() {
 // full-corpus one by `row` -- and sending full-corpus marks to the resident
 // endpoint silently drops every label, which reads as "no labels yet".
 function _thresholdEndpoint() {
-  return _fullCorpusOn() ? "/api/full_threshold" : "/api/threshold_search";
+  return "/api/calibrate";
 }
 
 // Export straight from the resident 34M-row corpus. This is the online
