@@ -1103,12 +1103,86 @@ def scans(limit: int = 50, live: bool = False) -> dict:
     return {"jobs": jobs, "refreshing": refreshing}
 
 
-@app.get("/api/export_file")
-def export_file(uri: str) -> RedirectResponse:
-    """Presigned GET for an export parquet, restricted to the export prefix."""
+def _export_artifact_key(uri: str) -> str:
+    """The object key for an export artifact, or 404 if it is not one.
+
+    Both the download and the preview take a URI from the client, so both must
+    refuse anything outside the export prefix rather than presigning or reading
+    an arbitrary object on the caller's behalf.
+    """
     prefix = _state["cfg"].export_s3_prefix.strip().rstrip("/")
     if not prefix or not uri.startswith(prefix + "/"):
         raise HTTPException(404, "not an export artifact")
+    return uri
+
+
+# Rows returned by a preview. Enough to see what the export contains and to spot
+# an obviously wrong cutoff; not so many that the panel becomes a second grid.
+_PREVIEW_MAX_ROWS = 100
+
+
+@app.get("/api/export_preview")
+def export_preview(uri: str, limit: int = 25) -> dict:
+    """First rows of an export parquet, for the Recent scans preview.
+
+    Reads through pyarrow's S3 filesystem rather than downloading the object:
+    parquet is seekable, so this fetches the footer and one row group instead of
+    a file that can run to millions of rows.
+    """
+    import pyarrow.fs as pafs
+    import pyarrow.parquet as pq
+
+    key = _export_artifact_key(uri)
+    limit = max(1, min(int(limit), _PREVIEW_MAX_ROWS))
+    bucket, path = oci_s3.parse_s3_uri(key)
+    endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+    try:
+        fs = pafs.S3FileSystem(
+            access_key=os.environ.get("AWS_ACCESS_KEY_ID"),
+            secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            endpoint_override=endpoint,
+            region=os.environ.get("AWS_REGION") or "us-phoenix-1",
+            scheme="https",
+        )
+        with fs.open_input_file(f"{bucket}/{path}") as fh:
+            pf = pq.ParquetFile(fh)
+            total = pf.metadata.num_rows
+            table = next(pf.iter_batches(batch_size=limit))
+    except StopIteration:
+        return {"columns": [], "rows": [], "num_rows": 0, "total_rows": 0, "uri": uri}
+    except Exception as exc:  # noqa: BLE001 -- a preview must not 500 the panel
+        LOGGER.warning("export preview failed for %s (%s): %s", uri, type(exc).__name__, exc)
+        raise HTTPException(502, f"could not read the export: {type(exc).__name__}: {exc}")
+    cols = table.schema.names
+    rows = [
+        {c: _preview_cell(v) for c, v in zip(cols, vals)}
+        for vals in zip(*[table.column(c).to_pylist() for c in cols])
+    ]
+    return {
+        "columns": cols,
+        "rows": rows,
+        "num_rows": len(rows),
+        "total_rows": int(total),
+        "uri": uri,
+    }
+
+
+def _preview_cell(value):
+    """JSON-safe, display-ready cell. Timestamps stay raw -- the client renders
+    them, and a preview that reformats them would not match the file."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", "replace")
+    if isinstance(value, float):
+        return round(value, 6)
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
+@app.get("/api/export_file")
+def export_file(uri: str) -> RedirectResponse:
+    """Presigned GET for an export parquet, restricted to the export prefix."""
+    uri = _export_artifact_key(uri)
     try:
         url = oci_s3.presign_get(uri, _state["s3"], _state["cfg"].presign_ttl_s)
     except (ValueError, botocore.exceptions.ClientError) as exc:

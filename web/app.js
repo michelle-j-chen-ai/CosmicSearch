@@ -139,7 +139,9 @@ function wireEvents() {
 
   $("saveOpenBtn").onclick = openSaveDrawer;
   $("drawerClose").onclick = closeDrawer;
-  $("overlay").onclick = closeDrawer;
+  $("overlay").onclick = () => { closeDrawer(); closePreview(); };
+  $("previewClose").onclick = closePreview;
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePreview(); });
   $("finalSaveBtn").onclick = finalSave;
 
   $("savedReload").onclick = loadSaved;
@@ -1312,6 +1314,12 @@ function _renderScans() {
     const dl = isParquet
       ? `<a class="scan-copy" href="/api/export_file?uri=${encodeURIComponent(j.lance_uri)}" title="Download this parquet">download</a>`
       : "";
+    // Preview reads the parquet's first row group server-side, so it works for
+    // an export of any size. A Lilypad segments.lance is a directory, not a
+    // single object, so it gets no preview for the same reason it gets no download.
+    const pv = isParquet
+      ? `<button class="scan-copy" data-preview="${escapeHtml(j.lance_uri)}" title="Show the first rows of this export">preview</button>`
+      : "";
     // Data Explorer: the registered set, or why there isn't one. "pending" only
     // appears for a row that asked for registration and hasn't reported back.
     let dx = `<span class="scan-dx none">—</span>`;
@@ -1319,7 +1327,7 @@ function _renderScans() {
     else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
     const out = j.lance_uri
       ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(_uriShort(j.lance_uri))}</span>`
-        + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}</div>`
+        + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}${pv}</div>`
       : "—";
     return `<tr>
       <td class="scan-time">${escapeHtml(j.created_at || "")}</td>
@@ -1344,16 +1352,68 @@ function _fmtScanCounts(c, status) {
   return `<div class="scan-counts-box"><div class="ct-total"><b>${total}</b> segments${clips}</div>`
     + (rows ? `<div class="ct-list" title="${unit} per tag">${rows}</div>` : "") + `</div>`;
 }
-// Copy a scan's full output Lance URI (delegated so it survives re-renders).
+// Copy an output path, or open a preview of it (delegated so both survive
+// re-renders of the scans table).
 document.addEventListener("click", (e) => {
   const btn = e.target.closest(".scan-copy");
   if (!btn) return;
+  if (btn.dataset.preview) { openPreview(btn.dataset.preview); return; }
   const uri = btn.dataset.uri || "";
+  if (!uri) return;
   navigator.clipboard.writeText(uri).then(
     () => showToast("Copied output path"),
     () => showToast("Copy failed — select the path manually"),
   );
 });
+
+/* ===================== export preview ===================== */
+const PREVIEW_ROWS = 25;
+// Columns worth right-aligning: scores and counts read as columns of numbers,
+// ids and uris do not.
+const _PREVIEW_NUM = /^(rank|score|peak_score|mean_score|duration_s|num_chunks|.*_unix|.*_ns)$/;
+
+function closePreview() {
+  $("previewModal").classList.remove("open");
+  $("overlay").classList.remove("open");
+}
+
+async function openPreview(uri) {
+  const body = $("previewBody"), note = $("previewNote");
+  $("previewUri").textContent = uri;
+  $("previewTitle").textContent = "Export preview";
+  body.innerHTML = `<div class="preview-note">Reading the export…</div>`;
+  note.textContent = "";
+  $("overlay").classList.add("open");
+  $("previewModal").classList.add("open");
+  try {
+    const r = await fetch(`/api/export_preview?uri=${encodeURIComponent(uri)}&limit=${PREVIEW_ROWS}`);
+    if (!r.ok) {
+      let d; try { d = (await r.json()).detail; } catch (_e) { }
+      throw new Error(d || `HTTP ${r.status}`);
+    }
+    const d = await r.json();
+    if (!d.rows.length) { body.innerHTML = `<div class="preview-note">This export has no rows.</div>`; return; }
+    const head = d.columns.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+    const rows = d.rows.map((row) => {
+      const tds = d.columns.map((c) => {
+        const v = row[c];
+        const cls = _PREVIEW_NUM.test(c) ? ' class="num"' : "";
+        // The clip is the point of the row -- link it rather than printing a
+        // path nobody can act on.
+        if (c === "source_media_uri" && v) {
+          return `<td><a href="/api/video?uri=${encodeURIComponent(v)}" target="_blank" rel="noopener" title="${escapeHtml(v)}">▶ clip</a></td>`;
+        }
+        return `<td${cls} title="${escapeHtml(String(v ?? ""))}">${escapeHtml(String(v ?? ""))}</td>`;
+      }).join("");
+      return `<tr>${tds}</tr>`;
+    }).join("");
+    body.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+    note.innerHTML = `Showing ${d.num_rows} of ${fmtInt(d.total_rows)} rows · `
+      + `<a href="/api/export_file?uri=${encodeURIComponent(uri)}">download the full parquet</a>`;
+  } catch (err) {
+    body.innerHTML = `<div class="preview-note" style="color:var(--neg)">Could not preview this export: ${escapeHtml(err.message)}</div>`;
+  }
+}
 function _fmtScanFilters(f) {
   if (!f) return "—"; const p = [];
   if (f.from_date || f.to_date) p.push(`${f.from_date || "…"}→${f.to_date || "latest"}`);
