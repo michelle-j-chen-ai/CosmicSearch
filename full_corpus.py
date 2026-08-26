@@ -198,9 +198,13 @@ def _dictionary_codes(column: object) -> tuple[np.ndarray, list]:
     import pyarrow as pa
     import pyarrow.compute as pc
 
-    encoded = pc.dictionary_encode(column.combine_chunks())
+    # Encode the CHUNKED column: combining first materializes every raw string
+    # in one array, and a 32-bit offset array caps that at 2GiB -- which
+    # run_uuid reaches as the corpus grows. Encoding chunk-wise and combining
+    # afterwards concatenates indices against a unified (small) dictionary.
+    encoded = pc.dictionary_encode(column)
     if isinstance(encoded, pa.ChunkedArray):
-        encoded = encoded.combine_chunks()
+        encoded = encoded.unify_dictionaries().combine_chunks()
     codes = encoded.indices.to_numpy(zero_copy_only=False)
     codes = np.where(np.isnan(codes.astype(np.float64)), -1, codes).astype(np.int32) \
         if codes.dtype.kind == "f" else codes.astype(np.int32)
@@ -1044,6 +1048,8 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     `scan_in_order=True` keeps the screen matrix and the metadata arrays on the
     same canonical row order, so a position in one indexes the other.
     """
+    import pyarrow as pa
+
     so = oci_s3.lance_storage_options()
     ds = lance.dataset(DEFAULT_CORPUS_TABLE_URI, storage_options=so)
     i8_col = embedding_column(model)
@@ -1121,7 +1127,13 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
         .combine_chunks().to_numpy(zero_copy_only=False).astype(np.int64),
         "dx_internal_id": meta_table.column("dx_internal_id")
         .combine_chunks().fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64),
-        "segment_id": meta_table.column("segment_id").combine_chunks(),
+        # large_string (64-bit offsets) before combining: at 34M rows the
+        # segment_ids exceed the 2GiB a 32-bit offset array can address, and
+        # concatenating them raised ArrowInvalid mid-load -- the whole corpus
+        # failed to open because one metadata column outgrew its index width.
+        "segment_id": meta_table.column("segment_id")
+        .cast(pa.large_string())
+        .combine_chunks(),
     }
     del meta_table
     LOGGER.info("full corpus metadata: %d vehicles, %d runs, %d dates",
