@@ -13,7 +13,6 @@ const escapeHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
 
 const state = {
   platform: null,
-  offlineScan: true,
   corpus: null,
   embeddingsUri: null,
   query: "",
@@ -29,8 +28,6 @@ const state = {
   resumeVec: null,
   resumeLabel: "",
   // filters resolved from the search-page panel + the saved-searches (export) panel
-  searchSegUuid: null, searchSegName: null,
-  exportSegUuid: null, exportSegName: null,
   // threshold
   tempTau: null, confirmedTau: null, suggestedTau: null,
   tauUserSet: false,         // true once the user drags/confirms τ (then labels stop moving it)
@@ -39,6 +36,8 @@ const state = {
   sweepSample: [],           // active-learning batch from /api/threshold_search
   rendered: [],              // clips currently in the grid (for vote lookup)
   // saved searches
+  searchSegUuid: null, searchSegName: null,
+  exportSegUuid: null, exportSegName: null,
   savedRows: [], selected: new Set(),
   scanJobs: [],
   cutoffMode: "threshold",
@@ -59,11 +58,14 @@ async function loadPlatform() {
   try {
     const p = await fetch("/api/platform").then((r) => r.json());
     state.platform = p;
-    state.offlineScan = !p || p.offline_scan !== false;
     const tag = $("brandTag");
     if (p && p.label) { tag.textContent = p.label; tag.className = "tag " + (p.name === "trucks" ? "trucking" : "cars"); }
   } catch (e) { /* cosmetic */ }
-  $("scansSection").style.display = state.offlineScan ? "block" : "none";
+  // The scan list is an archive of past runs and their output artifacts, so it
+  // shows regardless of whether new scans can still be launched. Gating it on
+  // `offline_scan` hid every historical parquet/segments.lance the moment the
+  // launcher was turned off.
+  $("scansSection").style.display = "block";
   renderExportPanel();
 }
 
@@ -72,6 +74,11 @@ function applyCorpus(c) {
   state.embeddingsUri = c.embeddings_uri;
   state.scoreHi = 0.4;
   $("corpusPill").innerHTML = `🗂 <b>${fmtInt(c.num_rows)} clips</b> · ${escapeHtml(c.model || "model")}`;
+  // The pill reported the resident browse corpus even while searches ran against
+  // the full one, so it read as though the app only held ~2M clips. Correct it
+  // whenever full-corpus mode is the active path.
+  wireDxCombo();
+  refreshCorpusPill();
   if ($("embeddings-uri")) $("embeddings-uri").value = c.embeddings_uri || "";
   if ($("model-uri") && c.model_uri !== undefined) $("model-uri").value = c.model_uri || "";
   // Search filters track the LOADED (in-app browse) corpus -- you're searching it, so
@@ -102,7 +109,6 @@ function wireEvents() {
   $("navSearch").onclick = () => setPage("search");
   $("navSaved").onclick = () => setPage("saved");
   $("settingsGear").onclick = () => $("settingsPop").classList.toggle("hidden");
-  $("load-corpus").onclick = loadCorpus;
   $("load-model").onclick = loadModel;
 
   const go = () => runSearch();
@@ -116,7 +122,7 @@ function wireEvents() {
 
   $("filtersChip").onclick = toggleSearchFilters;
   $("applyFiltersBtn").onclick = applySearchFilters;
-  wireDxCombo();
+  wireFullCorpusToggles();
 
   $("pagePrev").onclick = () => reload({ page: state.page - 1 });
   $("pageNext").onclick = () => reload({ page: state.page + 1 });
@@ -133,7 +139,9 @@ function wireEvents() {
 
   $("saveOpenBtn").onclick = openSaveDrawer;
   $("drawerClose").onclick = closeDrawer;
-  $("overlay").onclick = closeDrawer;
+  $("overlay").onclick = () => { closeDrawer(); closePreview(); };
+  $("previewClose").onclick = closePreview;
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePreview(); });
   $("finalSaveBtn").onclick = finalSave;
 
   $("savedReload").onclick = loadSaved;
@@ -170,21 +178,20 @@ function setPage(which) {
     // particular, a render error must not prevent the Recent scans list from loading.
     try { renderTable(); } catch (e) { console.error("renderTable failed", e); }
     try { renderExportPanel(); } catch (e) { console.error("renderExportPanel failed", e); }
-    if (state.offlineScan) loadScanJobs();
+    loadScanJobs();
   }
 }
 
+// Reports the pinned corpus; there is nothing to switch to. The server rejects
+// a `uri` that is not the pinned one, so offering the choice here would only
+// produce an error the user cannot act on.
 async function loadCorpus() {
-  const uri = $("embeddings-uri").value.trim();
-  if (!uri) return;
-  setNote("corpus-note", "loading corpus (downloading + into memory)…");
-  $("corpusPill").textContent = "loading corpus…";
   try {
-    const c = await fetch("/api/corpus?uri=" + encodeURIComponent(uri)).then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
+    const c = await fetch("/api/corpus").then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
     applyCorpus(c);
-    state.query = ""; state.marks = {}; $("resultsGrid").innerHTML = "";
-    setNote("corpus-note", `Loaded ${fmtInt(c.num_rows)} clips · segment_id ${c.has_segment_id ? "present ✓" : "absent"}`);
-  } catch (e) { setNote("corpus-note", "failed to load corpus: " + e.message, true); $("corpusPill").textContent = "corpus unavailable"; }
+    $("embeddings-uri").value = c.embeddings_uri || "";
+    setNote("corpus-note", `${fmtInt(c.num_rows)} clips · segment_id ${c.has_segment_id ? "present ✓" : "absent"}`);
+  } catch (e) { setNote("corpus-note", "corpus unavailable: " + e.message, true); $("corpusPill").textContent = "corpus unavailable"; }
 }
 async function loadModel() {
   const uri = $("model-uri").value.trim();
@@ -205,6 +212,18 @@ function toggleSearchFilters() {
 // Data Explorer segment-set combobox: type -> live DORA search -> dropdown -> pick.
 // A factory so both the Search filter and the Saved-searches (export) filter get
 // the same type-ahead dropdown, each writing to its own state.
+function wireDxCombo() {
+  _makeDxCombo({
+    inputId: "sf-dxset", comboId: "sf-dxset-combo", menuId: "sf-dxset-menu", noteId: "sf-dxset-note",
+    onClear: () => { state.searchSegUuid = null; state.searchSegName = null; },
+    onChoose: (s) => { state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`; if (state.query) reload({ page: 0 }); },
+  });
+  _makeDxCombo({
+    inputId: "ex-dxset", comboId: "ex-dxset-combo", menuId: "ex-dxset-menu", noteId: "ex-dxset-note",
+    onClear: () => { state.exportSegUuid = null; state.exportSegName = null; },
+    onChoose: (s) => { state.exportSegUuid = s.uuid; state.exportSegName = `${s.name} v${s.version}`; },
+  });
+}
 function _makeDxCombo(cfg) {
   const inp = $(cfg.inputId), combo = $(cfg.comboId), menu = $(cfg.menuId), note = $(cfg.noteId);
   if (!inp) return;
@@ -241,18 +260,6 @@ function _makeDxCombo(cfg) {
   inp.addEventListener("focus", () => { if (items.length && inp.value.trim().length >= 2 && !combo.classList.contains("chosen")) show(); });
   inp.addEventListener("blur", () => setTimeout(hide, 150));
 }
-function wireDxCombo() {
-  _makeDxCombo({
-    inputId: "sf-dxset", comboId: "sf-dxset-combo", menuId: "sf-dxset-menu", noteId: "sf-dxset-note",
-    onClear: () => { state.searchSegUuid = null; state.searchSegName = null; },
-    onChoose: (s) => { state.searchSegUuid = s.uuid; state.searchSegName = `${s.name} v${s.version}`; if (state.query) reload({ page: 0 }); },
-  });
-  _makeDxCombo({
-    inputId: "ex-dxset", comboId: "ex-dxset-combo", menuId: "ex-dxset-menu", noteId: "ex-dxset-note",
-    onClear: () => { state.exportSegUuid = null; state.exportSegName = null; },
-    onChoose: (s) => { state.exportSegUuid = s.uuid; state.exportSegName = `${s.name} v${s.version}`; },
-  });
-}
 
 function applySearchFilters() {
   $("filtersChip").classList.add("active");
@@ -266,10 +273,10 @@ function _searchFilters() {
     page_size: state.pageSize,
     from_date: $("sf-dateFrom").value || null,
     to_date: $("sf-dateTo").value || null,
-    segment_set_uuid: state.searchSegUuid,
     filter_lance_uri: _splitList($("sf-lance").value),
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
+    segment_set_uuid: state.searchSegUuid,
     embeddings_uri: state.embeddingsUri,
   };
 }
@@ -281,14 +288,31 @@ async function runSearch(startOpts) {
   if (!q) { showToast("Type a query first"); return; }
   $("searchInput2").value = q;
   state.query = q; state.mode = "search";
+  // Full-corpus mode ranks all ~34M clips instead of the loaded corpus. It is a
+  // different endpoint because that corpus is loaded on demand and has no paging
+  // or refine; the response envelope is identical, so the grid is unchanged.
+  if (_fullCorpusOn()) {
+    const page = (startOpts && startOpts.page) || 0;
+    // Same query and filters as the buffer we already hold -> page locally.
+    if (state.fullBuf && state.fullBuf.key === _fullKey(q)) { _renderFullPage(page); return; }
+    await _issueFullCorpus(q, page);
+    return;
+  }
   await _issue("/api/search", { query: q, ...(startOpts || {}), ..._searchFilters() });
 }
 async function runRefine(startOpts) {
   if (!state.query) return;
-  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, segment_id: m.segment_id, mark: m.mark, index: m.index, rank: m.rank, score: m.score }));
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, segment_id: m.segment_id, mark: m.mark, index: m.index, row: m.row, rank: m.rank, score: m.score }));
   if (!marks.some((m) => m.mark === "up")) { showToast("Mark at least one 👍 to re-rank"); return; }
   state.mode = "refine";
   showToast(`Re-ranking with ${marks.filter((m) => m.mark === "up").length} 👍 / ${marks.filter((m) => m.mark === "down").length} 👎…`);
+  if (_fullCorpusOn()) {
+    await _issueFullVector("/api/retrieve", {
+      query: state.query, marks, k: FULL_BATCH, output: "hits",
+      negative_weight: 0.5, text_weight: 0.3, refine_from_marks: true,
+    }, (startOpts && startOpts.page) || 0);
+    return;
+  }
   await _issue("/api/refine", { query: state.query, marks, negative_weight: 0.5, text_weight: 0.3, ...(startOpts || {}), ..._searchFilters() });
 }
 function _toNs(raw) {
@@ -303,7 +327,9 @@ async function runWindowSearch(startOpts) {
     state.windowReq = { run_uuid, segment_id, start_ns: _toNs($("vs-start").value), end_ns: _toNs($("vs-end").value), query: "video clip: " + (run_uuid || segment_id) };
   }
   state.mode = "window"; state.query = state.windowReq.query;
-  await _issue("/api/search_by_window", { ...state.windowReq, ...(startOpts || {}), ..._searchFilters() });
+  await _issueFullVector("/api/retrieve", {
+    window: state.windowReq, k: FULL_BATCH, output: "hits",
+  }, (startOpts && startOpts.page) || 0);
 }
 /* ===================== search by uploaded image (drag & drop) ===================== */
 function wireUploadSearch() {
@@ -376,9 +402,9 @@ async function handleUpload(file) {
       _uploadNote(`Encoding ${frames.length} frames sampled from ${span.toFixed(1)}s${dur > span ? ` (of ${dur.toFixed(0)}s)` : ""}…`);
       noteAfter = dur > _UPLOAD_SAMPLE_WINDOW_S ? `Sampled a ${span.toFixed(0)}s window — clips match best at ~2-4s.` : "";
     }
-    const enc = await fetch("/api/search_by_upload", {
+    const enc = await fetch("/api/retrieve", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ frames_b64, filename: file.name, content_type: file.type }),
+      body: JSON.stringify({ frames_b64, output: "vector" }),
     }).then((r) => r.ok ? r.json() : r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); }));
     // The uploaded example is now just a query vector -> reuse the resume path so
     // paging, refine, sweep, save, and offline-scan export all work unchanged.
@@ -394,6 +420,17 @@ async function handleUpload(file) {
 async function runVectorSearch(startOpts) {
   if (!state.resumeVec) return;
   state.mode = "resume";
+  // Resuming a saved search must cover the same corpus a fresh search does.
+  // Falling through to /api/search_by_vector ranked the reloaded tag over the
+  // 2M resident corpus while the identical text query covered 34M -- same UI,
+  // same wording, quietly different corpus.
+  if (_fullCorpusOn()) {
+    await _issueFullVector("/api/retrieve", {
+      vector: state.resumeVec, query: state.resumeLabel || state.query || "",
+      k: FULL_BATCH, output: "hits",
+    }, (startOpts && startOpts.page) || 0);
+    return;
+  }
   await _issue("/api/search_by_vector", { vector: state.resumeVec, query: state.resumeLabel || state.query || "", ...(startOpts || {}), ..._searchFilters() });
 }
 function reload(startOpts) {
@@ -403,6 +440,200 @@ function reload(startOpts) {
   return runSearch(startOpts);
 }
 
+// Show the corpus the next search will actually use, not the resident one.
+async function refreshCorpusPill() {
+  let st = null;
+  try { st = await fetch("/api/full_corpus_status").then((r) => r.json()); } catch (e) { return; }
+  if (!st) return;
+  const model = (state.corpus && state.corpus.model) || st.model || "model";
+  if (st.status === "ready" && st.num_rows) {
+    $("corpusPill").innerHTML = `🗂 <b>${fmtInt(st.num_rows)} clips</b> · full corpus · ${escapeHtml(model)}`;
+  } else if (st.status === "loading") {
+    $("corpusPill").innerHTML = `🗂 <b>full corpus loading…</b> ${Math.round(st.elapsed_s || 0)}s · ${escapeHtml(model)}`;
+    setTimeout(refreshCorpusPill, 10000);
+  } else if (st.status === "error") {
+    $("corpusPill").innerHTML = `🗂 <b>full corpus failed</b> · ${escapeHtml(model)}`;
+  }
+}
+
+// Search always covers the whole corpus. There is no toggle: offering the ~2M
+// resident subset as a choice meant users could silently search 6% of the data
+// and read the result as complete.
+function _fullCorpusOn() { return true; }
+function wireFullCorpusToggles() { refreshCorpusPill(); }
+// The corpus is read and decoded on first use (minutes, ~12GB), so the server
+// answers 503 until it is resident. Kick the load, show progress, and poll
+// rather than leaving the grid on "Searching...". Returns false if it failed.
+async function _ensureFullCorpus() {
+  $("emptyState").style.display = "none";
+  $("resultsState").style.display = "block";
+  const status = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+  if (status && status.status === "ready") return true;
+  await fetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
+  $("gridStatus").textContent =
+    "Loading the full corpus (first use, a few minutes) — this search will start automatically.";
+  for (let i = 0; i < 60; i++) {
+    await new Promise((res) => setTimeout(res, 10000));
+    const s = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+    if (!s) continue;
+    if (s.status === "error") { $("gridStatus").textContent = "Full corpus failed to load: " + s.error; return false; }
+    if (s.status === "ready") return true;
+    $("gridStatus").textContent = `Loading the full corpus… ${Math.round(s.elapsed_s || 0)}s`;
+  }
+  $("gridStatus").textContent = "Full corpus did not finish loading — try again.";
+  return false;
+}
+
+async function _issueFullCorpus(q, page) {
+  if (!(await _ensureFullCorpus())) return;
+  await _fullFetch("/api/retrieve", { query: q, k: FULL_BATCH, output: "hits" }, page, _fullKey(q));
+}
+
+// The filter half of every full-corpus request body, so text search, resume,
+// upload and refine cannot drift apart on which filters they apply.
+function _fullFilterBody() {
+  return {
+    page: 0,
+    limit: FULL_BATCH,
+    from_date: $("sf-dateFrom").value || null,
+    to_date: $("sf-dateTo").value || null,
+    vehicle: _splitList($("sf-vehicle").value),
+    drive_id: _splitList($("sf-drive").value),
+    filter_lance_uri: _splitList($("sf-lance") ? $("sf-lance").value : ""),
+  };
+}
+
+// Fetch one batch and page through it locally. A page is a slice of scores that
+// are already in memory server-side, so re-requesting per page would be a fresh
+// 34M-row scan for results we already hold. One batch also means the exact-score
+// round trip can cover every page in a single fetch.
+async function _fullFetch(endpoint, extra, page, key) {
+  $("gridStatus").textContent = "Searching all clips…";
+  let data;
+  try {
+    data = await fetch(endpoint, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ..._fullFilterBody(), ...extra }),
+    }).then((r) => {
+      if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); });
+      return r.json();
+    });
+  } catch (e) {
+    $("gridStatus").textContent = "Search failed: " + e.message;
+    return;
+  }
+  state.fullBuf = { key, data, hits: data.hits || [] };
+  _renderFullPage(page || 0);
+}
+
+// Resume / upload / refine: same corpus, same filters, same envelope as a text
+// search. Keyed so a different vector or a different mark set never reuses the
+// previous buffer.
+async function _issueFullVector(endpoint, extra, page) {
+  if (!(await _ensureFullCorpus())) return;
+  const key = [endpoint, _fullKey(state.query || ""), JSON.stringify(extra.marks || extra.vector || "").length,
+               JSON.stringify(extra.marks || "")].join("|");
+  await _fullFetch(endpoint, extra, page, key);
+}
+
+// One request covers this many results; the pager slices them client-side.
+const FULL_BATCH = 200;
+
+function _fullKey(q) {
+  return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
+          $("sf-vehicle").value, $("sf-drive").value,
+          $("sf-lance") ? $("sf-lance").value : ""].join("|");
+}
+
+function _renderFullPage(page) {
+  const buf = state.fullBuf;
+  const ps = state.pageSize || 24;
+  const pages = Math.max(1, Math.ceil(buf.hits.length / ps));
+  state.page = Math.min(Math.max(0, page), pages - 1);
+  state.hits = buf.hits.slice(state.page * ps, (state.page + 1) * ps);
+  state.total = buf.hits.length;
+  state.label = buf.data.label || state.query;
+  state.scoreHi = buf.data.score_hi || 0.4;
+  $("vectorChip").textContent = `vector: text "${state.query}"`;
+  // State plainly what was searched and what the filters did. "full corpus" is
+  // otherwise an unverifiable claim, and a filter that silently matched nothing
+  // is indistinguishable from a filter that was never applied -- which is the
+  // failure that went unnoticed for a week.
+  const d = buf.data;
+  const f = d.filters_applied || {};
+  const active = Object.entries(f).filter(([, v]) => v && v.length).map(([k, v]) => `${k}=${v}`);
+  const filtLine = active.length
+    ? ` · filters ${active.join(", ")} narrowed to ${fmtInt(d.candidates_after_filters)}`
+    : " · no filters";
+  $("resultCountText").textContent = buf.hits.length
+    ? `searched ALL ${fmtInt(d.num_rows_searched)} clips in ${d.elapsed_ms} ms${filtLine}`
+      + ` · showing top ${fmtInt(buf.hits.length)}`
+      // Exact scores carry no error bound; printing one next to them would be
+      // stating an uncertainty that no longer applies.
+      + (d.score_kind === "exact"
+          ? ` · similarity ${d.score_lo}–${d.score_hi} (exact)`
+          : ` · similarity ${d.score_lo}–${d.score_hi} ±${d.score_error_bound} (approximate)`)
+    : `searched ALL ${fmtInt(d.num_rows_searched)} clips${filtLine} · nothing matched`;
+  const prov = d.corpus_loaded_utc
+    ? `corpus ${String(d.corpus_uri || "").split("/").slice(-2).join("/")}`
+      + (d.corpus_version != null ? ` v${d.corpus_version}` : "")
+      + ` · ${fmtInt(d.num_rows_searched)} rows · loaded ${d.corpus_loaded_utc}`
+    : "";
+  $("gridStatus").textContent = buf.hits.length ? prov : "Try widening the date range or filters. " + prov;
+  renderQueryStrip(buf.data);
+  renderGrid();
+  renderPager();
+  rescoreVisible();
+}
+
+// The page renders from quantized scores, which are bounded but not comparable
+// to thresholds calibrated on the float corpus. Fetch the real 768-d cosine for
+// the rows on screen and swap them in. Fired after render, never awaited: it is
+// one S3 round trip with a ~1.65s floor, so blocking on it would undo the 190ms
+// search for a number the user has not looked at yet.
+async function rescoreVisible() {
+  const buf = state.fullBuf;
+  if (!buf || !buf.hits || !buf.hits.length || !state.query) return;
+  // Already sharpened this result set -- paging must not refetch or re-sort.
+  if (buf.exact) return;
+  // Rescore the WHOLE buffer, not the visible page. Two reasons: the ranking has
+  // to be global or page 2 can hold a clip that outranks page 1 and never moves,
+  // and the round trip has a ~1.65s floor regardless of row count, so doing it
+  // per page pays that cost again for every page.
+  const rows = buf.hits.map((h) => h.row).filter((r) => r != null && r >= 0);
+  if (!rows.length) return;
+  let data;
+  try {
+    data = await fetch("/api/retrieve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: state.query, rows, output: "scores" }),
+    }).then((r) => (r.ok ? r.json() : null));
+  } catch (e) { return; }
+  if (!data || !data.scores) return;
+  const byRow = new Map(data.scores.map((s) => [s.row, s.score]));
+  let changed = 0;
+  for (const h of buf.hits) {
+    const exact = byRow.get(h.row);
+    if (exact != null && exact !== h.score) { h.score = exact; changed++; }
+    if (exact != null) h.score_kind = "exact";
+  }
+  buf.exact = true;
+  if (!changed) return;
+  // Exact scores can reorder rows that sat within the error bound of each other.
+  buf.hits.sort((a, b) => b.score - a.score);
+  // Renumber. `rank` came from the screening pass; leaving it alone after a
+  // re-sort is what showed ranks 1, 19, 5, 2 down the grid -- correct ordering
+  // labelled with the ordering it replaced.
+  buf.hits.forEach((h, i) => { h.rank = i + 1; });
+  const d = buf.data;
+  if (d) {
+    const sc = buf.hits.map((h) => h.score);
+    d.score_lo = Math.round(Math.min(...sc) * 1e4) / 1e4;
+    d.score_hi = Math.round(Math.max(...sc) * 1e4) / 1e4;
+    d.score_kind = "exact";
+  }
+  _renderFullPage(state.page || 0);
+}
 async function _issue(endpoint, body) {
   const seq = ++_issueSeq;
   $("emptyState").style.display = "none";
@@ -507,7 +738,7 @@ function vote(chunkId, dir) {
   const h = (state.rendered || []).find((x) => x.chunk_id === chunkId) || state.hits.find((x) => x.chunk_id === chunkId); if (!h) return;
   const cur = state.marks[chunkId];
   if (cur && cur.mark === dir) delete state.marks[chunkId];
-  else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, rank: h.rank, score: h.score };
+  else state.marks[chunkId] = { mark: dir, segment_id: h.segment_id, index: h.index, row: h.row, rank: h.rank, score: h.score };
   // Toggle ONLY the clicked card in place — never re-render the whole grid (that
   // would reload every video on every click).
   const m = state.marks[chunkId];
@@ -528,10 +759,10 @@ let _fitTimer = null;
 function scheduleFit() { clearTimeout(_fitTimer); _fitTimer = setTimeout(fitOnly, 500); }
 async function fitOnly() {
   if (!state.sweepActive) return;
-  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "" }));
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, row: m.row, segment_id: m.segment_id || "" }));
   const f = _searchFilters();
   try {
-    const thr = await fetch("/api/threshold_search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
+    const thr = await fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
     if (!thr) return;
     state.suggestedTau = thr.suggested_threshold;
     const fitTau = thr.threshold;
@@ -588,12 +819,15 @@ function closeSweep() {
 }
 
 async function refreshSweep() {
-  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, segment_id: m.segment_id || "" }));
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, row: m.row, segment_id: m.segment_id || "" }));
   const f = _searchFilters();
   try {
     const [dist, thr] = await Promise.all([
-      fetch("/api/score_distribution", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, k: 2000, ...f, interval_mode: "k", interval_score: null }) }).then((r) => r.ok ? r.json() : null),
-      fetch("/api/threshold_search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
+      // The histogram comes back from /api/calibrate itself; a second call to a
+      // separate distribution endpoint scored the same 34.4M rows for the same
+      // answer.
+      Promise.resolve(null),
+      fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
     ]);
     const hist = (dist && dist.edges) ? dist : (thr && thr.histogram) ? thr.histogram : null;
     if (!hist) { showToast("Could not compute distribution"); return; }
@@ -723,7 +957,6 @@ async function finalSave() {
     const r = await fetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       tag, query: state.query, k: 50, threshold: tau,
       from_date: $("sf-dateFrom").value || null, to_date: $("sf-dateTo").value || null,
-      segment_set_uuid: state.searchSegUuid, segment_set_name: state.searchSegName,
       filter_lance_uri: _splitList($("sf-lance").value), vehicle: _splitList($("sf-vehicle").value), drive_id: _splitList($("sf-drive").value),
       thumbs_up, thumbs_down,
     }) });
@@ -795,8 +1028,8 @@ function renderTable() {
     </tr>`;
   }).join("");
   let html = body;
-  if (!body) html = `<tr><td colspan="7" style="color:var(--muted-2)">${all.length ? "No saved searches for this model / filter — pick another model above." : "No saved searches yet — run a search and Save."}</td></tr>`;
-  if (hidden > 0 && modelSel !== "__all__") html += `<tr><td colspan="7" style="color:var(--muted-2);font-size:12px;">${hidden} search${hidden === 1 ? "" : "es"} from other models hidden — choose “All models” above to see them.</td></tr>`;
+  if (!body) html = `<tr><td colspan="8" style="color:var(--muted-2)">${all.length ? "No saved searches for this model / filter — pick another model above." : "No saved searches yet — run a search and Save."}</td></tr>`;
+  if (hidden > 0 && modelSel !== "__all__") html += `<tr><td colspan="8" style="color:var(--muted-2);font-size:12px;">${hidden} search${hidden === 1 ? "" : "es"} from other models hidden — choose “All models” above to see them.</td></tr>`;
   $("tbody").innerHTML = html;
 }
 async function resumeSession(id) {
@@ -805,7 +1038,6 @@ async function resumeSession(id) {
   try { s = await fetch("/api/search_session/" + encodeURIComponent(id)).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }); }
   catch (e) { showToast("Could not load: " + e.message); return; }
   if (!s.vector || !s.vector.length) { showToast("That saved search has no stored vector"); return; }
-  if (s.embeddings_uri && s.embeddings_uri !== state.embeddingsUri) { $("embeddings-uri").value = s.embeddings_uri; await loadCorpus(); }
   $("searchInput2").value = s.query || ""; state.query = s.query || "";
   $("tagInput").value = s.tag || "";
   state.marks = {};
@@ -815,7 +1047,7 @@ async function resumeSession(id) {
   if (s.to_date) $("sf-dateTo").value = s.to_date;
   $("sf-lance").value = s.filter_lance_uri || ""; $("sf-vehicle").value = s.vehicle || ""; $("sf-drive").value = s.drive_id || "";
   state.searchSegUuid = s.segment_set_uuid || null; state.searchSegName = s.segment_set_name || null;
-  $("sf-dxset").value = s.segment_set_name || "";
+  if ($("sf-dxset")) $("sf-dxset").value = s.segment_set_name || "";
   if (s.segment_set_uuid) fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.segment_set_uuid)).catch(() => {});
   state.resumeVec = s.vector; state.resumeLabel = s.query || ""; state.mode = "resume";
   updateRail();
@@ -932,74 +1164,88 @@ function _exportFilename(resp, fb) { const n = resp.headers.get("X-NLS-Export-Na
 
 function doExport() {
   if (state.selected.size === 0) return;
-  if (state.offlineScan) launchScan(); else downloadCsv();
+  fullExport();
 }
-async function downloadCsv() {
+// Threshold fitting follows whichever corpus the results came from. The two
+// endpoints address marks differently -- the resident one by `index`, the
+// full-corpus one by `row` -- and sending full-corpus marks to the resident
+// endpoint silently drops every label, which reads as "no labels yet".
+function _thresholdEndpoint() {
+  return "/api/calibrate";
+}
+
+// Export straight from the resident 34M-row corpus. This is the online
+// replacement for the Lilypad scan: the ranking pass is the same one a search
+// runs, so the only extra cost is materializing the rows.
+async function fullExport() {
   const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
+  if (!rows.length) return;
   const topk = state.cutoffMode === "topk";
-  // Top-K uses a per-search K (kForRow: the tag's own input when >1 selected,
-  // else the single global K); threshold mode keeps each tag's saved k cap.
-  const queries = rows.map((e) => ({ query: e.query || e.tag, k: topk ? kForRow(e) : (e.k || 50), threshold: topk ? 0 : (e.threshold || 0) }));
-  const btn = $("exportBtn"); btn.disabled = true; $("exportNote").textContent = `Exporting ${queries.length} tag(s) from the loaded corpus…`;
+  const btn = $("exportBtn"); btn.disabled = true;
+  const note = $("exportNote");
+  const filters = _exportFilters();
+  let done = 0;
   try {
-    const resp = await fetch("/api/export_config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-      queries, dedupe: true, dedupe_segment: $("dedupInput").checked, create_segment_set: $("segsetInput").checked, embeddings_uri: state.embeddingsUri, ..._exportFilters(),
-    }) });
-    if (!resp.ok) { let d; try { d = (await resp.json()).detail; } catch (_e) { } throw new Error(d || ("export " + resp.status)); }
-    const parquet = resp.headers.get("X-NLS-Parquet") || "";
-    const blob = await resp.blob(); const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = _exportFilename(resp, "export.csv");
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-    $("exportNote").textContent = `Downloaded CSV for ${queries.length} tag(s)` + (parquet ? ` · parquet → ${parquet}` : " · ⚠ parquet not written");
-    showToast("CSV downloaded");
-  } catch (e) { $("exportNote").textContent = "Export failed: " + e.message; }
-  finally { btn.disabled = false; }
+    for (const e of rows) {
+      const tag = e.tag || e.query;
+      note.textContent = `Exporting ${tag} from all 34M clips… (${done + 1}/${rows.length})`;
+      const body = {
+        query: e.query || e.tag, tag, output: "csv",
+        interval: state.sampleMode === "interval",
+        dedupe_segment: $("dedupInput").checked,
+        exact: !!$("exactInput") && $("exactInput").checked,
+        from_date: filters.from_date, to_date: filters.to_date,
+        vehicle: filters.vehicle, drive_id: filters.drive_id,
+        segment_set_uuid: filters.segment_set_uuid,
+        filter_lance_uri: filters.filter_lance_uri,
+        create_segment_set: !!$("segsetInput") && $("segsetInput").checked,
+      };
+      if (topk) body.k = kForRow(e) || 50;
+      else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
+      const resp = await fetch("/api/retrieve", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        let d; try { d = (await resp.json()).detail; } catch (_e) { }
+        throw new Error(`${tag}: ${d || "HTTP " + resp.status}`);
+      }
+      const h = (k) => resp.headers.get(k) || "";
+      const blob = await resp.blob(); const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href = url;
+      a.download = _exportFilename(resp, tag + ".csv");
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      done++;
+      const bits = [`${fmtInt(+h("X-NLS-Rows"))} rows`, `${h("X-NLS-Elapsed-Ms")} ms`];
+      if (h("X-NLS-Parquet")) bits.push(`parquet → ${h("X-NLS-Parquet")}`);
+      else bits.push("⚠ parquet not written");
+      if (h("X-NLS-Segset")) bits.push(`segment set ${h("X-NLS-Segset")}`);
+      if (h("X-NLS-Segset-Error")) bits.push(`⚠ ${h("X-NLS-Segset-Error")}`);
+      // A capped threshold export is a partial answer; say so on the same line
+      // as the row count rather than letting it read as the complete set.
+      if (h("X-NLS-Truncated") === "1") {
+        bits.push(`⚠ capped — ${fmtInt(+h("X-NLS-Candidates"))} matched`);
+      }
+      if (h("X-NLS-Score-Kind") === "bounded_approx") {
+        bits.push(`scores ±${h("X-NLS-Score-Error-Bound")}`);
+      }
+      note.textContent = `${tag}: ` + bits.join(" · ");
+    }
+    showToast(`Exported ${done} tag(s) from the full corpus`);
+    // Publish-then-refresh, so the row other people will see is visible to the
+    // person who just made it -- an export that only exists in one browser's
+    // downloads folder is the thing this list is meant to prevent.
+    loadScanJobs(true);
+  } catch (err) {
+    note.textContent = "Export failed: " + err.message;
+  } finally { btn.disabled = false; }
 }
-async function launchScan() {
-  const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
-  const tags = rows.map((e) => e.tag);
-  const defThr = 0.3;
-  const thresholds = {}; rows.forEach((e) => { thresholds[e.tag] = e.threshold > 0 ? e.threshold : defThr; });
-  // Top-K offline scan: only when a segment set / lance downsample scopes the scan (the
-  // worker ranks within that set). Otherwise Top-K is meaningless offline -- guide the user.
-  const topk = state.cutoffMode === "topk";
-  const hasScope = !!(state.exportSegUuid || ($("ex-lance") && ($("ex-lance").value || "").trim()));
-  if (topk && !hasScope) {
-    const jsg = $("jobStatus"); jsg.classList.add("show");
-    jsg.innerHTML = `<span style="color:var(--neg)">Top-K needs a segment set (or lance downsample) to rank within — pick one under Filters, or switch Cutoff to Threshold.</span>`;
-    return;
-  }
-  const topK = topk ? (parseInt($("kInput").value, 10) || 50) : null;
-  const btn = $("exportBtn"); btn.disabled = true; btn.textContent = "⏳ Job queued…";
-  const js = $("jobStatus"); js.classList.add("show"); js.innerHTML = `<span>launching per-segment scan over ${tags.length} tag(s)…</span>`;
-  try {
-    const r = await fetch("/api/launch_segment_scan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-      tags, thresholds, default_threshold: defThr, create_segment_set: $("segsetInput").checked, merge_intervals: state.sampleMode === "interval", ..._exportFilters(),
-      ...(topK ? { top_k: topK } : {}),
-    }) });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
-    const { execution_id, url } = await r.json();
-    js.innerHTML = `<span>job <b><a href="${url}" target="_blank" rel="noopener">${escapeHtml(execution_id)}</a></b> launched</span><span>polling…</span>`;
-    showToast("Scan launched — see Recent scans");
-    loadScanJobs();
-    pollScan(execution_id, url);
-  } catch (e) { js.innerHTML = `<span style="color:var(--neg)">launch failed: ${escapeHtml(e.message)}</span>`; }
-  finally { btn.disabled = false; renderExportPanel(); }
-}
-async function pollScan(execId, url) {
-  for (let i = 0; i < 90; i++) {
-    await new Promise((res) => setTimeout(res, 20000));
-    let s; try { s = await fetch("/api/scan_status?execution=" + encodeURIComponent(execId)).then((r) => r.json()); } catch (e) { continue; }
-    loadScanJobs();
-    if (s.done) return;
-  }
-}
+
 
 /* ===================== recent scans ===================== */
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
 let _scansRepollTimer = null;
 async function loadScanJobs(live) {
-  if (!state.offlineScan) return;
   clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
@@ -1032,6 +1278,15 @@ async function loadScanJobs(live) {
   }
 }
 function renderScans() {
+  try { _renderScans(); }
+  catch (e) {
+    // One malformed row must not blank the whole archive -- this panel is the
+    // only place some artifacts are discoverable.
+    console.error("renderScans failed", e);
+    $("scansBody").innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+function _renderScans() {
   const jobs = state.scanJobs || [];
   $("scansBody").innerHTML = jobs.length ? jobs.map((j) => {
     const id = j.console_url ? `<a class="scan-name" href="${j.console_url}" target="_blank" rel="noopener">${escapeHtml(j.execution_id)}</a>` : `<span class="scan-name">${escapeHtml(j.execution_id)}</span>`;
@@ -1041,23 +1296,49 @@ function renderScans() {
     // threshold scan). Threshold scans keep the per-tag "@tau" suffix.
     const tagList = (j.tags || []).map((t) => escapeHtml(t) + (!topK && j.thresholds && j.thresholds[t] != null ? ` @${j.thresholds[t]}` : "")).join(", ");
     const modeBadge = topK ? `<span class="scan-mode-topk" title="Top-K ranking within the downsampled scope (per-tag thresholds ignored)">top-K=${topK}</span> ` : "";
+    // In-app exports and offline scans share this list, but a reader should not
+    // have to guess which produced a row: an app export is already complete and
+    // has no console to open, and its artifact is a parquet, not a segments.lance.
+    const srcBadge = j.source === "app"
+      ? `<span class="scan-mode-topk" title="Exported in-app from the full corpus — no offline job">in-app</span> `
+      : "";
+    const truncNote = j.counts && j.counts.truncated
+      ? `<div class="ct-sub" style="color:var(--neg)">⚠ capped — ${(j.counts.candidates || 0).toLocaleString()} matched</div>`
+      : "";
     const filt = _fmtScanFilters(j.filters);
-    const out = j.lance_uri
-      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(j.lance_uri)}</span><button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button></div>`
-      : "—";
+    // An in-app export writes a parquet under the export prefix, which
+    // /api/export_file can presign -- so offer the artifact as a download, not
+    // just a path to copy. A Lilypad scan's segments.lance is a directory and
+    // has no single-object download, so it stays copy-only.
+    const isParquet = /\.parquet$/i.test(j.lance_uri || "");
+    const dl = isParquet
+      ? `<a class="scan-copy" href="/api/export_file?uri=${encodeURIComponent(j.lance_uri)}" title="Download this parquet">download</a>`
+      : "";
+    // Preview reads the parquet's first row group server-side, so it works for
+    // an export of any size. A Lilypad segments.lance is a directory, not a
+    // single object, so it gets no preview for the same reason it gets no download.
+    const pv = isParquet
+      ? `<button class="scan-copy" data-preview="${escapeHtml(j.lance_uri)}" title="Show the first rows of this export">preview</button>`
+      : "";
+    // Data Explorer: the registered set, or why there isn't one. "pending" only
+    // appears for a row that asked for registration and hasn't reported back.
     let dx = `<span class="scan-dx none">—</span>`;
     if (j.segset_label) dx = `<span class="scan-dx">${escapeHtml(j.segset_label)}</span>`;
     else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
+    const out = j.lance_uri
+      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(_uriShort(j.lance_uri))}</span>`
+        + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}${pv}</div>`
+      : "—";
     return `<tr>
       <td class="scan-time">${escapeHtml(j.created_at || "")}</td>
-      <td>${id}</td>
+      <td>${srcBadge}${id}</td>
       <td class="scan-tags">${(j.tags || []).length} tag(s): ${modeBadge}${tagList}</td>
       <td class="scan-filters">${escapeHtml(filt)}</td>
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
-      <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}</td>
+      <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}${truncNote}</td>
       <td>${out}</td>
       <td>${dx}</td></tr>`;
-  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No scans launched yet.</td></tr>`;
+  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
 }
 // Result counts (total segments + per-tag breakdown), mirroring the Data Explorer view.
 function _fmtScanCounts(c, status) {
@@ -1071,16 +1352,68 @@ function _fmtScanCounts(c, status) {
   return `<div class="scan-counts-box"><div class="ct-total"><b>${total}</b> segments${clips}</div>`
     + (rows ? `<div class="ct-list" title="${unit} per tag">${rows}</div>` : "") + `</div>`;
 }
-// Copy a scan's full output Lance URI (delegated so it survives re-renders).
+// Copy an output path, or open a preview of it (delegated so both survive
+// re-renders of the scans table).
 document.addEventListener("click", (e) => {
   const btn = e.target.closest(".scan-copy");
   if (!btn) return;
+  if (btn.dataset.preview) { openPreview(btn.dataset.preview); return; }
   const uri = btn.dataset.uri || "";
+  if (!uri) return;
   navigator.clipboard.writeText(uri).then(
     () => showToast("Copied output path"),
     () => showToast("Copy failed — select the path manually"),
   );
 });
+
+/* ===================== export preview ===================== */
+const PREVIEW_ROWS = 25;
+// Columns worth right-aligning: scores and counts read as columns of numbers,
+// ids and uris do not.
+const _PREVIEW_NUM = /^(rank|score|peak_score|mean_score|duration_s|num_chunks|.*_unix|.*_ns)$/;
+
+function closePreview() {
+  $("previewModal").classList.remove("open");
+  $("overlay").classList.remove("open");
+}
+
+async function openPreview(uri) {
+  const body = $("previewBody"), note = $("previewNote");
+  $("previewUri").textContent = uri;
+  $("previewTitle").textContent = "Export preview";
+  body.innerHTML = `<div class="preview-note">Reading the export…</div>`;
+  note.textContent = "";
+  $("overlay").classList.add("open");
+  $("previewModal").classList.add("open");
+  try {
+    const r = await fetch(`/api/export_preview?uri=${encodeURIComponent(uri)}&limit=${PREVIEW_ROWS}`);
+    if (!r.ok) {
+      let d; try { d = (await r.json()).detail; } catch (_e) { }
+      throw new Error(d || `HTTP ${r.status}`);
+    }
+    const d = await r.json();
+    if (!d.rows.length) { body.innerHTML = `<div class="preview-note">This export has no rows.</div>`; return; }
+    const head = d.columns.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+    const rows = d.rows.map((row) => {
+      const tds = d.columns.map((c) => {
+        const v = row[c];
+        const cls = _PREVIEW_NUM.test(c) ? ' class="num"' : "";
+        // The clip is the point of the row -- link it rather than printing a
+        // path nobody can act on.
+        if (c === "source_media_uri" && v) {
+          return `<td><a href="/api/video?uri=${encodeURIComponent(v)}" target="_blank" rel="noopener" title="${escapeHtml(v)}">▶ clip</a></td>`;
+        }
+        return `<td${cls} title="${escapeHtml(String(v ?? ""))}">${escapeHtml(String(v ?? ""))}</td>`;
+      }).join("");
+      return `<tr>${tds}</tr>`;
+    }).join("");
+    body.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+    note.innerHTML = `Showing ${d.num_rows} of ${fmtInt(d.total_rows)} rows · `
+      + `<a href="/api/export_file?uri=${encodeURIComponent(uri)}">download the full parquet</a>`;
+  } catch (err) {
+    body.innerHTML = `<div class="preview-note" style="color:var(--neg)">Could not preview this export: ${escapeHtml(err.message)}</div>`;
+  }
+}
 function _fmtScanFilters(f) {
   if (!f) return "—"; const p = [];
   if (f.from_date || f.to_date) p.push(`${f.from_date || "…"}→${f.to_date || "latest"}`);
