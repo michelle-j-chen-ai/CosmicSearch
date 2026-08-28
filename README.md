@@ -165,6 +165,7 @@ Cold start downloads the model (base model from HF, or the merged snapshot from
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `NLS_MODEL_ARTIFACT_URI` | `""` | Merged fine-tuned model S3 URI; empty = base model |
+| `NLS_ATLAS_URI` | `""` | Precomputed atlas artifact (`scripts/precompute_atlas.py`); empty = `/atlas` returns 404 |
 | `NLS_CACHE_ROOT` | `/gcs/nls_cache` or `/tmp/nls_cache` | Disk-cache root for downloaded corpora + models |
 | `NLS_DEVICE` | `cpu` | torch device for encoding |
 | `NLS_MATRIX_DTYPE` | `float32` | corpus matrix dtype (`float16` to halve RAM, 20x slower matmul) |
@@ -186,6 +187,24 @@ boto3 client settings (all set in `oci_s3.s3_client`), or the URL fails:
 
 With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 `Accept-Ranges: bytes`, so the browser `<video>` tag streams via range requests.
+
+## The atlas: the corpus as a map
+
+`/atlas` renders the same corpus as a 2D projection instead of a ranked list.
+Where search answers "which clips match this query", the atlas answers "what is
+in this corpus and how is it organized" -- click a point for its clip, lasso a
+region to sample one, or ask a point for its nearest neighbours.
+
+It reads a precomputed artifact (`scripts/precompute_atlas.py`: PCA then UMAP
+over a sample, ~63MB) rather than projecting at request time, and loads it lazily
+on first visit -- nobody who only searches pays for it, and a failure to load it
+cannot touch retrieval. With `NLS_ATLAS_URI` unset the page is simply absent.
+
+Read it for local structure, not global distance: UMAP preserves neighbourhoods,
+not the size of the gaps between them. Measured on this corpus, PCA-50 kNN
+recovers 0.79 of the true 768-d top-10, neighbourhoods are not drive-driven
+(1.3% same-drive), and hour-of-day and month each explain ~3% of variance -- so a
+scene-organized map reflects the encoder's similarity, not the projection.
 
 ## Scaling beyond 1M
 
