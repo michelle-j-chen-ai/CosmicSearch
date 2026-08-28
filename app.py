@@ -29,7 +29,7 @@ import uuid
 
 import analytics
 import botocore.exceptions
-import dora_client
+import full_corpus
 import local_cache
 import oci_s3
 import search_engine
@@ -48,34 +48,6 @@ _CORPUS_ERRORS = (
     botocore.exceptions.BotoCoreError,
     botocore.exceptions.ClientError,
 )
-
-
-@st.cache_resource(show_spinner="Loading text encoder (one-time)...")
-def get_model(model_artifact_uri: str, device: str) -> tuple[object, object]:
-    """Load + cache the encoder once per process, keyed by model URI."""
-    return search_engine.load_model(model_artifact_uri, device)
-
-
-@st.cache_resource(show_spinner=False)
-def get_corpus(embeddings_uri: str, matrix_dtype: str) -> search_engine.Corpus:
-    """Download (cached) + load a corpus once per process, keyed by its URI.
-
-    Across user sessions in one instance this is an in-memory hit; the first
-    load also populates the on-disk download cache shared across instances.
-    """
-    return search_engine.load_corpus(embeddings_uri, matrix_dtype)
-
-
-@st.cache_data(ttl=300, show_spinner="Listing Data Explorer segment sets...")
-def get_segment_sets(name_filter: str) -> list[dora_client.SegmentSet]:
-    """List DORA segment sets (cached briefly so reruns don't re-hit gRPC)."""
-    return dora_client.list_segment_sets(name_filter)
-
-
-@st.cache_data(show_spinner="Fetching segment ids...")
-def get_segment_ids(dataset_uuid: str) -> frozenset[str]:
-    """Fetch a dataset's segment external_ids (cached per dataset UUID)."""
-    return dora_client.fetch_segment_ids(dataset_uuid)
 
 
 def _fmt_start(chunk_start_unix: int) -> str:
@@ -357,6 +329,20 @@ def _inject_chrome() -> None:
     )
 
 
+@st.cache_resource(show_spinner="Loading text encoder (one-time)...")
+def get_model(model_artifact_uri: str, device: str) -> tuple[object, object]:
+    """Load + cache the encoder once per process, keyed by model URI."""
+    return search_engine.load_model(model_artifact_uri, device)
+@st.cache_resource(show_spinner=False)
+def get_corpus(embeddings_uri: str, matrix_dtype: str) -> search_engine.Corpus:
+    """Download (cached) + load a corpus once per process, keyed by its URI.
+
+    Across user sessions in one instance this is an in-memory hit; the first
+    load also populates the on-disk download cache shared across instances.
+    """
+    return search_engine.load_corpus(embeddings_uri, matrix_dtype)
+
+
 def main() -> None:
     _inject_chrome()
     config = AppConfig.from_env()
@@ -371,13 +357,11 @@ def main() -> None:
     with st.sidebar:
         st.header("Corpus")
         st.caption("The pool of video clips you search over.")
-        embeddings_uri = st.text_input(
-            "Lance embeddings URI",
-            value=config.default_embeddings_uri,
-            placeholder="s3://bucket/.../embeddings/<session>/",
-            help="Parent S3 URI containing rank=NNNNN/ Lance shards. Downloaded "
-            "and cached on first use.",
-        )
+        # Not a text input any more: the corpus is pinned. Pointing a run at a
+        # different table silently returns a plausible ranked list scored against
+        # another model's embeddings, so there is nothing safe to type here.
+        embeddings_uri = full_corpus.DEFAULT_CORPUS_TABLE_URI
+        st.code(embeddings_uri, language=None)
         st.caption(f"Cache root: `{local_cache.cache_root()}`")
 
         st.header("Display")
@@ -486,59 +470,11 @@ def main() -> None:
     start_unix = None if from_date <= lo_date else range_start_unix
     end_unix = None if to_date >= hi_date else range_end_unix
 
-    # Optional downsample to a Data Explorer (DORA) segment set: the chosen set
-    # is the superset, and only mini-segments whose segment_id is in it are
-    # displayed/exported. Matching needs the corpus to carry segment_id.
-    corpus_has_segment_id = bool((corpus.segment_id_array() != "").any())
+    # Segment-set downsampling is gone with the DORA dependency; the same
+    # filtering is available by pointing the lance downsample at a parquet of
+    # segment_ids.
     allowed_segment_ids = None
     segset_chip = None
-    with st.sidebar:
-        st.markdown("**Data Explorer segment set**")
-        downsample = st.checkbox(
-            "Restrict to a segment set",
-            value=False,
-            help="The chosen set becomes the superset: only mini-segments whose "
-            "segment_id is in it are searched, displayed, and exported.",
-        )
-        if not corpus_has_segment_id:
-            st.caption(
-                ":warning: This corpus has no `segment_id`, so a set can't match "
-                "it -- selecting one would return nothing. Point "
-                "`NLS_EMBEDDINGS_URI` at a corpus that carries `segment_id` to "
-                "use this."
-            )
-        if downsample:
-            name_filter = st.text_input(
-                "Segment-set name filter",
-                value="",
-                help="Name substring to find a Data Explorer segment set "
-                "(server-side filter over ~12k datasets).",
-            )
-            sets: list[dora_client.SegmentSet] = []
-            if not name_filter.strip():
-                st.caption("Type a name filter to list segment sets.")
-            else:
-                try:
-                    sets = get_segment_sets(name_filter.strip())
-                except dora_client.DoraUnavailable as exc:
-                    st.error(str(exc))
-            if sets:
-                choice = st.selectbox(
-                    "Segment set",
-                    options=sets,
-                    format_func=lambda s: s.label(),
-                    key="nls_segset_choice",
-                )
-                try:
-                    allowed_segment_ids = get_segment_ids(choice.dataset_uuid)
-                    segset_chip = (
-                        f"{choice.name} v{choice.version} "
-                        f"({len(allowed_segment_ids):,} segs)"
-                    )
-                except dora_client.DoraUnavailable as exc:
-                    st.error(str(exc))
-            elif name_filter.strip():
-                st.caption("No segment sets match that filter.")
 
     with st.form("search_form"):
         query = st.text_input(

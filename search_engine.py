@@ -399,10 +399,20 @@ def load_threshold_corpus(embeddings_uri: str) -> "threshold_search.ThresholdCor
 
 
 def _internal_ids_from_arrow(arrow_table: object) -> list[int] | None:
-    """The dx_internal_id column as a list, or None when the corpus lacks it."""
+    """The dx_internal_id column as a list, or None when the corpus lacks it.
+
+    An all-null column counts as absent. Some corpora carry the column with no
+    values filled in; treating that as present would advertise the roaring-bitmap
+    segment filter, and since every row maps to the -1 sentinel the resulting
+    mask is uniformly False -- a segment-set search silently returns nothing.
+    Reporting None routes those corpora to the segment_id path instead.
+    """
     if "dx_internal_id" not in arrow_table.column_names:
         return None
-    return arrow_table.column("dx_internal_id").to_pylist()
+    column = arrow_table.column("dx_internal_id")
+    if column.null_count == arrow_table.num_rows:
+        return None
+    return column.to_pylist()
 
 
 # Candidate vehicle-id column names in the corpus metadata (build-time join from
@@ -564,7 +574,7 @@ def _load_corpus_lance(
     source_media_uri: list[str] = []
     segment_id: list[str] = []
     internal_ids: list[int] = []
-    has_internal = True  # cleared if any shard lacks the dx_internal_id column
+    has_internal = True  # cleared if any shard lacks dx_internal_id, or has it all-null
     for rank_dir in rank_dirs:
         db = lancedb.connect(str(rank_dir))
         table = db.open_table(OUTPUT_TABLE_NAME)
@@ -582,8 +592,18 @@ def _load_corpus_lance(
             segment_id.extend(arrow_table.column("segment_id").to_pylist())
         else:
             segment_id.extend([""] * arrow_table.num_rows)
-        if has_internal and "dx_internal_id" in arrow_table.column_names:
-            internal_ids.extend(arrow_table.column("dx_internal_id").to_pylist())
+        # All-null counts as missing, for the reason in _internal_ids_from_arrow.
+        shard_ids = (
+            arrow_table.column("dx_internal_id")
+            if "dx_internal_id" in arrow_table.column_names
+            else None
+        )
+        if (
+            has_internal
+            and shard_ids is not None
+            and shard_ids.null_count < arrow_table.num_rows
+        ):
+            internal_ids.extend(shard_ids.to_pylist())
         else:
             has_internal = False
         LOGGER.info("  %s: %d rows", rank_dir.name, arrow_table.num_rows)

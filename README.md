@@ -71,7 +71,7 @@ Browser (prompt box + <video> grid)
 Cloud Run service (CPU, 16Gi, min_instances=1)   app.py (Streamlit)
    |- load once @st.cache_resource:
    |     model  (search_engine.load_model)   ~5.3GB
-   |     corpus (search_engine.load_corpus)  ~3GB, from NLS_EMBEDDINGS_URI
+   |     corpus (full_corpus.load)  int8/PCA-256 screen, whole corpus
    |- per query:
    |     encode_query    ~40ms   (search_engine)  [text query]
    |     centroid_query          (search_engine)  [refine: mean of selected]
@@ -116,9 +116,11 @@ existing inference pipeline:
    consumes. Generate the MP4s with `../finetuning/generate_chunks_mp4_workflow.py`
    if they don't exist yet.
 2. Run the Cosmos-Embed inference workload (`fine_tuned_embed_inference_lilypad_config.yaml`)
-   with `output_uri` set to your corpus location, e.g.
-   `s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/embeddings/corpus_1m/`.
-3. Point the app at that location via `NLS_EMBEDDINGS_URI`.
+   with `output_uri` set to the consolidated corpus, then consolidate into
+   `full_corpus.DEFAULT_CORPUS_TABLE_URI`. The app reads only that table; the
+   URI is a module constant, not configuration, because pointing a run at
+   another table returns a confident ranked list scored against a different
+   model's embeddings with nothing to signal it.
 
 The video objects referenced by `source_media_uri` in the Lance rows must be
 readable with the same credentials the app uses (they live under
@@ -134,7 +136,6 @@ pip install -r requirements.txt
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 export AWS_ENDPOINT_URL_S3=https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com
 export AWS_REGION=us-phoenix-1
-export NLS_EMBEDDINGS_URI=s3://neuron-prod-data-intelligence-exploratory/sibogeng/nls_search/embeddings/corpus_1m/
 export NLS_MODEL_ARTIFACT_URI=s3://.../models/<session>/   # empty -> base model
 
 python -m streamlit run app.py
@@ -152,7 +153,6 @@ apps-platform app secret set AWS_ACCESS_KEY_ID <key>    --service vlm-nls-search
 apps-platform app secret set AWS_SECRET_ACCESS_KEY <key> --service vlm-nls-search
 apps-platform app secret set AWS_ENDPOINT_URL_S3 https://idskhu5vqvtl.compat.objectstorage.us-phoenix-1.oraclecloud.com --service vlm-nls-search
 apps-platform app secret set AWS_REGION us-phoenix-1     --service vlm-nls-search
-apps-platform app secret set NLS_EMBEDDINGS_URI s3://.../corpus_1m/ --service vlm-nls-search
 apps-platform app secret set NLS_MODEL_ARTIFACT_URI s3://.../models/<session>/ --service vlm-nls-search
 ```
 
@@ -164,7 +164,6 @@ Cold start downloads the model (base model from HF, or the merged snapshot from
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `NLS_EMBEDDINGS_URI` | `""` | Optional default Lance URI to prefill the search box (any URI can be typed at runtime) |
 | `NLS_MODEL_ARTIFACT_URI` | `""` | Merged fine-tuned model S3 URI; empty = base model |
 | `NLS_CACHE_ROOT` | `/gcs/nls_cache` or `/tmp/nls_cache` | Disk-cache root for downloaded corpora + models |
 | `NLS_DEVICE` | `cpu` | torch device for encoding |

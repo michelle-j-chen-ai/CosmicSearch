@@ -12,11 +12,22 @@ import dataclasses
 import os
 
 
+def mp4_prefix() -> str:
+    """Where chunk MP4s live. The single definition: `gpu_corpus` and
+    `full_corpus` both reconstruct source_media_uri from it rather than holding
+    the column resident, and two copies meant an NLS_MP4_PREFIX override could
+    apply to one and not the other -- giving the same clip two different paths.
+    """
+    return os.environ.get(
+        "NLS_MP4_PREFIX",
+        "s3://neuron-prod-data-intelligence-exploratory/vlm/chunks_mp4_v2/",
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class AppConfig:
     # Optional default Lance corpus URI to prefill the search box. The user can
     # type any rank=NNNNN/-sharded embeddings URI at query time; empty is fine.
-    default_embeddings_uri: str
     # S3 URI of the merged fine-tuned text-encoder snapshot. Empty -> base HF
     # model. Downloaded to the disk cache on first load.
     model_artifact_uri: str
@@ -58,7 +69,6 @@ class AppConfig:
     @staticmethod
     def from_env() -> "AppConfig":
         return AppConfig(
-            default_embeddings_uri=os.environ.get("NLS_EMBEDDINGS_URI", "").strip(),
             model_artifact_uri=os.environ.get("NLS_MODEL_ARTIFACT_URI", "").strip(),
             device=os.environ.get("NLS_DEVICE", "cpu").strip(),
             matrix_dtype=os.environ.get("NLS_MATRIX_DTYPE", "float32").strip(),
