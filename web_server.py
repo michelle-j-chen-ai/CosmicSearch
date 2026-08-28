@@ -406,70 +406,7 @@ def _lance_filter_ids(uri: str) -> tuple[str, frozenset[str]]:
 _SCAN_INLINE_IDS_MAX = 10_000
 
 
-def _scan_downsample_ids(uri: str) -> tuple[str, list[str]]:
-    """``(corpus_key, sorted ids)`` for the OFFLINE-SCAN downsample dataset at ``uri``.
-
-    The app (which already powers the in-app lance filter) resolves the membership here;
-    the launch path ships the ids inline when small, else by parquet reference (no size
-    cap). Uses the segment_id-first priority (no dx) so the worker can match the
-    segment_id string space."""
-    local_dir = _lance_filter_cache_dir(uri)
-    if not local_dir.exists():
-        tmp = local_dir.with_name(local_dir.name + ".tmp")
-        if tmp.exists():
-            shutil.rmtree(tmp, ignore_errors=True)
-        oci_s3.download_s3_prefix(uri.rstrip("/") + "/", tmp, oci_s3.s3_client(fast_fail=True))
-        local_dir.parent.mkdir(parents=True, exist_ok=True)
-        tmp.replace(local_dir)
-    is_lance = uri.rstrip("/").endswith(".lance")
-    key, ids = search_engine.read_filter_ids(
-        local_dir, is_lance, key_columns=search_engine._SCAN_FILTER_KEY_COLUMNS
-    )
-    if not ids:
-        raise ValueError("downsample dataset has no usable segment ids")
-    LOGGER.info("scan downsample %s -> %d %s ids", uri, len(ids), key)
-    return key, sorted(ids)
-
-
 _SCAN_MANIFEST_S3 = None  # cached fast_fail OCI client for manifest reads
-
-
-def _read_scan_manifest(lance_uri: str) -> dict | None:
-    """The result manifest.json a completed scan writes next to its Lance output;
-    None if absent/unreadable. Best-effort (the scan may still be running, or an old
-    image may not have written one)."""
-    lance_uri = (lance_uri or "").rstrip("/")
-    if not lance_uri.endswith("/segments.lance"):
-        return None
-    manifest_uri = lance_uri[: -len("/segments.lance")] + "/manifest.json"
-    # MUST use the fast_fail client (2 attempts, short timeouts): a missing/unreadable
-    # manifest has to fail in seconds, not retry for minutes on the polled /api/scans
-    # path. Cache it module-level so the first poll doesn't rebuild it per scan.
-    global _SCAN_MANIFEST_S3
-    if _SCAN_MANIFEST_S3 is None:
-        _SCAN_MANIFEST_S3 = oci_s3.s3_client(fast_fail=True)
-    client = _SCAN_MANIFEST_S3
-    try:
-        bucket, key = oci_s3.parse_s3_uri(manifest_uri)
-        body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
-        return json.loads(body)
-    except (botocore.exceptions.BotoCoreError, botocore.exceptions.ClientError, ValueError, OSError) as exc:
-        LOGGER.info("scan manifest unavailable (%s): %s", manifest_uri, exc)
-        return None
-
-
-def _scan_counts_from_manifest(manifest: dict) -> dict:
-    """Compact result counts for the Recent-scans panel: total segments/clips and the
-    per-tag breakdown. Prefers distinct-segment counts (Data-Explorer semantics); older
-    manifests only carry interval counts, so fall back to those and flag which it is."""
-    per_tag_segments = manifest.get("segments_per_tag") or {}
-    per_tag = per_tag_segments or manifest.get("intervals_per_tag") or {}
-    return {
-        "num_segments": manifest.get("num_segments"),
-        "num_clips_scanned": manifest.get("num_clips_scanned"),
-        "per_tag": per_tag,
-        "per_tag_is_segments": bool(per_tag_segments),
-    }
 
 
 def _parse_vehicles(vehicle: str | None) -> frozenset[str]:
@@ -490,12 +427,6 @@ def _parse_drive_ids(drive_id: str | None) -> frozenset[str]:
     return frozenset(
         d.strip() for d in re.split(r"[,\s]+", drive_id.strip()) if d.strip()
     )
-
-
-def _resident_corpus():
-    """The full corpus if it is already loaded, else None (no load triggered)."""
-    with _FULL_LOCK:
-        return _FULL["corpus"]
 
 
 def _current_user(request: Request) -> str:
@@ -704,45 +635,6 @@ def model_info(uri: str | None = None) -> dict:
     return {"model_uri": cur, "label": _model_label(cur) or "base Cosmos-Embed1-448p"}
 
 
-def _window(corpus, scores, order, page, page_size, start_rank, start_score, t0, label):
-    """Shared result-window builder for /api/search and /api/refine.
-
-    Resolves the page start from (in priority order) start_score, start_rank, or
-    page, so the frontend's "jump to rank" / "jump to similarity" controls and
-    Prev/Next all route through one path.
-    """
-    total = int(order.size)
-    if total == 0:
-        return {
-            "total": 0,
-            "page": 0,
-            "page_size": page_size,
-            "hits": [],
-            "score_hi": None,
-            "score_lo": None,
-            "label": label,
-            "elapsed_ms": round((time.time() - t0) * 1000, 1),
-        }
-    if start_score is not None:
-        start = search_engine.start_index_for_score(scores, order, start_score)
-    elif start_rank is not None:
-        start = int(start_rank) - 1
-    else:
-        start = max(0, page) * page_size
-    start = max(0, min(start, total - 1))
-    hits = search_engine.hits_from_order(corpus, scores, order, start, page_size)
-    return {
-        "total": total,
-        "page": start // page_size,
-        "page_size": page_size,
-        "elapsed_ms": round((time.time() - t0) * 1000, 1),
-        "score_hi": round(float(scores[order[0]]), 4),
-        "score_lo": round(float(scores[order[-1]]), 4),
-        "label": label,
-        "hits": [_hit_dict(h) for h in hits],
-    }
-
-
 @app.get("/api/search_session/{session_id}")
 def search_session(session_id: int) -> dict:
     """The stored query + search vector + filters for a past export, by row id.
@@ -848,77 +740,6 @@ def _export_base(label: str) -> str:
     return f"{safe}_{stamp}_{uuid.uuid4().hex[:8]}"
 
 
-def _write_export_parquet(hits: list, tag: str, name: str | None = None) -> str:
-    """Write the exported top-k rows as a parquet under the OCI export prefix.
-
-    Returns the s3:// URI written, or "" if export is disabled or the upload
-    fails -- best-effort, so a failed parquet write never blocks the CSV
-    download. The columns mirror the CSV exactly. When ``name`` is given the object
-    stem is exactly ``name`` (so it matches the CSV download + segment-set name);
-    otherwise a name is derived from ``tag``.
-    """
-    prefix = _state["cfg"].export_s3_prefix.strip()
-    if not prefix:
-        return ""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    table = pa.table(
-        {
-            "rank": [h.rank for h in hits],
-            "score": [float(h.score) for h in hits],
-            "segment_id": [h.segment_id for h in hits],
-            "chunk_id": [h.chunk_id for h in hits],
-            "run_uuid": [h.run_uuid for h in hits],
-            "start_timestamp_ns": [_ns(h.chunk_start_unix) for h in hits],
-            "end_timestamp_ns": [_ns(h.chunk_end_unix) for h in hits],
-            "source_media_uri": [h.source_media_uri for h in hits],
-            "tag": [tag for _ in hits],
-        }
-    )
-    sink = io.BytesIO()
-    pq.write_table(table, sink)
-
-    stem = name or _export_base(tag)
-    key = f"{prefix.rstrip('/')}/{stem}.parquet"
-    try:
-        oci_s3.put_bytes(key, sink.getvalue(), _state["s3"], "application/octet-stream")
-        LOGGER.info("export parquet written: %s (%d rows)", key, len(hits))
-        return key
-    except (
-        ValueError,
-        botocore.exceptions.BotoCoreError,
-        botocore.exceptions.ClientError,
-    ) as exc:
-        LOGGER.warning("export parquet write failed (%s): %s", type(exc).__name__, exc)
-        return ""
-
-
-def _interval_rows(intervals: list, corpus, query: str) -> list[dict]:
-    """Flatten ScoredIntervals into export dicts, pulling the peak clip's
-    chunk_id / segment_id / source_media_uri from the corpus for preview."""
-    rows = []
-    for rank, iv in enumerate(intervals, start=1):
-        i = iv.peak_index
-        rows.append(
-            {
-                "rank": rank,
-                "peak_score": round(float(iv.peak_score), 6),
-                "mean_score": round(float(iv.mean_score), 6),
-                "run_uuid": iv.run_uuid,
-                "start_timestamp_ns": _ns_f(iv.start_unix),
-                "end_timestamp_ns": _ns_f(iv.end_unix),
-                "duration_s": round(float(iv.end_unix - iv.start_unix), 3),
-                "num_chunks": int(iv.num_cells),
-                "segment_id": corpus.segment_id[i] if i >= 0 else "",
-                "chunk_id": corpus.chunk_id[i] if i >= 0 else "",
-                "source_media_uri": corpus.source_media_uri[i] if i >= 0 else "",
-                "tag": query,
-            }
-        )
-    return rows
-
-
 _INTERVAL_COLS = [
     "rank",
     "peak_score",
@@ -977,9 +798,9 @@ def _write_interval_export_parquet(rows: list[dict], name: str) -> str:
 
 
 class SaveVectorRequest(BaseModel):
-    # Persist the current (refined) search vector under a tag, for reuse on the Curate
-    # page. vector omitted -> use the CURRENT vector cached in _state["last"]["vec"]
-    # (the relevance-feedback-refined one), which a plain text re-encode can't recover.
+    # Persist a search vector under a tag, for reuse on the Curate page. The
+    # vector is required: a refined (relevance-feedback) direction cannot be
+    # recovered by re-encoding the query text, and the client already holds it.
     tag: str
     query: str = ""
     vector: list[float] | None = None
@@ -989,7 +810,6 @@ class SaveVectorRequest(BaseModel):
     to_date: str | None = None
     filter_lance_uri: str | None = None
     segment_set_uuid: str | None = None
-    filter_lance_uri: str | None = None
     vehicle: str | None = None
     drive_id: str | None = None
     # The 👍/👎 marks labeled during this search, persisted so Resume restores the exact
@@ -1014,10 +834,14 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
         raise HTTPException(400, "tag is required")
     vec = req.vector
     if not vec:
-        last = _state.get("last", {}).get("vec")
-        vec = last.tolist() if last is not None else None
-    if not vec:
-        raise HTTPException(400, "run a search or refine first to define a vector to save")
+        # There is no server-side "current vector" to fall back on: searches are
+        # stateless and the client holds the direction its results were ranked
+        # by (the /api/retrieve response carries it). The old fallback read
+        # _state["last"], which nothing has written since /api/search went away
+        # -- and which _activate_model sets to None, so reading it raised.
+        raise HTTPException(
+            400, "send the vector the results were ranked by (`vector` is required)"
+        )
     cfg = _state["cfg"]
     uri = _state["active_uri"]
     saved = db.insert_export(
@@ -1220,26 +1044,6 @@ _POLICY_TTL_S = 300.0
 _policy_episode_count = 0
 
 
-def _load_policy(uri: str) -> dict | None:
-    now = time.time()
-    with _policy_lock:
-        ent = _policy_cache.get(uri or "")
-        if ent and (now - ent[1]) < _POLICY_TTL_S:
-            return ent[0]
-    pol = db.get_threshold_policy(uri or "")
-    with _policy_lock:
-        _policy_cache[uri or ""] = (pol, now)
-    return pol
-
-
-def _suggested_tau(uri: str, stats: dict) -> float:
-    """Learned policy prediction when one is fitted for this corpus, else heuristic."""
-    pol = _load_policy(uri)
-    if pol:
-        return search_engine.predict_threshold(stats, pol)
-    return search_engine.heuristic_threshold(stats)
-
-
 def _refit_policy(uri: str) -> dict | None:
     """Fit + persist the ridge policy for one embedding space from its episodes."""
     eps = [e for e in db.threshold_episodes() if (e.get("embeddings_uri") or "") == (uri or "")]
@@ -1250,15 +1054,6 @@ def _refit_policy(uri: str) -> dict | None:
         with _policy_lock:
             _policy_cache[uri or ""] = (pol, time.time())
     return pol
-
-
-def _maybe_refit_policy_async(uri: str) -> None:
-    """Every few logged episodes, refit in the background (off the request path)."""
-    global _policy_episode_count
-    _policy_episode_count += 1
-    if _policy_episode_count % 5 != 0:
-        return
-    threading.Thread(target=_refit_policy, args=(uri,), daemon=True).start()
 
 
 @app.post("/api/refit_policy")
@@ -1306,7 +1101,13 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
         # Threshold when given (clips scoring >= it, capped at k as a safety max),
         # else pure top-k. Selecting top-k first and trimming is the same set: the
         # ranking is score-descending, so the above-threshold clips are its prefix.
-        hits, _cand = corpus.search(vec, limit=max(1, int(cq.k)), **filters)
+        # refine="auto": an export is an artifact, not a browse. `search`
+        # defaults to never refining because paging wants the 190ms answer, but
+        # rows within eps of the cutoff here decide what lands in the file, and
+        # the same query through /api/retrieve resolves them against L2.
+        hits, _cand = corpus.search(
+            vec, limit=max(1, int(cq.k)), refine="auto", **filters
+        )
         if cq.threshold and cq.threshold > 0:
             hits = [h for h in hits if float(h.score) >= float(cq.threshold)]
         LOGGER.info(
@@ -1446,7 +1247,13 @@ def curate_preview(req: ConfigExportRequest, request: Request) -> dict:
     for cq in queries:
         q = cq.query.strip()
         vec, reused = _query_vector(q, uri, model_uri, corpus)
-        hits, _cand = corpus.search(vec, limit=max(1, int(cq.k)), **filters)
+        # refine="auto": an export is an artifact, not a browse. `search`
+        # defaults to never refining because paging wants the 190ms answer, but
+        # rows within eps of the cutoff here decide what lands in the file, and
+        # the same query through /api/retrieve resolves them against L2.
+        hits, _cand = corpus.search(
+            vec, limit=max(1, int(cq.k)), refine="auto", **filters
+        )
         per_query.append(
             {
                 "query": q,
@@ -2323,11 +2130,10 @@ class FullExportRequest(BaseModel):
 class CalibrateRequest(BaseModel):
     """Fit a cutoff for a full-corpus query from labeled marks.
 
-    Separate from `/api/threshold_search` because that one addresses marks by
-    resident-corpus row index, and full-corpus hits have no resident index --
-    they carry `row`, a position in the 34M table. Feeding those to the resident
-    endpoint silently dropped every label (they fail its bounds check), which
-    left every tag on the label-free mean+3*std heuristic without saying so.
+    Marks are addressed by `row`, a position in the full corpus. They used to be
+    addressed by a resident-corpus index, which full-corpus hits do not carry --
+    so every label failed the bounds check and was silently dropped, leaving each
+    tag on the label-free mean+3*std heuristic with nothing saying so.
     """
 
     query: str
@@ -2344,19 +2150,6 @@ class CalibrateRequest(BaseModel):
     drive_id: str | None = None
     filter_lance_uri: str | None = None
     segment_set_uuid: str | None = None
-
-
-class FullSearchRequest(BaseModel):
-    query: str
-    limit: int = 50
-    page: int = 0
-    from_date: str | None = None
-    to_date: str | None = None
-    # Same comma/space-separated forms the resident search accepts. Unlike the
-    # resident path, MULTIPLE vehicles are honoured here.
-    vehicle: str | None = None
-    drive_id: str | None = None
-    filter_lance_uri: str | None = None
 
 
 # Segment-set membership resolved against the FULL corpus, cached per set uuid.
@@ -2397,7 +2190,9 @@ def _merge_filters(base: dict, extra: dict) -> dict:
     out = dict(base)
     for key, val in extra.items():
         cur = out.get(key)
-        out[key] = val if not cur else (set(cur) & set(val))
+        # An empty intersection is a real answer -- "no row satisfies both" --
+        # and stays an empty set. `filter_mask` distinguishes that from None.
+        out[key] = val if cur is None else (set(cur) & set(val))
     return out
 
 
@@ -2581,25 +2376,6 @@ _EXACT_MS_PER_ROW = 0.317
 # 3.4M rows in practice), and the row count -- not the scan -- is what decides
 # how much memory this endpoint uses.
 _FULL_EXPORT_MAX_ROWS = 2_000_000
-
-
-def _full_export_selection(corpus, req: "FullExportRequest", vec) -> object:
-    """Resolve a FullExportRequest to a `full_corpus.Selection`."""
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    filters = {
-        "vehicles": set(_parse_vehicles(req.vehicle)) or None,
-        "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
-        "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-    }
-    filters = _merge_filters(filters, _full_lance_filter(req.filter_lance_uri))
-    if req.k is not None:
-        return corpus.select(vec, k=int(req.k), **filters)
-    return corpus.select(
-        vec,
-        tau=float(req.threshold),
-        max_rows=min(int(req.max_rows or 0) or _FULL_EXPORT_MAX_ROWS, _FULL_EXPORT_MAX_ROWS),
-        **filters,
-    )
 
 
 class WindowRef(BaseModel):
@@ -2919,6 +2695,11 @@ def _retrieve_hits(req: "RetrieveRequest", corpus, vec, exclude) -> dict:
     out["score_kind"] = "exact" if req.exact else sel.score_kind
     out["band_rows"] = sel.band_rows
     out["refined"] = sel.refined
+    # The direction this ranking used. A later rescore of these rows has to
+    # address the SAME vector: for a refine, a window or an upload there is no
+    # text that reproduces it, and re-encoding the UI's label would rescore
+    # against the cosine of a caption.
+    out["vector"] = [round(float(x), 6) for x in np.asarray(vec).reshape(-1)]
     return out
 
 
@@ -2976,88 +2757,6 @@ def _retrieve_export(req: "RetrieveRequest", request: Request, corpus, vec, excl
             )
         return _full_export_write(
             shim, request, corpus, sel, vec, t0, exact_scores, score_kind
-        )
-    finally:
-        _FULL_EXPORT_LOCK.release()
-
-
-def full_export(req: FullExportRequest, request: Request) -> Response:
-    """Export from the whole 34M-row corpus, in-process -- no Lilypad launch.
-
-    The screening pass that ranks a search already produces every row's score, so
-    selection here is the same scan plus a cut: `k` takes the best k, `threshold`
-    takes everything at or above a cutoff. What made this an offline job was
-    never the scoring (~190ms) but materializing millions of results; the
-    columnar path in `full_corpus` is what removes that.
-
-    `exact=true` replaces the screening scores with true 768-d cosine for the
-    selected rows. Worth it for a bounded k, and the reason `threshold` mode
-    defaults to off: at a permissive cutoff the boundary is not meaningful
-    enough to pay a per-100k-row S3 fetch to resolve.
-    """
-    query = (req.query or "").strip()
-    if not query:
-        raise HTTPException(400, "query must not be empty")
-    if (req.k is None) == (req.threshold is None):
-        raise HTTPException(400, "pass exactly one of k or threshold")
-    if req.k is not None and req.k <= 0:
-        raise HTTPException(400, "k must be a positive integer")
-    if not _state.get("model_ready"):
-        raise HTTPException(503, "model still loading")
-    with _FULL_LOCK:
-        corpus = _FULL["corpus"]
-    if corpus is None:
-        _full_corpus_begin_load()
-        raise HTTPException(503, "full corpus is loading; poll /api/full_corpus_status")
-
-    if not _FULL_EXPORT_LOCK.acquire(blocking=False):
-        raise HTTPException(429, "another export is running; retry when it finishes")
-    try:
-        t0 = time.perf_counter()
-        vec = search_engine.encode_query(
-            query, _state["processor"], _state["model"], _state["cfg"].device
-        )
-        sel = _full_export_selection(corpus, req, vec)
-        if len(sel) == 0:
-            raise HTTPException(404, "nothing matched the query and filters")
-
-        exact_scores = None
-        score_kind = "bounded_approx"
-        if req.exact:
-            projected = len(sel) * _EXACT_MS_PER_ROW / 1000.0
-            if projected > _FULL_EXACT_BUDGET_S:
-                raise HTTPException(
-                    400,
-                    f"exact scoring {len(sel):,} rows is projected at "
-                    f"{projected:.0f}s, over the {_FULL_EXACT_BUDGET_S:.0f}s "
-                    "budget. Lower k, raise the threshold, or export with "
-                    "exact=false (scores stay bounded-approximate).",
-                )
-            try:
-                corpus._verify_alignment(sel.rows)
-                exact_scores = corpus.exact_scores(
-                    sel.rows, vec, deadline=time.monotonic() + _FULL_EXACT_BUDGET_S
-                )
-            except TimeoutError as exc:
-                # The estimate was optimistic. 503 rather than 400: the request
-                # was reasonable, the object store was slow, and retrying or
-                # narrowing are both sensible next moves.
-                raise HTTPException(503, str(exc))
-            except RuntimeError as exc:
-                # Either the snapshot moved under the loaded row positions, or
-                # this corpus has no dataset handle to read from. Both mean the
-                # exact scores would be wrong or absent -- 409 rather than a
-                # confident number attached to the wrong clip.
-                raise HTTPException(409, str(exc))
-            score_kind = "exact"
-
-        if req.interval:
-            return _full_export_intervals(
-                req, request, corpus, sel, vec, t0, exact_scores, score_kind
-            )
-
-        return _full_export_write(
-            req, request, corpus, sel, vec, t0, exact_scores, score_kind
         )
     finally:
         _FULL_EXPORT_LOCK.release()
@@ -3459,12 +3158,11 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
     operating point and returns the next clips worth labelling; without them it
     reports the label-free suggestion over the same distribution. Splitting that
     into `threshold_search` and `score_distribution` meant two endpoints scoring
-    34.4M rows to produce overlapping answers.
+    the whole corpus to produce overlapping answers.
 
-    Same operating-point selection as `/api/threshold_search`, against the full
-    corpus's screening scores. Marks are addressed by `row` (a position in the
-    34M table), which is what full-corpus hits carry; `index` is a resident-corpus
-    address and is ignored here.
+    Operating-point selection over the full corpus's screening scores. Marks are
+    addressed by `row`, which is what full-corpus hits carry; `index` is a
+    resident-corpus address and is ignored here.
     """
     query = (req.query or "").strip()
     if not query:
@@ -3481,17 +3179,12 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
         query, _state["processor"], _state["model"], _state["cfg"].device
     )
     scores, err = corpus.score(vec)
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    mask = corpus.filter_mask(
-        **_merge_filters(
-            {
-                "vehicles": set(_parse_vehicles(req.vehicle)) or None,
-                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-                "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
-                    },
-            _full_lance_filter(req.filter_lance_uri),
-        )
-    )
+    # Through the shared builder, so a cutoff is fitted over exactly the rows a
+    # search or export would return. Building the filter set by hand here meant
+    # segment_set_uuid was declared, sent by the UI, and silently ignored -- the
+    # histogram and tau came from the whole corpus while the user believed they
+    # were scoped to a segment set.
+    mask = corpus.filter_mask(**_full_filters(req))
     allowed = mask if mask is not None else np.ones(corpus.num_rows, dtype=bool)
 
     def _valid(rows: list) -> list[int]:
@@ -3586,6 +3279,12 @@ def full_corpus_status() -> dict:
         "corpus_uri": full_corpus.DEFAULT_CORPUS_TABLE_URI,
         "model": full_corpus.CORPUS_MODEL,
         "num_rows": corpus.num_rows if corpus is not None else 0,
+        # A row count is not a searchable count: rows whose embedding was null
+        # are zero-filled, score 0 against every query, and can never match.
+        "embedded_rows": corpus.embedded_rows if corpus is not None else 0,
+        "null_embedding_rows": (
+            corpus.null_embedding_rows if corpus is not None else 0
+        ),
         "corpus_version": getattr(corpus, "dataset_version", None),
         "loaded_utc": _utc(int(corpus.loaded_at)) if corpus is not None else "",
         "refresh": dict(_REFRESH),
@@ -3599,102 +3298,6 @@ def full_corpus_status() -> dict:
 def full_corpus_load() -> dict:
     """Begin (or report) the on-demand load. Returns immediately."""
     return {"status": _full_corpus_begin_load()}
-
-
-class FullVectorSearchRequest(BaseModel):
-    """Rank the full corpus by a pre-computed vector (resume a saved search, or
-    search by an uploaded example). Mirrors FullSearchRequest minus the text."""
-
-    vector: list[float]
-    query: str = ""
-    limit: int = 50
-    page: int = 0
-    from_date: str | None = None
-    to_date: str | None = None
-    vehicle: str | None = None
-    drive_id: str | None = None
-    filter_lance_uri: str | None = None
-
-
-class FullRefineRequest(BaseModel):
-    """Re-rank the full corpus from relevance feedback. Marks are addressed by
-    `row`; the marked clips' original embeddings are fetched to build the
-    prototype, since this corpus holds only the quantized screen."""
-
-    query: str = ""
-    marks: list[Mark] = []
-    negative_weight: float = 0.5
-    text_weight: float = 0.3
-    limit: int = 50
-    page: int = 0
-    from_date: str | None = None
-    to_date: str | None = None
-    vehicle: str | None = None
-    drive_id: str | None = None
-    filter_lance_uri: str | None = None
-
-
-def full_search_by_vector(req: FullVectorSearchRequest) -> dict:
-    """Rank the WHOLE corpus by a supplied vector.
-
-    Resuming a saved search used to fall through to the resident corpus, so a
-    reloaded tag was silently ranked over 2M clips while a fresh search of the
-    same text covered 34M -- same UI, same wording, different corpus.
-    """
-    if not req.vector:
-        raise HTTPException(400, "empty search vector")
-    corpus = _require_full_corpus()
-    vec = np.asarray(req.vector, dtype=np.float32)
-    if vec.ndim != 1 or vec.shape[0] != corpus.dim:
-        raise HTTPException(
-            400,
-            f"vector dim {vec.shape[0]} != corpus dim {corpus.dim} -- resume "
-            "against the corpus the search was originally run on",
-        )
-    return _full_rank(corpus, vec, req, label=req.query or "saved vector")
-
-
-def full_refine(req: FullRefineRequest) -> dict:
-    """Re-rank the whole corpus from 👍/👎 marks (Rocchio prototype).
-
-    The marked clips' 768-d embeddings are read from S3 -- a handful of rows,
-    one round trip -- because the resident screen is quantized and PCA-reduced
-    and cannot reconstruct a query direction of the quality feedback needs.
-    """
-    corpus = _require_full_corpus()
-    pos = [int(m.row) for m in req.marks if m.mark == "up" and m.row is not None]
-    neg = [int(m.row) for m in req.marks if m.mark == "down" and m.row is not None]
-    pos = [r for r in dict.fromkeys(pos) if 0 <= r < corpus.num_rows]
-    neg = [r for r in dict.fromkeys(neg) if 0 <= r < corpus.num_rows]
-    if not pos:
-        raise HTTPException(400, "mark at least one positive to re-rank")
-
-    text_vec = None
-    if req.text_weight > 0 and (req.query or "").strip():
-        if not _state.get("model_ready"):
-            raise HTTPException(503, "model still loading")
-        text_vec = search_engine.encode_query(
-            req.query.strip(), _state["processor"], _state["model"],
-            _state["cfg"].device,
-        )
-    try:
-        mat = corpus.vectors_for(pos + neg)
-    except RuntimeError as exc:
-        raise HTTPException(409, str(exc))
-    vec = _rocchio(
-        mat[: len(pos)], mat[len(pos):], text_vec,
-        req.negative_weight, req.text_weight,
-    )
-    # Drop the rejected clips from the results. Rocchio moves the query direction
-    # away from the negative centroid, which is not the same as removing them: a
-    # thumbs-down clip that still sits near the positives came straight back at
-    # the top of the re-rank, so the feedback looked ignored. Positives are kept
-    # -- seeing them hold their place is how you tell the re-rank worked.
-    out = _full_rank(corpus, vec, req, label=req.query or "refined", exclude_rows=neg)
-    out["refined_from"] = {
-        "num_up": len(pos), "num_down": len(neg), "excluded": len(neg),
-    }
-    return out
 
 
 def _rocchio(
@@ -3734,106 +3337,6 @@ def _require_full_corpus():
     return corpus
 
 
-def _full_rank(corpus, vec: np.ndarray, req, *, label: str, exclude_rows=None) -> dict:
-    """Shared ranking + response envelope for the full-corpus vector endpoints.
-
-    Accepts either field name for the page size: the vector/refine requests use
-    `limit`, the older window request uses `page_size`.
-    """
-    limit = int(getattr(req, "limit", None) or getattr(req, "page_size", None) or 50)
-    if limit <= 0 or limit > 1000:
-        raise HTTPException(400, "limit must be between 1 and 1000")
-    if req.page < 0:
-        raise HTTPException(400, "page must not be negative")
-    offset = req.page * limit
-    if offset + limit > _FULL_MAX_DEPTH:
-        raise HTTPException(400, f"full-corpus paging stops at {_FULL_MAX_DEPTH:,} results")
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    t0 = time.perf_counter()
-    hits, candidates = corpus.search(
-        vec,
-        limit=limit,
-        offset=offset,
-        **_merge_filters(
-            {
-                "vehicles": set(_parse_vehicles(req.vehicle)) or None,
-                "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
-                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-                    },
-            _full_lance_filter(req.filter_lance_uri),
-        ),
-        exclude_rows=exclude_rows,
-    )
-    took_ms = round((time.perf_counter() - t0) * 1000, 1)
-    LOGGER.info(
-        "full vector search %r -> %d hits over %d rows in %.1fms%s",
-        label, len(hits), corpus.num_rows, took_ms, _separation_note(hits),
-    )
-    return _full_payload(hits, candidates, corpus, req, took_ms, label, page_size=limit)
-
-
-def full_search(req: FullSearchRequest) -> dict:
-    """Top-`limit` clips over the ENTIRE corpus. No S3 access per query.
-
-    Scores are int8 screening scores: the exact PCA score of each hit lies
-    within +/- `score_error_bound`. They are NOT comparable to the resident
-    corpus's fp32 scores, so a threshold calibrated there does not transfer --
-    hence `score_kind` on every row.
-    """
-    query = (req.query or "").strip()
-    if not query:
-        raise HTTPException(400, "query must not be empty")
-    if req.limit <= 0 or req.limit > 1000:
-        raise HTTPException(400, "limit must be between 1 and 1000")
-    if req.page < 0:
-        raise HTTPException(400, "page must not be negative")
-    offset = req.page * req.limit
-    if offset + req.limit > _FULL_MAX_DEPTH:
-        raise HTTPException(
-            400,
-            f"full-corpus paging stops at {_FULL_MAX_DEPTH:,} results; "
-            "narrow the filters or export instead",
-        )
-    if not _state.get("model_ready"):
-        raise HTTPException(503, "model still loading")
-
-    with _FULL_LOCK:
-        corpus, status, error = _FULL["corpus"], _FULL["status"], _FULL["error"]
-    if corpus is None:
-        if status == "error":
-            raise HTTPException(503, f"full corpus load failed: {error}")
-        _full_corpus_begin_load()
-        raise HTTPException(
-            503,
-            "full corpus is loading (~2 min); poll /api/full_corpus_status and retry",
-        )
-
-    start_unix, end_unix = _date_bounds(req.from_date, req.to_date, corpus)
-    vec = search_engine.encode_query(
-        query, _state["processor"], _state["model"], _state["cfg"].device
-    )
-    t0 = time.perf_counter()
-    hits, candidates = corpus.search(
-        vec,
-        limit=req.limit,
-        offset=offset,
-        **_merge_filters(
-            {
-                "vehicles": set(_parse_vehicles(req.vehicle)) or None,
-                "run_uuids": set(_parse_drive_ids(req.drive_id)) or None,
-                "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
-                    },
-            _full_lance_filter(req.filter_lance_uri),
-        ),
-    )
-    took_ms = round((time.perf_counter() - t0) * 1000, 1)
-    LOGGER.info(
-        "full search %r -> %d hits over %d rows in %.1fms%s",
-        query, len(hits), corpus.num_rows, took_ms, _separation_note(hits),
-    )
-    return _full_payload(hits, candidates, corpus, req, took_ms, query)
-
-
 def _separation_note(hits) -> str:
     """Whether this query actually separated anything, logged with the search.
 
@@ -3860,10 +3363,9 @@ def _full_payload(
 ) -> dict:
     """The response envelope shared by every full-corpus ranking endpoint.
 
-    Identical in shape to what /api/search returns, so the grid renders these
-    with no special-casing. `index` is -1 because there is no resident-corpus
-    row to address; `row` is the full-corpus position, which is what
-    /api/full_rescore and /api/full_refine key on.
+    `index` is -1 because there is no resident-corpus row to address; `row` is
+    the full-corpus position, which is how the caller addresses these rows to
+    rescore them (`output="scores"`).
     """
     scores = [float(h.score) for h in hits]
     payload = [
@@ -3881,7 +3383,7 @@ def _full_payload(
             "source_media_uri": h.source_media_uri,
             "vehicle": h.vehicle,
             "dx_internal_id": h.dx_internal_id,
-            # Dataset row position, so /api/full_rescore can address these rows.
+            # Dataset row position: how `output="scores"` addresses this row.
             "row": h.row,
             "index": -1,
         }
@@ -3901,6 +3403,9 @@ def _full_payload(
         "score_lo": round(min(scores), 4) if scores else 0.0,
         "score_hi": round(max(scores), 4) if scores else 0.0,
         "funnel": {"corpus_total": corpus.num_rows},
+        # Rows whose embedding was null cannot match anything, so a corpus size
+        # is not the number of clips a query was actually compared against.
+        "embedded_rows": corpus.embedded_rows,
         "full_corpus": True,
         "score_kind": "bounded_approx",
         # Provenance, so the UI can state what was actually searched instead of

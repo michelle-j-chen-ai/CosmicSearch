@@ -30,3 +30,8 @@ jobs:
 
       - name: Run all smoke tests
         run: uv run python smoke_test.py
+
+      # smoke_test.py is a plain __main__ script and collects none of tests/.
+      # Without this the suite could break with the check still green.
+      - name: Run the pytest suite
+        run: uv run python -m pytest tests/ -q

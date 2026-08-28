@@ -499,6 +499,7 @@ function _fullFilterBody() {
     to_date: $("sf-dateTo").value || null,
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
+    segment_set_uuid: state.searchSegUuid,
     filter_lance_uri: _splitList($("sf-lance") ? $("sf-lance").value : ""),
   };
 }
@@ -522,7 +523,8 @@ async function _fullFetch(endpoint, extra, page, key) {
     $("gridStatus").textContent = "Search failed: " + e.message;
     return;
   }
-  state.fullBuf = { key, data, hits: data.hits || [] };
+  // Carry the ranking's vector so a rescore addresses the same direction.
+  state.fullBuf = { key, data, hits: data.hits || [], vector: data.vector || null };
   _renderFullPage(page || 0);
 }
 
@@ -542,6 +544,7 @@ const FULL_BATCH = 200;
 function _fullKey(q) {
   return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
           $("sf-vehicle").value, $("sf-drive").value,
+          state.searchSegUuid || "",
           $("sf-lance") ? $("sf-lance").value : ""].join("|");
 }
 
@@ -606,7 +609,13 @@ async function rescoreVisible() {
   try {
     data = await fetch("/api/retrieve", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: state.query, rows, output: "scores" }),
+      // The vector the ranking used, NOT the query text. A refine, window or
+      // upload has no text that reproduces its direction, and sending `query`
+      // made the server re-encode a UI label and rescore against that.
+      body: JSON.stringify(
+        buf.vector ? { vector: buf.vector, rows, output: "scores" }
+                   : { query: state.query, rows, output: "scores" },
+      ),
     }).then((r) => (r.ok ? r.json() : null));
   } catch (e) { return; }
   if (!data || !data.scores) return;
@@ -956,7 +965,12 @@ async function finalSave() {
     const thumbs_down = Object.entries(state.marks).filter(([, m]) => m.mark === "down").map(([c, m]) => _mark(c, m));
     const r = await fetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       tag, query: state.query, k: 50, threshold: tau,
+      // The direction these results were ranked by. Required: a refined vector
+      // cannot be recovered by re-encoding the query text, and the server keeps
+      // no per-user "current search" to fall back on.
+      vector: (state.fullBuf && state.fullBuf.vector) || state.resumeVec || null,
       from_date: $("sf-dateFrom").value || null, to_date: $("sf-dateTo").value || null,
+      segment_set_uuid: state.searchSegUuid, segment_set_name: state.searchSegName,
       filter_lance_uri: _splitList($("sf-lance").value), vehicle: _splitList($("sf-vehicle").value), drive_id: _splitList($("sf-drive").value),
       thumbs_up, thumbs_down,
     }) });

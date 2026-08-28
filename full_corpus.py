@@ -235,6 +235,10 @@ class FullCorpus:
         # directly-constructed corpus still has them.
         self.corpus_uri = DEFAULT_CORPUS_TABLE_URI
         self.dataset_version = None
+        # Rows whose embedding was null at load. They are zero-filled, so they
+        # score exactly 0 and rank last -- present in num_rows, unreachable by
+        # any query. Reported so a row count is not read as a searchable count.
+        self.null_embedding_rows = 0
         self.loaded_at = 0.0
         # Held open from load time. Row positions address THIS version; the table
         # grows daily, so reopening it per request would let positions drift onto
@@ -246,6 +250,12 @@ class FullCorpus:
         # Set at load by `probe_vector_fp`. False means the middle cascade tier
         # is the quantization it would be there to resolve.
         self.vector_fp_usable = False
+
+    @property
+    def embedded_rows(self) -> int:
+        """Rows a query can actually match: `num_rows` minus the null-embedding
+        rows, which score 0 against everything."""
+        return int(self.num_rows) - int(self.null_embedding_rows)
 
     @property
     def num_rows(self) -> int:
@@ -347,6 +357,8 @@ class FullCorpus:
         seg = self._meta["segment_id"]
         if seg is None:
             return np.zeros(self.num_rows, dtype=bool)
+        if not segment_ids:
+            return np.zeros(self.num_rows, dtype=bool)
         hit = pc.is_in(seg, value_set=pa.array(sorted(segment_ids), type=pa.string()))
         return pc.fill_null(hit, False).to_numpy(zero_copy_only=False).astype(bool)
 
@@ -370,22 +382,27 @@ class FullCorpus:
         positive centroid comes back near the top of the very next re-rank.
         """
         has_exclude = exclude_rows is not None and len(exclude_rows) > 0
+        # `is None` means "not filtered"; an EMPTY collection means "filtered to
+        # nothing" and must match nothing. Testing truthiness conflated the two,
+        # so intersecting two disjoint filters -- a drive id and a downsample
+        # keyed by other drives -- produced an empty set, read as no filter, and
+        # ranked the whole corpus while presenting it as a filtered result.
         if (
-            not vehicles and date_range is None and not run_uuids
-            and not segment_ids and not has_exclude
+            vehicles is None and date_range is None and run_uuids is None
+            and segment_ids is None and not has_exclude
         ):
             return None
         mask = np.ones(self.num_rows, dtype=bool)
         if has_exclude:
             idx = np.asarray(exclude_rows, dtype=np.int64)
             mask[idx[(idx >= 0) & (idx < self.num_rows)]] = False
-        if segment_ids:
+        if segment_ids is not None:
             mask &= self.segment_mask(segment_ids)
-        if vehicles:
+        if vehicles is not None:
             uniques = self._meta["vehicle_uniques"]
             codes = [i for i, v in enumerate(uniques) if v in vehicles]
             mask &= np.isin(self._meta["vehicle"], codes)
-        if run_uuids:
+        if run_uuids is not None:
             uniques = self._meta["run_uuid_uniques"]
             codes = [i for i, v in enumerate(uniques) if v in run_uuids]
             mask &= np.isin(self._meta["run_uuid"], codes)
@@ -773,10 +790,21 @@ class FullCorpus:
         col = vector_fp_column(CORPUS_MODEL)
         if col not in self.dataset.schema.names:
             return {"available": False, "reason": f"no column {col!r}"}
-        rows = np.unique(
-            np.linspace(0, self.num_rows - 1, num=min(sample, self.num_rows))
+        # Sample only rows that HAVE an embedding. A row whose embedding was
+        # null is all-zero in the screen (the loader fills nulls with 0), and
+        # its vector_fp is null too -- comparing those says nothing about
+        # whether the column is a real projection.
+        spread = np.unique(
+            np.linspace(0, self.num_rows - 1, num=min(sample * 8, self.num_rows))
             .astype(np.int64)
         )
+        embedded = spread[np.any(self.corpus_i8[spread] != 0, axis=1)]
+        if embedded.size == 0:
+            return {
+                "available": False,
+                "reason": "no embedded rows in the sample (all-null embeddings)",
+            }
+        rows = embedded[:sample]
         try:
             tbl = self.dataset.take(rows, columns=[col])
         except Exception as exc:  # noqa: BLE001 - a probe must never break load
@@ -787,6 +815,16 @@ class FullCorpus:
             self.scale.astype(np.float32) / np.float32(127.0)
         )
         dev = float(np.abs(fp - dequant).max())
+        # A non-finite deviation is not evidence of a real projection -- it means
+        # the sample was unusable (a null vector_fp decodes to NaN). The old
+        # `dev < quant_step*1e-3` test read NaN as "not a fallback" and reported
+        # a NaN deviation as proof the tier was sound.
+        if not np.isfinite(dev):
+            return {
+                "available": False,
+                "reason": f"non-finite deviation over {rows.size} sampled rows "
+                "(null vectors in the sample)",
+            }
         # The dequantized value is exactly representable, so a genuine fallback
         # matches to float32 round-off. A real projection differs by the
         # quantization error it was quantized FROM -- orders of magnitude larger.
@@ -1086,9 +1124,12 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
         at += rows
     if at != n_rows:
         raise ValueError(f"decoded {at} rows, expected {n_rows}")
+    null_rows = nulls // dim if dim else 0
     if nulls:
         LOGGER.warning(
-            "%s: %d null values filled with 0 (those rows score 0)", i8_col, nulls
+            "%s: %d null values filled with 0 -- %d of %d rows (%.1f%%) have no "
+            "embedding and score 0 against every query",
+            i8_col, nulls, null_rows, n_rows, 100.0 * null_rows / max(n_rows, 1),
         )
     LOGGER.info(
         "full corpus screen: %d rows x %d dim (%.2fGB) in %.1fs",
@@ -1143,6 +1184,7 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
         "pca basis from %s field metadata: %s, encoder %s",
         vector_full_column(model), "x".join(str(d) for d in pca.shape), model_id or "?",
     )
+    corpus.null_embedding_rows = null_rows
     corpus.model_id = model_id
     corpus.dataset = ds
     corpus.corpus_uri = DEFAULT_CORPUS_TABLE_URI

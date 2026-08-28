@@ -50,9 +50,6 @@ _CORPUS_ERRORS = (
 )
 
 
-@st.cache_resource(show_spinner="Loading text encoder (one-time)...")
-
-
 def _fmt_start(chunk_start_unix: int) -> str:
     return dt.datetime.fromtimestamp(chunk_start_unix, tz=dt.timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
