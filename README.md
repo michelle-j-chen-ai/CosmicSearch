@@ -71,7 +71,7 @@ Browser (prompt box + <video> grid)
 Cloud Run service (CPU, 16Gi, min_instances=1)   app.py (Streamlit)
    |- load once @st.cache_resource:
    |     model  (search_engine.load_model)   ~5.3GB
-   |     corpus (full_corpus.load)  ~8.8GB int8 screen, 34.4M clips
+   |     corpus (full_corpus.load)  int8/PCA-256 screen, whole corpus
    |- per query:
    |     encode_query    ~40ms   (search_engine)  [text query]
    |     centroid_query          (search_engine)  [refine: mean of selected]
@@ -186,74 +186,6 @@ boto3 client settings (all set in `oci_s3.s3_client`), or the URL fails:
 
 With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 `Accept-Ranges: bytes`, so the browser `<video>` tag streams via range requests.
-
-## Companion tool: the embedding atlas
-
-A separate Cloud Run service, **[vlm-embedding-atlas](https://vlm-embedding-atlas.experimental.apps.applied.dev/)**,
-renders the same black-dwarf corpus as a 2D map instead of a ranked list. Source
-is in [`embedding_atlas/`](embedding_atlas/) -- a self-contained app with its own
-`Dockerfile` and `project.toml`, built and deployed independently of NLS.
-
-Where NLS answers "which clips match this query", the atlas answers "what is in
-this corpus and how is it organized". Click a point to play the clip and see its
-nearest neighbours; lasso a region to sample it.
-
-### Shape
-
-All projection work is offline (`precompute_atlas.py`); the served app never
-opens the Lance table. The source is 34.4M x 768 fp32 (~104GB), reduced to a
-63MB artifact:
-
-| Stage | Result |
-| --- | --- |
-| Uniform sample, 250k of 34.4M rows (p=0.726%) | 21,699 drives |
-| PCA 768 -> 50 (GPU) | 94% of sampled variance retained |
-| UMAP 50 -> 2 (CPU, 124s) | `atlas.parquet` + `projection.pkl` |
-
-`projection.pkl` holds the PCA basis and the fitted reducer. Coordinates from
-two independent UMAP fits are not comparable, so placing anything new on *this*
-map -- another checkpoint's embeddings, a text query -- requires the saved
-basis; re-fitting produces an unrelated picture.
-
-### Reading it honestly
-
-UMAP preserves local neighbourhoods and distorts everything else. Cluster area,
-inter-cluster distance, and cluster count (a function of `n_neighbors` /
-`min_dist`) carry no information. Neighbour lookup in the app therefore runs in
-PCA space, never on the 2D coordinates.
-
-Measured caveats, all from the shipped artifact:
-
-| Measurement | Value |
-| --- | --- |
-| PCA-50 kNN recall@10 vs true 768-d | **0.79** (median 0.80) |
-| Trustworthiness@15, 2D / 3D | 0.973 / 0.985 |
-| Neighbours from the same drive | 1.3% (168x chance; 90.6% of clips have none) |
-| Variance explained by hour-of-day / month | 3.1% / 3.3% |
-
-Two consequences worth carrying over to NLS work. First, roughly two of every
-ten clips in the neighbour panel are not among the true top-10 -- fine for
-browsing, not for anything quantitative; storing the sample as int8 768-d
-(192MB) rather than fp32 PCA-50 would make it near-exact, which is the one place
-in this pipeline quantization earns its keep. Second, local structure survives
-*both* reductions well, so if the map looks scene-organized that is a property
-of the encoder's similarity, not an artifact of the projection.
-
-### Known gaps
-
-- **No labels are joined**, so no cluster has been verified as semantic. This is
-  the largest gap and it is a precompute-time join.
-- **The rare tail is invisible by arithmetic.** At p=0.726%, a scenario with
-  1,000 chunks corpus-wide appears as ~7 points. Uniform sampling faithfully
-  reproduces corpus imbalance, which is exactly wrong for rare-class inspection;
-  that needs label-aware over-sampling with inclusion weights.
-- **One UMAP seed, no stability pass.** No claim about cluster shape is yet
-  trustworthy.
-- **Planned:** semantic contrast axes -- project clips onto
-  `normalize(emb("A") - emb("B"))` directions so the coordinates are the same
-  cosines retrieval is scored on. The query bank is encoded offline (~0.6MB for
-  200 axes), so this needs no text tower at serving time. Running UMAP *within*
-  that space would organize the map by maneuver rather than appearance.
 
 ## Scaling beyond 1M
 

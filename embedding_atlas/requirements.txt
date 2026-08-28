@@ -1,8 +1,0 @@
-# Serving deps only. The projection (torch, umap-learn, lance) runs offline in
-# precompute_atlas.py, so the served image stays small and cold-starts fast.
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.4
-numpy==2.2.1
-pyarrow==18.1.0
-boto3==1.35.90
