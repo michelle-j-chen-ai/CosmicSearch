@@ -32,7 +32,7 @@ COPY gpu_corpus.py ./
 # exact-threshold retrieval path it shares (PCA metadata reader + error bound).
 # search_engine imports threshold_search lazily, so a missing file here fails at
 # call time rather than at build -- hence copying them explicitly.
-COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
+COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py atlas_store.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
 # DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
 # image builds on a plain Cloud Build with NO internal pip index. `adp/` is
