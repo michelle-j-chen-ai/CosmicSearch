@@ -84,8 +84,7 @@ class AtlasStore:
         # Count with a dict rather than np.unique: np.unique SORTS, and sorting
         # an object array raises TypeError the moment a value is None ("'<' not
         # supported between NoneType and str"). Nulls are ordinary here -- the
-        # corpus carries rows with no metadata -- and a colouring is a tally,
-        # which needs no ordering.
+        # corpus carries rows with no metadata -- and a tally needs no ordering.
         values = getattr(self, field)
         tally: dict[str, int] = {}
         for v in values:

@@ -33,7 +33,7 @@ COPY gpu_corpus.py ./
 # Hard dependencies of web_server/app since full-corpus search landed. The CPU
 # Dockerfile copies these; this one did not, so the GPU image imported clean
 # locally and died with ModuleNotFoundError in the built container.
-COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py interval_core.py atlas_store.py ./
+COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py interval_core.py ./
 COPY web_server.py dora_client.py db.py machine_auth.py ./
 COPY web ./web
 

@@ -194,10 +194,10 @@ def fit_pca(vectors: np.ndarray, pca_dim: int, device: str) -> dict[str, np.ndar
     _, singular_values, components = torch.pca_lowrank(centered, q=q, niter=4)
 
     projected = centered @ components[:, :pca_dim]
-    # Normalize by the TOTAL variance, not by the truncated spectrum. pca_lowrank
-    # returns only q singular values, so dividing by their sum makes the ratios
-    # sum to 1 over whatever was computed -- reporting "retains 100%" for any q
-    # and hiding exactly the collapse this number exists to detect.
+    # Normalize by the TOTAL variance, not by the truncated spectrum.
+    # pca_lowrank returns only q singular values, so dividing by their sum makes
+    # the ratios sum to 1 over whatever was computed -- reporting "retains 100%"
+    # for any q and hiding exactly the collapse this number exists to detect.
     total_var = float((centered**2).sum())
     sv2 = (singular_values**2).cpu().numpy()
     explained = (sv2 / total_var).astype(np.float32) if total_var > 0 else sv2 * 0.0

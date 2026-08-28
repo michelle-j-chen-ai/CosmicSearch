@@ -350,8 +350,9 @@ input:checked + .slider-toggle:before{transform:translateX(16px); background:var
 .preview-note{padding:10px 20px; border-top:1px solid var(--border-soft);
   font-size:11.5px; color:var(--muted);}
 
-/* Explore: the atlas, framed so its own :root/body rules cannot reach this
-   document. Fills the viewport below the header + nav. */
-#page-explore { padding: 0; }
-#page-explore iframe { display: block; width: 100%; height: calc(100vh - 118px);
-  min-height: 420px; border: 0; background: var(--surface); }
+/* Explore links to the atlas, a separate service. Styled as a nav item so it
+   reads as a third view rather than an afterthought; the arrow says it leaves. */
+.nav a.nav-link{background:none;border:none;color:var(--muted);font-size:14px;font-weight:500;
+  padding:10px 4px;margin-right:22px;cursor:pointer;border-bottom:2px solid transparent;
+  font-family:var(--sans);text-decoration:none;display:inline-flex;align-items:center;}
+.nav a.nav-link:hover{color:var(--text);}

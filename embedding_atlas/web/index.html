@@ -222,8 +222,8 @@ async function onClick(info) {
   state.selected = info.index;
   buildLayer();
   const [point, nn] = await Promise.all([
-    fetch(`/api/atlas/point/${info.index}`).then((r) => r.json()),
-    fetch(`/api/atlas/neighbors/${info.index}?k=24`).then((r) => r.json()),
+    fetch(`/api/point/${info.index}`).then((r) => r.json()),
+    fetch(`/api/neighbors/${info.index}?k=24`).then((r) => r.json()),
   ]);
   renderDetail(point, nn.neighbors);
 }
@@ -312,7 +312,7 @@ deckCanvas.addEventListener('pointerup', async () => {
     .map(([x, y]) => viewport.unproject([x, y]).slice(0, 2));
   setLasso(false);
   el('status').textContent = 'selecting…';
-  const res = await fetch('/api/atlas/lasso', {
+  const res = await fetch('/api/lasso', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ polygon, limit: 48 }),
@@ -331,8 +331,8 @@ deckCanvas.addEventListener('pointerup', async () => {
 
 async function loadColoring(field) {
   const [buf, legend] = await Promise.all([
-    fetch(`/api/atlas/coloring/${field}`).then((r) => r.arrayBuffer()),
-    fetch(`/api/atlas/legend/${field}`).then((r) => r.json()),
+    fetch(`/api/coloring/${field}`).then((r) => r.arrayBuffer()),
+    fetch(`/api/legend/${field}`).then((r) => r.json()),
   ]);
   state.colorIndices = new Uint8Array(buf);
   state.legend = legend.legend;
@@ -347,11 +347,11 @@ async function loadColoring(field) {
 }
 
 async function init() {
-  // The atlas loads on a background thread, so /api/atlas/meta answers 503 until it
+  // The atlas loads on a background thread, so /api/meta answers 503 until it
   // is resident. Poll rather than failing the page on a cold instance.
   let meta = null;
   while (!meta) {
-    const res = await fetch('/api/atlas/meta');
+    const res = await fetch('/api/meta');
     if (res.ok) { meta = await res.json(); break; }
     const health = await fetch('/healthz').then((r) => r.json()).catch(() => ({}));
     el('status').textContent = health.error
@@ -368,7 +368,7 @@ async function init() {
     .map((f) => `<option value="${f}">${f}</option>`).join('');
   select.onchange = () => loadColoring(select.value);
 
-  const buf = await fetch('/api/atlas/points').then((r) => r.arrayBuffer());
+  const buf = await fetch('/api/points').then((r) => r.arrayBuffer());
   state.positions = new Float32Array(buf);
   el('status').textContent = `${state.count.toLocaleString()} points`;
 

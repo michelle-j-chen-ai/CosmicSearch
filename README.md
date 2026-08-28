@@ -165,7 +165,6 @@ Cold start downloads the model (base model from HF, or the merged snapshot from
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `NLS_MODEL_ARTIFACT_URI` | `""` | Merged fine-tuned model S3 URI; empty = base model |
-| `NLS_ATLAS_URI` | `""` | Precomputed atlas artifact (`scripts/precompute_atlas.py`); empty = Explore returns 404 |
 | `NLS_CACHE_ROOT` | `/gcs/nls_cache` or `/tmp/nls_cache` | Disk-cache root for downloaded corpora + models |
 | `NLS_DEVICE` | `cpu` | torch device for encoding |
 | `NLS_MATRIX_DTYPE` | `float32` | corpus matrix dtype (`float16` to halve RAM, 20x slower matmul) |
@@ -190,27 +189,24 @@ With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 
 ## The atlas: the corpus as a map
 
-The **Explore** tab (alongside Search and Saved searches) renders the same corpus
-as a 2D projection instead of a ranked list; `/atlas` serves the same view
-directly.
-Where search answers "which clips match this query", the atlas answers "what is
-in this corpus and how is it organized" -- click a point for its clip, lasso a
-region to sample one, or ask a point for its nearest neighbours.
+The **Explore** tab links to [vlm-embedding-atlas](https://vlm-embedding-atlas.experimental.apps.applied.dev/),
+a separate Cloud Run service that renders the same corpus as a 2D projection
+instead of a ranked list. Source is in [`embedding_atlas/`](embedding_atlas/) --
+self-contained, with its own `Dockerfile` and `project.toml`.
 
-It reads a precomputed artifact (`scripts/precompute_atlas.py`: PCA then UMAP
-over a sample, ~63MB) rather than projecting at request time, and loads it lazily
-the first time the tab is opened -- on both sides, so nobody who only searches
-pays for it, and a failure to load it cannot touch retrieval. With
-`NLS_ATLAS_URI` unset the tab reports the feature as unconfigured.
+It stays a separate service rather than a page in this app, for memory. This
+process already holds a 13.86GB int8 screen plus a ~5GB encoder against a 32GiB
+ceiling, and the screen grew 8.82GB -> 13.86GB in a week as the corpus went
+34.4M -> 54.2M rows. The atlas runs in 2GiB. Spending the search service's
+shrinking headroom on it -- and risking an OOM that Cloud Run answers by killing
+the whole instance, search included -- buys nothing the link does not.
 
-The tab frames `/atlas` rather than inlining it: the atlas ships its own `:root`,
-`body` and `*` rules, which would overwrite the search UI's variables and reset.
-
-Read it for local structure, not global distance: UMAP preserves neighbourhoods,
-not the size of the gaps between them. Measured on this corpus, PCA-50 kNN
-recovers 0.79 of the true 768-d top-10, neighbourhoods are not drive-driven
-(1.3% same-drive), and hour-of-day and month each explain ~3% of variance -- so a
-scene-organized map reflects the encoder's similarity, not the projection.
+Read the map for local structure, not global distance: UMAP preserves
+neighbourhoods, not the size of the gaps between them. Measured on this corpus,
+PCA-50 kNN recovers 0.79 of the true 768-d top-10, neighbourhoods are not
+drive-driven (1.3% same-drive), and hour-of-day and month each explain ~3% of
+variance -- so a scene-organized map reflects the encoder's similarity, not the
+projection.
 
 ## Scaling beyond 1M
 

@@ -22,7 +22,8 @@
   <div class="nav">
     <button class="active" id="navSearch">Search</button>
     <button id="navSaved">Saved searches <span class="count" id="savedCount"></span></button>
-    <button id="navExplore">Explore</button>
+    <a class="nav-link" id="navExplore" href="https://vlm-embedding-atlas.experimental.apps.applied.dev/" target="_blank" rel="noopener"
+       title="Open the embedding atlas — the corpus as a 2D map">Explore ↗</a>
   </div>
 
   <!-- ⚙ corpus / model settings (backend switcher; hidden until opened) -->
@@ -211,15 +212,7 @@
   </div>
 
   <!-- ============ SAVED SEARCHES PAGE ============ -->
-  <div class="page" id="page-explore">
-  <!-- Framed rather than inlined: the atlas ships its own :root, body and *
-       rules, which would overwrite this app's variables and reset. The src is
-       set the first time the tab is opened, so deck.gl and the artifact are
-       never fetched for someone who only searches. -->
-  <iframe id="atlasFrame" title="Explore the corpus as a map" loading="lazy"></iframe>
-</div>
-
-<div class="page" id="page-saved">
+  <div class="page" id="page-saved">
     <div class="filterbar">
       <input type="text" id="savedFilter" placeholder="Filter by query or tag…">
       <select class="rt-select" id="modelFilter" title="Which model's saved searches to show (defaults to the loaded model)"></select>
