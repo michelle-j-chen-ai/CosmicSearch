@@ -108,6 +108,7 @@ async function loadDefaultCorpusWhenReady() {
 function wireEvents() {
   $("navSearch").onclick = () => setPage("search");
   $("navSaved").onclick = () => setPage("saved");
+  $("navExplore").onclick = () => setPage("explore");
   $("settingsGear").onclick = () => $("settingsPop").classList.toggle("hidden");
   $("load-model").onclick = loadModel;
 
@@ -171,8 +172,17 @@ function wireEvents() {
 function setPage(which) {
   $("navSearch").classList.toggle("active", which === "search");
   $("navSaved").classList.toggle("active", which === "saved");
+  $("navExplore").classList.toggle("active", which === "explore");
   $("page-search").classList.toggle("active", which === "search");
   $("page-saved").classList.toggle("active", which === "saved");
+  $("page-explore").classList.toggle("active", which === "explore");
+  if (which === "explore") {
+    // Sourced on first open, not at load: the atlas pulls deck.gl and a ~63MB
+    // artifact, and the server loads it lazily too, so an unopened tab costs
+    // nothing on either side.
+    const frame = $("atlasFrame");
+    if (frame && !frame.src) frame.src = "/atlas";
+  }
   if (which === "saved") {
     // Each render is isolated so a failure in one never blocks the others -- in
     // particular, a render error must not prevent the Recent scans list from loading.

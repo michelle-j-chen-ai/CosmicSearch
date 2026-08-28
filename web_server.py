@@ -3410,8 +3410,11 @@ def atlas_lasso(req: LassoRequest) -> dict:
 
 @app.get("/atlas")
 def atlas_page() -> FileResponse:
-    """The map, served from the same origin as the search UI so it shares the
-    session and the IAP identity rather than needing its own."""
+    """The map. Framed by the Explore tab, and reachable directly.
+
+    Same origin as the search UI, so it shares the session and the IAP identity
+    rather than needing its own -- which is also what lets the tab frame it.
+    """
     return FileResponse(os.path.join(HERE, "web", "atlas.html"))
 
 
