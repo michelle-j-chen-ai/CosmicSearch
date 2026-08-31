@@ -187,6 +187,27 @@ boto3 client settings (all set in `oci_s3.s3_client`), or the URL fails:
 With all three, a presigned GET returns 200 and a ranged GET returns 206 with
 `Accept-Ranges: bytes`, so the browser `<video>` tag streams via range requests.
 
+## The atlas: the corpus as a map
+
+The **Explore** tab links to [vlm-embedding-atlas](https://vlm-embedding-atlas.experimental.apps.applied.dev/),
+a separate Cloud Run service that renders the same corpus as a 2D projection
+instead of a ranked list. Source is in [`embedding_atlas/`](embedding_atlas/) --
+self-contained, with its own `Dockerfile` and `project.toml`.
+
+It stays a separate service rather than a page in this app, for memory. This
+process already holds a 13.86GB int8 screen plus a ~5GB encoder against a 32GiB
+ceiling, and the screen grew 8.82GB -> 13.86GB in a week as the corpus went
+34.4M -> 54.2M rows. The atlas runs in 2GiB. Spending the search service's
+shrinking headroom on it -- and risking an OOM that Cloud Run answers by killing
+the whole instance, search included -- buys nothing the link does not.
+
+Read the map for local structure, not global distance: UMAP preserves
+neighbourhoods, not the size of the gaps between them. Measured on this corpus,
+PCA-50 kNN recovers 0.79 of the true 768-d top-10, neighbourhoods are not
+drive-driven (1.3% same-drive), and hour-of-day and month each explain ~3% of
+variance -- so a scene-organized map reflects the encoder's similarity, not the
+projection.
+
 ## Scaling beyond 1M
 
 - **~1-3M rows**: flat search still fine (~0.1-0.3s/query); bump memory.
