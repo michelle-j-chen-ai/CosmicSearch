@@ -65,34 +65,44 @@ deploy.
 ## Architecture
 
 ```
-Browser (prompt box + <video> grid)
-        |
-        v
-Cloud Run service (CPU, 16Gi, min_instances=1)   app.py (Streamlit)
-   |- load once @st.cache_resource:
-   |     model  (search_engine.load_model)   ~5.3GB
-   |     corpus (full_corpus.load)  int8/PCA-256 screen, whole corpus
-   |- per query:
-   |     encode_query    ~40ms   (search_engine)  [text query]
-   |     centroid_query          (search_engine)  [refine: mean of selected]
-   |     rank_top_k      ~58ms   (search_engine, numpy)
-   |     presign_get             (oci_s3 -> browser streams MP4 from OCI)
+Browser (search, refine, threshold sweep, save, export)        Integrations
+        |  /ui/* (IAP only)                                     |  /api/v1/* (API key)
+        v                                                       v
+Cloud Run service (CPU, 32Gi, min_instances=1)  --  web_server.py + api_v1.py
+   |- loaded once, held resident:
+   |     model   (search_engine.load_model)              ~5GB fp32
+   |     corpora (full_corpus.load, one per project)     int8/PCA-256 screen, whole table
+   |- per request:
+   |     encode_query   ~40ms  (search_engine)
+   |     select         ~190ms (full_corpus: int8 sweep -> eps band -> fp32 refine)
+   |     exact_scores          (full_corpus: 768-d cosine for exports)
+   |     presign_get           (oci_s3 -> browser streams MP4 from OCI)
+   |- catalog.py: tags, versions, per-project thresholds, exports (Cloud SQL)
 ```
+
+The public API is the seven endpoints under `/api/v1` (`POST/GET /tags`,
+`GET/PUT/DELETE /tags/{tag}`, `GET /video`, `GET /health`); see the design page
+"Cosmic Search API Design v2". The browser uses those plus four `/ui` routes
+(live search over an unsaved query, threshold calibration, the Data Explorer
+set picker, clip redirects) that the API gateway does not expose.
 
 Files:
 - `config.py` -- env-driven config.
+- `deployment.py` -- the project registry: table, clip prefix and Data Explorer host per project.
 - `oci_s3.py` -- OCI S3-compat client, Lance storage options, model download, presign.
-- `local_cache.py` -- disk cache for downloaded Lance corpora and model snapshots.
-- `search_engine.py` -- model load, query encode, corpus load, ranking, centroid refinement.
-- `app.py` -- Streamlit UI (text search + relevance-feedback refinement).
+- `local_cache.py` -- disk cache for model snapshots and fetched segment sets.
+- `search_engine.py` -- model load, text/frame encoding, threshold fitting.
+- `full_corpus.py` -- the resident corpus and the search cascade.
+- `catalog.py` -- the tag store.
+- `api_v1.py` -- the public API.
+- `web_server.py` -- corpus lifecycle, `/ui` routes, pages.
 - `smoke_test.py` -- offline checks for the search core (no model/network).
 
 ## Caching: the corpus and model are downloaded once
 
-The Lance corpus URI is a runtime input (sidebar), not baked in. On first use
-of a URI, `local_cache` downloads its `rank=NNNNN/` shards to a cache directory
-keyed by the URI, guarded by a file lock so concurrent requests download it at
-most once. Two cache layers:
+Each project's corpus table is read straight from OCI at load; the model
+snapshot and fetched Data Explorer segment sets are cached on disk, guarded by a
+file lock so concurrent requests download at most once. Two cache layers:
 
 - **Disk cache** (`local_cache`): keyed by URI, with a `.nls_download_complete`
   marker (partial downloads are re-fetched, never served). Cache root resolves
@@ -106,25 +116,19 @@ most once. Two cache layers:
 The text-encoder model snapshot is cached the same way. Measured: a cold
 download+load of a 5k-row corpus took ~21s; the second load was ~0s (cache hit).
 
-## Data prerequisite: build the 1M-sample embedding corpus
+## Data prerequisite: the consolidated corpus
 
-The app needs an embeddings URI containing `rank=NNNNN/` Lance shards. Reuse the
-existing inference pipeline:
+Each project serves one Lance table, named in `deployment.py` (neuron:
+`s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/video_embeddings.lance`,
+frontier: `s3://frontier-perception-datasets/vlm/corpus/video_embeddings.lance`).
+The embedding pipeline in core-stack upserts into it; the app only reads. A
+request cannot point a search at another table: a query scored against a
+different model's embeddings returns a confident ranked list with nothing to
+signal it.
 
-1. Build a parquet of 1M random mini-segment chunks (a `chunk_id` column plus
-   the MP4 source columns), the same schema `fine_tuned_embed_inference.py`
-   consumes. Generate the MP4s with `../finetuning/generate_chunks_mp4_workflow.py`
-   if they don't exist yet.
-2. Run the Cosmos-Embed inference workload (`fine_tuned_embed_inference_lilypad_config.yaml`)
-   with `output_uri` set to the consolidated corpus, then consolidate into
-   `full_corpus.DEFAULT_CORPUS_TABLE_URI`. The app reads only that table; the
-   URI is a module constant, not configuration, because pointing a run at
-   another table returns a confident ranked list scored against a different
-   model's embeddings with nothing to signal it.
-
-The video objects referenced by `source_media_uri` in the Lance rows must be
-readable with the same credentials the app uses (they live under
-`vlm/chunks_mp4/dt=YYYY-MM-DD/<run_uuid>_t<chunk_start_unix>.mp4`).
+The video objects referenced by `source_media_uri` must be readable with the
+same credentials the app uses, laid out as
+`<clip prefix>/dt=YYYY-MM-DD/<run_uuid>_t<chunk_start_unix>.mp4`.
 
 ## Run locally
 
@@ -138,7 +142,7 @@ export AWS_ENDPOINT_URL_S3=https://idskhu5vqvtl.compat.objectstorage.us-phoenix-
 export AWS_REGION=us-phoenix-1
 export NLS_MODEL_ARTIFACT_URI=s3://.../models/<session>/   # empty -> base model
 
-python -m streamlit run app.py
+uvicorn web_server:app --port 8080
 ```
 
 Offline core test (no model, no network): `python smoke_test.py`.
@@ -223,35 +227,3 @@ projection.
 - **Encoder throughput**: a single CPU encode is ~40ms, so one warm instance
   handles ~25 queries/s/core. Raise `max_instances` for more concurrent users;
   the model is stateless across requests.
-
-## End-to-end master-vs-threshold benchmark
-
-`bench_e2e.py` compares two retrieval paths over the same query, filters, and
-threshold (`tau`):
-
-- **master path** — score the resident 768-d model-space matrix
-  (`score_corpus`), apply the real-app filter masks (vehicle / run / date
-  window), cut at `tau`.
-- **PR3 path** — `ThresholdCorpus.threshold_search` (prefilter + screen +
-  re-rank) in the shipped `fast_curation` default.
-
-Two hard-fail correctness gates (the script exits non-zero on violation):
-
-- **membership** — the master path's PCA-256-space reference set and the PR3
-  path's result set must be equal at the same `tau`.
-- **eps bound** — every `bounded_approx` hit's screening score must satisfy
-  `|fast_score - exact_score| <= score_error_bound + CROSS_SPACE_TOL`, where
-  `exact_score` is the PR3 path's own exact re-rank score.
-
-```bash
-# synthetic mode (default): generates two legacy shards locally, converts to
-# both corpora, runs the full sweep — no model, no credentials, no network.
-python bench_e2e.py --source synthetic --rows 20000
-
-# pre-built corpora (local dirs or s3:// URIs)
-python bench_e2e.py --master-uri <dir|uri> --threshold-uri <dir|uri> [--repeats N]
-```
-
-The sweep covers filter cells: none; vehicle; date-window narrow (1 week) and
-medium (4 weeks); run_uuids (one drive). A cell whose corpus lacks values for
-its filter is skipped gracefully.
