@@ -34,25 +34,14 @@ _TABLE = f"{SCHEMA_NAME}.export_log"
 # Bare relation name (no schema). Used to reference the target row inside an
 # INSERT ... ON CONFLICT DO UPDATE, where Postgres expects the unqualified table name.
 _BARE = _TABLE.split(".")[-1]
-# Launched per-segment scans (Lilypad workloads). A durable record so the Export
-# tab can show what is running / completed and its workload id across reloads.
+# In-app exports. A durable record so the Export tab can show what was produced
+# and where the artifact landed, across reloads and users.
 _SCAN_TABLE = f"{SCHEMA_NAME}.scan_jobs"
-# Threshold-tuning episodes: one row per labeled fit, holding the query's score
-# features + the fitted tau + metrics. Training data for a future learned
-# threshold policy (see scripts/fit_threshold_policy.py); append-only.
-_EPISODE_TABLE = f"{SCHEMA_NAME}.threshold_episodes"
-_BARE_EPISODE = _EPISODE_TABLE.split(".")[-1]
-# Learned threshold policy: one row per embedding space (corpus). Holds the ridge
-# weights fitted from that corpus's episodes, so serving predicts the suggested tau
-# with a cheap dot product (no fit on the request path). See search_engine.fit_threshold_policy.
-_POLICY_TABLE = f"{SCHEMA_NAME}.threshold_policy"
-_BARE_POLICY = _POLICY_TABLE.split(".")[-1]
 # One row per DISTINCT human relevance judgment: (query, segment, user) -> 👍/👎.
 # This is the honest feedback ledger. It is written the moment a mark is USED
 # (refine / threshold-sweep / export), not only on Download, and re-marking the
 # same (query, segment) upserts in place -- so a COUNT here is the true number of
-# thumbs, unlike SUM(threshold_episodes.n_pos) which re-adds a running tally per
-# fit and massively overcounts.
+# thumbs.
 _MARKS_TABLE = f"{SCHEMA_NAME}.feedback_marks"
 _BARE_MARKS = _MARKS_TABLE.split(".")[-1]
 
@@ -158,8 +147,8 @@ _DDL = [
         WHERE el.query IS NOT NULL AND btrim(el.query) <> ''
           AND COALESCE(NULLIF(m->>'segment_id', ''), m->>'chunk_id') IS NOT NULL
         ON CONFLICT (query_key, segment_id, user_email) DO NOTHING""",
-    # Launched per-segment scans, keyed by Lilypad workload id. thresholds is the
-    # per-tag cosine cutoff map ({tag: float}); status is the last-polled phase.
+    # In-app exports, keyed by export id. thresholds is the per-tag cosine cutoff
+    # map ({tag: float}).
     f"""CREATE TABLE IF NOT EXISTS {_SCAN_TABLE} (
         id            BIGSERIAL PRIMARY KEY,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -186,53 +175,16 @@ _DDL = [
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS segset_uuid TEXT",
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS segset_label TEXT",
     f"CREATE UNIQUE INDEX IF NOT EXISTS scan_jobs_exec_idx ON {_SCAN_TABLE} (execution_id)",
-    # Idempotency key for server-side launch dedup: identical concurrent requests
-    # (e.g. a Spark stage firing the same scan from every executor) coalesce to one
-    # Lilypad workload. The partial UNIQUE index is the cross-instance authority.
+    # Idempotency key: identical concurrent requests coalesce to one row. The
+    # partial UNIQUE index is the cross-instance authority.
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS idem_key TEXT",
     f"CREATE UNIQUE INDEX IF NOT EXISTS scan_jobs_idem_idx ON {_SCAN_TABLE} (idem_key) "
     f"WHERE idem_key IS NOT NULL",
-    # Result counts read back from the scan's manifest.json once it succeeds
-    # ({num_segments, num_clips_scanned, segments_per_tag, intervals_per_tag}); cached
-    # here so the Recent-scans panel need not re-read the manifest on every list.
+    # Result counts ({num_segments, num_clips_scanned, candidates, truncated,
+    # score_kind}), cached so the panel need not re-read the artifact on every list.
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS counts JSONB",
-    # Which mechanism produced the row: "lilypad" for an offline scan launch,
-    # "app" for an in-app full-corpus export. Both belong in the same list -- the
-    # panel is the shared record of what was produced and where it landed -- but
-    # they differ in what a reader can expect (an app export is already complete
-    # and has no console to open).
+    # Which mechanism produced the row; "app" for an in-app full-corpus export.
     f"ALTER TABLE {_SCAN_TABLE} ADD COLUMN IF NOT EXISTS source TEXT",
-    # Threshold-tuning episodes: (score-distribution features, suggested tau, fitted
-    # tau, metrics) captured each time a labeled fit is produced. Append-only training
-    # data for a future learned threshold policy; no unique key (many tunes per tag).
-    f"""CREATE TABLE IF NOT EXISTS {_EPISODE_TABLE} (
-        id                 BIGSERIAL PRIMARY KEY,
-        created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-        user_email         TEXT,
-        query              TEXT,
-        tag                TEXT,
-        model_uri          TEXT,
-        embeddings_uri     TEXT,
-        features           JSONB,
-        suggested_tau      DOUBLE PRECISION,
-        fit_tau            DOUBLE PRECISION,
-        f1                 DOUBLE PRECISION,
-        precision          DOUBLE PRECISION,
-        recall             DOUBLE PRECISION,
-        average_precision  DOUBLE PRECISION,
-        objective          TEXT,
-        n_pos              INTEGER,
-        n_neg              INTEGER
-    )""",
-    f"""CREATE TABLE IF NOT EXISTS {_POLICY_TABLE} (
-        embeddings_uri    TEXT PRIMARY KEY,
-        feature_names     JSONB NOT NULL,
-        weights           JSONB NOT NULL,
-        n_episodes        INTEGER NOT NULL,
-        mae_policy        DOUBLE PRECISION,
-        mae_heuristic     DOUBLE PRECISION,
-        fitted_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-    )""",
 ]
 
 # Upsert keyed on `tag` (the true key): a row with a non-empty tag conflicts with the
@@ -382,16 +334,6 @@ def insert_export(record: dict, upsert_by_tag: bool = True) -> bool:
         return False
 
 
-_INSERT_EPISODE = text(
-    f"""INSERT INTO {_BARE_EPISODE}
-        (user_email, query, tag, model_uri, embeddings_uri, features, suggested_tau,
-         fit_tau, f1, precision, recall, average_precision, objective, n_pos, n_neg)
-        VALUES (:user_email, :query, :tag, :model_uri, :embeddings_uri, CAST(:features AS JSONB),
-                :suggested_tau, :fit_tau, :f1, :precision, :recall, :average_precision,
-                :objective, :n_pos, :n_neg)
-        RETURNING id"""
-)
-
 # Upsert one relevance judgment. Re-marking the same (query, segment, user)
 # updates the label + timestamp in place rather than adding a row, so the ledger
 # stays one-row-per-judgment.
@@ -412,9 +354,7 @@ _INSERT_MARK = text(
 def feedback_totals() -> dict:
     """Distinct human feedback counts from the ledger -- the HONEST totals.
 
-    Counts one row per (query, segment, user) judgment. This is what the
-    analytics page should show, NOT ``SUM(threshold_episodes.n_pos)`` (which
-    re-adds each fit's running tally and overcounts ~17x). Best-effort; returns
+    Counts one row per (query, segment, user) judgment. Best-effort; returns
     zeros when exp-db is unreachable."""
     try:
         if not _schema_ready:
@@ -547,80 +487,6 @@ def tags_catalog(limit: int = 500) -> list[dict]:
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: tags_catalog failed (%s): %s", type(exc).__name__, exc)
         return []
-
-
-def threshold_episodes(limit: int = 10000) -> list[dict]:
-    """All logged threshold-tuning episodes, newest-first. Training data for the
-    offline threshold-policy fit (scripts/fit_threshold_policy.py). Best-effort:
-    returns [] when exp-db is unreachable."""
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            rows = conn.execute(
-                text(
-                    f"SELECT created_at, features, suggested_tau, fit_tau, f1, tag, "
-                    f"objective, n_pos, n_neg, embeddings_uri, model_uri "
-                    f"FROM {_BARE_EPISODE} ORDER BY created_at DESC LIMIT :lim"
-                ),
-                {"lim": int(limit)},
-            ).mappings().all()
-        return [dict(r) for r in rows]
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: threshold_episodes failed (%s): %s", type(exc).__name__, exc)
-        return []
-
-
-_INSERT_POLICY = text(
-    f"""INSERT INTO {_BARE_POLICY}
-        (embeddings_uri, feature_names, weights, n_episodes, mae_policy, mae_heuristic, fitted_at)
-        VALUES (:embeddings_uri, CAST(:feature_names AS JSONB), CAST(:weights AS JSONB),
-                :n_episodes, :mae_policy, :mae_heuristic, now())
-        ON CONFLICT (embeddings_uri) DO UPDATE SET
-            feature_names = EXCLUDED.feature_names, weights = EXCLUDED.weights,
-            n_episodes = EXCLUDED.n_episodes, mae_policy = EXCLUDED.mae_policy,
-            mae_heuristic = EXCLUDED.mae_heuristic, fitted_at = now()"""
-)
-
-
-def upsert_threshold_policy(record: dict) -> bool:
-    """Persist the fitted ridge policy for one embedding space. Best-effort."""
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            conn.execute(_INSERT_POLICY, {
-                "embeddings_uri": record.get("embeddings_uri") or "",
-                "feature_names": json.dumps(record.get("feature_names") or []),
-                "weights": json.dumps(record.get("weights") or []),
-                "n_episodes": int(record.get("n_episodes") or 0),
-                "mae_policy": record.get("mae_policy"),
-                "mae_heuristic": record.get("mae_heuristic"),
-            })
-        return True
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: upsert_threshold_policy failed (%s): %s", type(exc).__name__, exc)
-        return False
-
-
-def get_threshold_policy(embeddings_uri: str) -> dict | None:
-    """The fitted policy for one embedding space, or None. Best-effort."""
-    try:
-        if not _schema_ready:
-            init_schema()
-        with _get_engine().begin() as conn:
-            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
-            row = conn.execute(
-                text(f"SELECT feature_names, weights, n_episodes, mae_policy, mae_heuristic "
-                     f"FROM {_BARE_POLICY} WHERE embeddings_uri = :uri"),
-                {"uri": embeddings_uri or ""},
-            ).mappings().first()
-        return dict(row) if row else None
-    except (SQLAlchemyError, OSError) as exc:
-        logger.warning("DB: get_threshold_policy failed (%s): %s", type(exc).__name__, exc)
-        return None
 
 
 def get_session(session_id: int) -> dict | None:

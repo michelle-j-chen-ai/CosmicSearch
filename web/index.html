@@ -295,12 +295,12 @@
 
     <div class="scans-section" id="scansSection" style="display:none;">
       <div class="section-label" style="display:flex; align-items:center; justify-content:space-between;">
-        <span>Recent scans</span>
+        <span>Recent exports</span>
         <button class="icon-btn-sm" id="scansReload">↻ Reload</button>
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Launched</th><th>Scan</th><th>Tags (@threshold)</th><th>Filters</th><th>Status</th><th>Results</th><th>Output (parquet / segments.lance)</th><th>Data Explorer (segment set)</th></tr></thead>
+          <thead><tr><th>Created</th><th>Export</th><th>Tags (@threshold)</th><th>Filters</th><th>Status</th><th>Results</th><th>Output (parquet / segments.lance)</th><th>Data Explorer (segment set)</th></tr></thead>
           <tbody id="scansBody"></tbody>
         </table>
       </div>
@@ -308,7 +308,7 @@
   </div>
 </div>
 
-<!-- export preview (Recent scans) -->
+<!-- export preview (Recent exports) -->
 <div class="preview-modal" id="previewModal">
   <div class="preview-head">
     <div><h3 id="previewTitle">Export preview</h3><p id="previewUri"></p></div>
