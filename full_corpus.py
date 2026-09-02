@@ -45,9 +45,8 @@ import oci_s3
 LOGGER = logging.getLogger(__name__)
 
 
-# The one corpus this app reads. Pinned, NOT a caller/workflow input -- see the
-# module docstring. Every other embedding source has been retired; anything that
-# needs "the corpus" resolves to this.
+# The neuron corpus, and the table `load()` reads when given no other. Which
+# table a request is served from is decided by `deployment`, never by the caller.
 DEFAULT_CORPUS_TABLE_URI = (
     "s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/video_embeddings.lance"
 )
@@ -56,13 +55,17 @@ DEFAULT_CORPUS_TABLE_URI = (
 CORPUS_MODEL = "black_dwarf"
 
 # Rebuilt per hit rather than held resident: 34.4M source_media_uri strings are
-# ~4.5GB, and the value is a pure function of (dt, run_uuid, chunk_start_unix).
-# Verified against the corpus: reconstruction matched on every sampled row.
-# Shares NLS_MP4_PREFIX with gpu_corpus so the two cannot disagree about where
-# the clips live.
-_MEDIA_URI_TEMPLATE = (
-    config.mp4_prefix() + "dt={dt}/{run_uuid}_t{chunk_start_unix}.mp4"
-)
+# ~4.5GB, and the value is a pure function of (dt, run_uuid, chunk_start_unix)
+# under the project's clip prefix. Verified against the neuron corpus:
+# reconstruction matched on every sampled row.
+_MEDIA_URI_SUFFIX = "dt={dt}/{run_uuid}_t{chunk_start_unix}.mp4"
+
+
+def media_uri(prefix: str, dt, run_uuid, chunk_start_unix) -> str:
+    """The clip's object URI under `prefix`."""
+    return prefix + _MEDIA_URI_SUFFIX.format(
+        dt=dt, run_uuid=run_uuid, chunk_start_unix=int(chunk_start_unix)
+    )
 
 # Rows per take() when fetching exact vectors for an export. take() has a ~1.65s
 # floor per call regardless of size, so bigger is cheaper -- but each chunk holds
@@ -234,6 +237,7 @@ class FullCorpus:
         # unanswerable. Set on the instance at load; defaulted here so a
         # directly-constructed corpus still has them.
         self.corpus_uri = DEFAULT_CORPUS_TABLE_URI
+        self.mp4_prefix = config.mp4_prefix()
         self.dataset_version = None
         # Rows whose embedding was null at load. They are zero-filled, so they
         # score exactly 0 and rank last -- present in num_rows, unreachable by
@@ -923,8 +927,7 @@ class FullCorpus:
         )
         chunk_ids = [f"{r}#t{int(s)}" for r, s in zip(runs, starts)]
         media = [
-            _MEDIA_URI_TEMPLATE.format(dt=d, run_uuid=r, chunk_start_unix=int(s))
-            for d, r, s in zip(dts, runs, starts)
+            media_uri(self.mp4_prefix, d, r, s) for d, r, s in zip(dts, runs, starts)
         ]
         cols = {
             "rank": np.arange(1, rows.size + 1, dtype=np.int64),
@@ -1057,9 +1060,7 @@ class FullCorpus:
             segment_id=seg,
             run_uuid=run_uuid,
             chunk_id=f"{run_uuid}#t{start}",
-            source_media_uri=_MEDIA_URI_TEMPLATE.format(
-                dt=dt, run_uuid=run_uuid, chunk_start_unix=start
-            ),
+            source_media_uri=media_uri(self.mp4_prefix, dt, run_uuid, start),
             chunk_start_unix=start,
             chunk_end_unix=None if end < 0 else int(end),
             vehicle=m["vehicle_uniques"][veh_code] if veh_code >= 0 else None,
@@ -1080,8 +1081,16 @@ def latest_version(uri: str = DEFAULT_CORPUS_TABLE_URI) -> "int | None":
     return getattr(ds, "version", None)
 
 
-def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
-    """Read the pinned corpus into memory. ~2 minutes, ~12GB resident.
+def load(
+    *,
+    model: str = CORPUS_MODEL,
+    table_uri: str = DEFAULT_CORPUS_TABLE_URI,
+    mp4_prefix: str | None = None,
+) -> FullCorpus:
+    """Read one corpus table into memory. ~2 minutes and ~12GB for the neuron table.
+
+    `table_uri` and `mp4_prefix` come from the project being loaded; the model
+    and its column family are the same for every project.
 
     `scan_in_order=True` keeps the screen matrix and the metadata arrays on the
     same canonical row order, so a position in one indexes the other.
@@ -1089,11 +1098,11 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     import pyarrow as pa
 
     so = oci_s3.lance_storage_options()
-    ds = lance.dataset(DEFAULT_CORPUS_TABLE_URI, storage_options=so)
+    ds = lance.dataset(table_uri, storage_options=so)
     i8_col = embedding_column(model)
     if i8_col not in ds.schema.names:
         raise ValueError(
-            f"{DEFAULT_CORPUS_TABLE_URI} has no column {i8_col!r} "
+            f"{table_uri} has no column {i8_col!r} "
             f"(available: {sorted(n for n in ds.schema.names if 'embedding' in n)})"
         )
     pca, scale, model_id = _read_field_pca(ds, model)
@@ -1187,7 +1196,8 @@ def load(*, model: str = CORPUS_MODEL) -> FullCorpus:
     corpus.null_embedding_rows = null_rows
     corpus.model_id = model_id
     corpus.dataset = ds
-    corpus.corpus_uri = DEFAULT_CORPUS_TABLE_URI
+    corpus.corpus_uri = table_uri
+    corpus.mp4_prefix = mp4_prefix or config.mp4_prefix()
     corpus.dataset_version = getattr(ds, "version", None)
     corpus.loaded_at = time.time()
     probe = corpus.probe_vector_fp()

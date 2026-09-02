@@ -49,9 +49,10 @@ def _sync_dora_env() -> None:
     os.environ.setdefault("CLOUD_ENVIRONMENT", "OCI")
 
 
-_STUB = None  # cached: get_stub() opens a Connector + gRPC channel + threads, so
-# we create it ONCE. Creating one per call leaks threads/channels and starves the
-# rest of the process (search slows to a crawl after many DORA calls).
+_STUBS: dict[str, object] = {}  # one per hostname: get_stub() opens a Connector
+# + gRPC channel + threads, so each is created ONCE. Creating one per call leaks
+# threads/channels and starves the rest of the process.
+_STUBS_LOCK = threading.Lock()
 
 # gRPC's default 4 MiB receive cap throttles segment-id fetches: at 4 MiB a page
 # tops out near 80k external_ids, so a multi-million-segment set needs hundreds of
@@ -73,10 +74,18 @@ _GRPC_CHANNEL_OPTIONS = [
 ]
 
 
-def _get_stub():
-    global _STUB
-    if _STUB is not None:
-        return _STUB
+def _default_hostname() -> str:
+    _sync_dora_env()
+    return os.getenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", "")
+
+
+def _get_stub(hostname: str | None = None):
+    """The stub for `hostname` (the env default when None), built once per host."""
+    host = hostname or _default_hostname()
+    with _STUBS_LOCK:
+        stub = _STUBS.get(host)
+    if stub is not None:
+        return stub
     try:
         from adp.services.dora_event_management.proto import (
             dora_event_management_service_pb2_grpc,
@@ -86,11 +95,12 @@ def _get_stub():
             "Data Explorer SDK not installed (need data-explorer-py + ursa-py). "
             "Segment-set downsampling is unavailable in this deployment."
         ) from exc
-    _sync_dora_env()
-    _STUB = _build_secure_stub(
-        dora_event_management_service_pb2_grpc.DoraEventManagementStub
+    stub = _build_secure_stub(
+        dora_event_management_service_pb2_grpc.DoraEventManagementStub, host
     )
-    return _STUB
+    with _STUBS_LOCK:
+        _STUBS[host] = stub
+    return stub
 
 
 def _wait_ready(channel, hostname) -> None:
@@ -105,7 +115,7 @@ def _wait_ready(channel, hostname) -> None:
         ) from exc
 
 
-def _build_secure_stub(stub_type):
+def _build_secure_stub(stub_type, hostname: str = ""):
     """A DORA stub whose channel allows large receive messages and is authed.
 
     Adds ``grpc.max_receive_message_length`` (so segment-id pages can be ~100k
@@ -125,7 +135,7 @@ def _build_secure_stub(stub_type):
     """
     import grpc
 
-    hostname = os.getenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", "")
+    hostname = hostname or os.getenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", "")
     if not hostname.startswith("grpc."):
         from adp.public.strada import dora
 
@@ -168,7 +178,7 @@ def _build_secure_stub(stub_type):
     return stub_type(channel)
 
 
-def prewarm() -> bool:
+def prewarm(hostname: str | None = None) -> bool:
     """Open the gRPC channel + fetch the machine token now (best-effort).
 
     Called at app startup so the FIRST user segment-set selection doesn't pay the
@@ -176,8 +186,8 @@ def prewarm() -> bool:
     the SDK is absent -- it just logs and returns False, and the lazy path retries
     on real use."""
     try:
-        _get_stub()
-        LOGGER.info("DORA stub pre-warmed")
+        _get_stub(hostname)
+        LOGGER.info("DORA stub pre-warmed (%s)", hostname or "default host")
         return True
     except Exception as exc:  # noqa: BLE001 -- prewarm is best-effort
         LOGGER.warning("DORA prewarm failed (will retry lazily): %s", exc)
@@ -188,20 +198,20 @@ def prewarm() -> bool:
 # typing keeps the same most-selective token, so each extra character reuses one
 # fetch instead of re-paginating DORA from scratch. Dataset versions are
 # effectively immutable, so a short TTL is safe.
-_LIST_CACHE: dict[str, tuple[float, list]] = {}
+_LIST_CACHE: dict[tuple[str, str], tuple[float, list]] = {}
 _LIST_CACHE_LOCK = threading.Lock()
 _LIST_TTL_S = 300
 
 
-def _list_datasets(dora_filter: str) -> list[SegmentSet]:
+def _list_datasets(dora_filter: str, hostname: str | None = None) -> list[SegmentSet]:
     """Latest version of each dataset matching DORA's fuzzy server filter (TTL-cached)."""
     now = time.time()
     with _LIST_CACHE_LOCK:
-        ent = _LIST_CACHE.get(dora_filter)
+        ent = _LIST_CACHE.get((hostname or "", dora_filter))
         if ent and ent[0] > now:
             return ent[1]
 
-    stub = _get_stub()
+    stub = _get_stub(hostname)
     import grpc
     from adp.public.proto import pagination_pb2
     from adp.services.dora_event_management.proto import (
@@ -244,11 +254,11 @@ def _list_datasets(dora_filter: str) -> list[SegmentSet]:
         raise DoraUnavailable(f"ListDataSets failed: {exc}") from exc
 
     with _LIST_CACHE_LOCK:
-        _LIST_CACHE[dora_filter] = (now + _LIST_TTL_S, out)
+        _LIST_CACHE[(hostname or "", dora_filter)] = (now + _LIST_TTL_S, out)
     return out
 
 
-def list_segment_sets(name_filter: str = "") -> list[SegmentSet]:
+def list_segment_sets(name_filter: str = "", hostname: str | None = None) -> list[SegmentSet]:
     """Latest version of each DORA dataset matching every whitespace token.
 
     DORA's name_filter is fuzzy and can't handle multi-word queries, so the
@@ -258,11 +268,11 @@ def list_segment_sets(name_filter: str = "") -> list[SegmentSet]:
     """
     # Resolve the stub first so a missing SDK is a clean DoraUnavailable (503),
     # even on a cache hit, rather than a raw ImportError.
-    _get_stub()
+    _get_stub(hostname)
     tokens = [t for t in name_filter.lower().split() if t]
     dora_filter = max(tokens, key=len) if tokens else name_filter
 
-    out = list(_list_datasets(dora_filter))
+    out = list(_list_datasets(dora_filter, hostname=hostname))
     if tokens:
         out = [s for s in out if all(t in s.name.lower() for t in tokens)]
     out.sort(key=lambda s: (s.name, -s.version))
@@ -270,13 +280,15 @@ def list_segment_sets(name_filter: str = "") -> list[SegmentSet]:
     return out
 
 
-def fetch_segment_ids(dataset_uuid: str, progress=None) -> frozenset[str]:
+def fetch_segment_ids(
+    dataset_uuid: str, progress=None, hostname: str | None = None
+) -> frozenset[str]:
     """The set of segment external_ids belonging to a dataset (paginated).
 
     ``progress`` (optional) is called with the running id count after each page,
     so a background loader can surface live progress for very large sets.
     """
-    stub = _get_stub()  # clean DoraUnavailable if the SDK isn't installed
+    stub = _get_stub(hostname)  # clean DoraUnavailable if the SDK isn't installed
 
     import grpc
     from adp.public.proto import pagination_pb2
@@ -315,7 +327,7 @@ def fetch_segment_ids(dataset_uuid: str, progress=None) -> frozenset[str]:
     return frozenset(ids)
 
 
-def fetch_segment_bitmap(dataset_uuid: str):
+def fetch_segment_bitmap(dataset_uuid: str, hostname: str | None = None):
     """The dataset's membership as a ``pyroaring.BitMap`` of global internal
     segment counters, fetched in a SINGLE ``DescribeDataSet(include_bitmap=True)``
     call -- no pagination, regardless of set size.
@@ -325,7 +337,7 @@ def fetch_segment_bitmap(dataset_uuid: str):
     intersected directly against a corpus that carries ``dx_internal_id``. Used
     by the fast segment-set downsample; returns a ``pyroaring.BitMap``.
     """
-    stub = _get_stub()  # clean DoraUnavailable if the SDK isn't installed
+    stub = _get_stub(hostname)  # clean DoraUnavailable if the SDK isn't installed
 
     import grpc
     from adp.public.proto import pagination_pb2
@@ -367,6 +379,7 @@ def create_dataset(
     external_ids: list[str],
     version: int | None = None,
     custom_metadata: dict | None = None,
+    hostname: str | None = None,
 ) -> tuple[str, int]:
     """Create a DORA curation dataset (segment set) from segment ``external_id``s.
 
@@ -378,7 +391,7 @@ def create_dataset(
     Returns ``(dataset_uuid, version)``. Raises ``DoraUnavailable`` if the SDK is
     absent or the RPC fails -- the caller surfaces that to the UI.
     """
-    stub = _get_stub()  # clean DoraUnavailable if the SDK isn't installed
+    stub = _get_stub(hostname)  # clean DoraUnavailable if the SDK isn't installed
 
     import grpc
     from adp.services.dora_event_management.proto import (

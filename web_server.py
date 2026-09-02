@@ -49,6 +49,7 @@ for _tv in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 import analytics
 import botocore.exceptions
 import db
+import deployment
 import dora_client
 import local_cache
 import oci_s3
@@ -114,14 +115,18 @@ def _load_engine() -> None:
     cfg = AppConfig.from_env()
     _state["cfg"] = cfg
     _state["s3"] = oci_s3.s3_client()
-    # One corpus, named once. Kept in _state because several endpoints stamp it
-    # onto persisted rows (exported vectors, threshold policies) as the space
-    # those numbers belong to.
-    _state["active_uri"] = full_corpus_module().DEFAULT_CORPUS_TABLE_URI
+    # The default project's table, stamped onto persisted rows (exported
+    # vectors) as the space those numbers belong to.
+    _state["active_uri"] = deployment.get(deployment.DEFAULT).corpus_table_uri
     threading.Thread(target=_warm_engine, name="engine-warmup", daemon=True).start()
-    # Pre-warm the DORA gRPC channel + machine token now (independent of the
-    # model), so the first segment-set selection doesn't pay channel/auth setup.
-    threading.Thread(target=dora_client.prewarm, name="dora-prewarm", daemon=True).start()
+    # Pre-warm each project's DORA gRPC channel + the machine token now
+    # (independent of the model), so the first segment-set selection doesn't pay
+    # channel/auth setup.
+    for name in deployment.enabled():
+        threading.Thread(
+            target=dora_client.prewarm, args=(_dora_host(name),),
+            name=f"dora-prewarm-{name}", daemon=True,
+        ).start()
 
 
 def _warm_engine() -> None:
@@ -143,13 +148,14 @@ def _warm_engine() -> None:
         _state["model_ready"] = True  # endpoints unblock here
         LOGGER.info("model ready")
         db.init_schema()  # best-effort; logs + continues if exp-db is unreachable
-        # There is one corpus, so start its load here rather than
-        # waiting for someone to search: the read and decode take minutes, and
-        # paying that on a user's first query reads as a hang. Runs on its own
-        # thread and never gates readiness -- browse works throughout.
+        # Start every enabled project's corpus load here rather than waiting
+        # for someone to search: the read and decode take minutes, and paying
+        # that on a user's first query reads as a hang. Each runs on its own
+        # thread and never gates readiness.
         try:
-            _full_corpus_begin_load()
-            LOGGER.info("full corpus load started in the background")
+            for name in deployment.enabled():
+                _full_corpus_begin_load(name)
+            LOGGER.info("corpus loads started: %s", ", ".join(deployment.enabled()))
             _start_corpus_refresh_schedule()
         except Exception as exc:  # noqa: BLE001 -- warm-up must not wedge startup
             LOGGER.warning("full corpus pre-warm could not start: %s", exc)
@@ -172,6 +178,23 @@ def _require_ready() -> None:
     raise HTTPException(503, "model is still loading; retry in a moment")
 
 
+def _project_of(req) -> str:
+    """The project a request addresses; the default when the model has no field."""
+    return getattr(req, "project", None) or deployment.DEFAULT
+
+
+def _project_or_404(name: str | None) -> "deployment.Project":
+    try:
+        return deployment.get(name)
+    except KeyError:
+        raise HTTPException(404, f"unknown project {name!r}; one of {deployment.names()}")
+
+
+def _dora_host(project: str) -> str | None:
+    """The Data Explorer host for a project's segment sets, or None for the env default."""
+    return _project_or_404(project).dora_hostname or None
+
+
 @app.get("/healthz")
 def healthz() -> dict:
     """Liveness/readiness: the port is up immediately; ``ready`` flips when the
@@ -184,25 +207,17 @@ def healthz() -> dict:
     }
 
 
-def _is_frontier() -> bool:
-    """True on the frontier/trucking deployment (derived from runtime env: Cloud Run service
-    name / DORA hostname). Both deployments run the same image."""
-    svc = os.getenv("K_SERVICE", "")
-    host = os.getenv("URSA_SDK_GRPC_HOSTNAME", "")
-    return "trucking" in svc.lower() or "frontier" in host.lower()
-
-
 @app.get("/api/platform")
 def platform() -> dict:
-    """Which deployment this is (cars vs trucking) -- both run the same image, so
-    it's derived from runtime env (Cloud Run service name / DORA hostname). Drives
-    the top-left platform tag + whether the offline scan is offered. Not gated on
-    model readiness, so the tag shows immediately during warmup."""
-    is_trucks = _is_frontier()
+    """The projects this deployment serves and which is the default. Drives the
+    project selector; not gated on readiness, so it renders during warmup."""
+    on = set(deployment.enabled())
     return {
-        "name": "trucks" if is_trucks else "cars",
-        "label": "TRUCKING" if is_trucks else "CARS",
-        # Frontier holds the whole dataset in CPU memory, so the offline scan is hidden there.
+        "default": deployment.DEFAULT,
+        "projects": [
+            {"name": p.name, "label": p.label, "enabled": p.name in on}
+            for p in (deployment.get(n) for n in deployment.names())
+        ],
     }
 
 
@@ -287,7 +302,7 @@ def _write_seg_cache(uuid: str, ids: frozenset[str]) -> None:
         LOGGER.warning("could not write segment-set disk cache for %s: %s", uuid, exc)
 
 
-def _segment_ids(uuid: str) -> "frozenset[str] | None":
+def _segment_ids(uuid: str, hostname: str | None = None) -> "frozenset[str] | None":
     """The set's segment_ids if resident, else None while a loader runs.
 
     Fetched in the BACKGROUND and never inline: a large Data Explorer set is
@@ -313,7 +328,7 @@ def _segment_ids(uuid: str) -> "frozenset[str] | None":
         try:
             ids = _read_seg_cache(uuid)
             if ids is None:
-                ids = dora_client.fetch_segment_ids(uuid, progress=_progress)
+                ids = dora_client.fetch_segment_ids(uuid, progress=_progress, hostname=hostname)
                 _write_seg_cache(uuid, ids)
             rec = {"status": "done", "ids": ids, "count": len(ids), "err": None}
         except Exception as exc:  # noqa: BLE001 -- a background loader must not die silently
@@ -507,6 +522,7 @@ class ConfigExportRequest(BaseModel):
     """Batch export: each query contributes its own top-k, concatenated into one
     CSV/parquet -- the same artifact flow as a single Export, run N times."""
 
+    project: str = deployment.DEFAULT
     queries: list[ConfigQuery] = []
     dedupe: bool = True
     # When true, collapse to one row per segment_id (best-scoring clip per segment) after the
@@ -548,6 +564,7 @@ class CurateExportRequest(BaseModel):
     preview) -- the same CSV/parquet/segment-set artifacts as ``/api/export_config``,
     but built from exactly these rows rather than re-running the queries."""
 
+    project: str = deployment.DEFAULT
     rows: list[CurateRow] = []
     embeddings_uri: str | None = None
     filter_lance_uri: str | None = None
@@ -559,23 +576,14 @@ class CurateExportRequest(BaseModel):
 
 # --- API --------------------------------------------------------------------
 @app.get("/api/corpus")
-def corpus_info(uri: str | None = None) -> dict:
-    """Info for THE corpus. There is only one, and it cannot be switched.
-
-    `uri` used to load and activate an arbitrary Lance table. Pointing a run at
-    the wrong table silently produces plausible results -- a query scored against
-    another model's embeddings still returns a ranked list -- so the corpus is
-    pinned to `full_corpus.DEFAULT_CORPUS_TABLE_URI` and the parameter is
-    rejected rather than ignored.
+def corpus_info(project: str = deployment.DEFAULT) -> dict:
+    """Info for one project's corpus. Which table that is comes from `deployment`,
+    not the request: a query scored against another model's embeddings still
+    returns a plausible ranked list, so a caller cannot point a search at an
+    arbitrary Lance table.
     """
-    if uri and uri.strip() and uri.strip() != full_corpus_module().DEFAULT_CORPUS_TABLE_URI:
-        raise HTTPException(
-            400,
-            "the corpus is fixed to "
-            f"{full_corpus_module().DEFAULT_CORPUS_TABLE_URI} and cannot be switched",
-        )
     cfg = _state["cfg"]
-    c = _require_full_corpus()
+    c = _require_full_corpus(project)
     lo, hi = c.time_span()
     return {
         "num_rows": c.num_rows,
@@ -588,6 +596,7 @@ def corpus_info(uri: str | None = None) -> dict:
         .date()
         .isoformat(),
         "has_segment_id": c.has_segment_id(),
+        "project": project,
         "embeddings_uri": c.corpus_uri,
         "corpus_version": c.dataset_version,
         # The ACTIVE (possibly runtime-swapped) encoder, not just the configured
@@ -682,12 +691,12 @@ _UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg i
 
 
 @app.get("/api/segment_sets")
-def segment_sets(name_filter: str = "") -> list[dict]:
+def segment_sets(name_filter: str = "", project: str = deployment.DEFAULT) -> list[dict]:
     """Data Explorer sets whose name matches, for the downsample picker."""
     if not name_filter.strip():
         return []
     try:
-        sets = dora_client.list_segment_sets(name_filter.strip())
+        sets = dora_client.list_segment_sets(name_filter.strip(), hostname=_dora_host(project))
     except dora_client.DoraUnavailable as exc:
         raise HTTPException(503, str(exc))
     return [
@@ -703,13 +712,13 @@ def segment_sets(name_filter: str = "") -> list[dict]:
 
 
 @app.get("/api/segment_set_prefetch")
-def segment_set_prefetch(uuid: str) -> dict:
+def segment_set_prefetch(uuid: str, project: str = deployment.DEFAULT) -> dict:
     """Start the background id-load without running a search.
 
     Called the moment a set is picked, so the DORA pull overlaps the user
     composing their query and the first filtered search does not have to re-run.
     """
-    _segment_ids(uuid)  # idempotent: starts a loader only if not cached/loading
+    _segment_ids(uuid, _dora_host(project))  # idempotent: starts a loader only if not cached/loading
     return _seg_state(uuid)
 
 
@@ -801,6 +810,7 @@ class SaveVectorRequest(BaseModel):
     # Persist a search vector under a tag, for reuse on the Curate page. The
     # vector is required: a refined (relevance-feedback) direction cannot be
     # recovered by re-encoding the query text, and the client already holds it.
+    project: str = deployment.DEFAULT
     tag: str
     query: str = ""
     vector: list[float] | None = None
@@ -1036,7 +1046,7 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
     queries = [q for q in req.queries if q.query.strip()]
     if not queries:
         raise HTTPException(400, "no queries in config")
-    corpus = _require_full_corpus()
+    corpus = _require_full_corpus(_project_of(req))
     uri = corpus.corpus_uri
     # One filter set (date + vehicle + drive + segment set + lance) for every query.
     filters = _full_filters(req)
@@ -1142,6 +1152,7 @@ def export_config(req: ConfigExportRequest, request: Request) -> Response:
     segset_label, segset_error = "", ""
     if req.create_segment_set:
         segset_label, segset_error = _create_export_segment_set(
+            req.project,
             (h.segment_id for _, h in rows),
             base,
             provenance={
@@ -1188,7 +1199,7 @@ def curate_preview(req: ConfigExportRequest, request: Request) -> dict:
     queries = [q for q in req.queries if q.query.strip()]
     if not queries:
         raise HTTPException(400, "no queries in config")
-    corpus = _require_full_corpus()
+    corpus = _require_full_corpus(_project_of(req))
     uri = corpus.corpus_uri
     filters = _full_filters(req)
     model_uri = _state["cfg"].model_artifact_uri
@@ -1274,6 +1285,7 @@ def curate_export(req: CurateExportRequest, request: Request) -> Response:
     segset_label, segset_error = "", ""
     if req.create_segment_set:
         segset_label, segset_error = _create_export_segment_set(
+            req.project,
             (h.segment_id for _, h in rows),
             base,
             provenance={
@@ -1791,38 +1803,53 @@ def fmtint(n) -> str:
 # by the first request that needs it, if that lands first) rather than in the
 # startup event, so uvicorn binds the port immediately and the UI can poll
 # `/api/full_corpus_status` while it runs.
-_FULL_LOCK = threading.Lock()
-_FULL: dict = {"corpus": None, "status": "idle", "error": "", "started": 0.0}
+_CORPORA_LOCK = threading.Lock()
+# One slot per project: {"corpus", "status", "error", "started"}. Created idle on
+# first reference so a valid but not-yet-loaded project has a state to report.
+_CORPORA: dict[str, dict] = {}
 
 
-def _full_load_worker() -> None:
+def _slot(project: str) -> dict:
+    """This project's slot. Callers hold _CORPORA_LOCK."""
+    slot = _CORPORA.get(project)
+    if slot is None:
+        slot = _CORPORA[project] = {"corpus": None, "status": "idle", "error": "", "started": 0.0}
+    return slot
+
+
+def _full_load_worker(project: str) -> None:
     import full_corpus
 
+    spec = deployment.get(project)
     try:
-        corpus = full_corpus.load()
-        with _FULL_LOCK:
-            _FULL["corpus"] = corpus
-            _FULL["status"] = "ready"
-            _FULL["error"] = ""
-        LOGGER.info("full corpus ready: %d rows", corpus.num_rows)
+        corpus = full_corpus.load(table_uri=spec.corpus_table_uri, mp4_prefix=spec.mp4_prefix)
+        with _CORPORA_LOCK:
+            slot = _slot(project)
+            slot["corpus"] = corpus
+            slot["status"] = "ready"
+            slot["error"] = ""
+        LOGGER.info("%s corpus ready: %d rows", project, corpus.num_rows)
     except Exception as exc:  # noqa: BLE001 -- surfaced through the status endpoint
-        LOGGER.exception("full corpus load failed")
-        with _FULL_LOCK:
-            _FULL["corpus"] = None
-            _FULL["status"] = "error"
-            _FULL["error"] = f"{type(exc).__name__}: {exc}"
+        LOGGER.exception("%s corpus load failed", project)
+        with _CORPORA_LOCK:
+            slot = _slot(project)
+            slot["corpus"] = None
+            slot["status"] = "error"
+            slot["error"] = f"{type(exc).__name__}: {exc}"
 
 
-def _full_corpus_begin_load() -> str:
-    """Start the background load if it is not already running/ready."""
-    with _FULL_LOCK:
-        if _FULL["status"] in ("loading", "ready"):
-            return _FULL["status"]
-        _FULL["status"] = "loading"
-        _FULL["error"] = ""
-        _FULL["started"] = time.time()
+def _full_corpus_begin_load(project: str = deployment.DEFAULT) -> str:
+    """Start the project's background load if it is not already running/ready."""
+    _project_or_404(project)
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        if slot["status"] in ("loading", "ready"):
+            return slot["status"]
+        slot["status"] = "loading"
+        slot["error"] = ""
+        slot["started"] = time.time()
     threading.Thread(
-        target=_full_load_worker, name="full-corpus-load", daemon=True
+        target=_full_load_worker, args=(project,), name=f"corpus-load-{project}", daemon=True
     ).start()
     return "loading"
 
@@ -1839,8 +1866,8 @@ _FULL_MAX_DEPTH = 5000
 _WINDOW_MAX_POOL = 512
 
 
-def _full_refresh_worker() -> None:
-    """Drop the resident corpus, then load the current one.
+def _full_refresh_worker(project: str = deployment.DEFAULT) -> None:
+    """Drop the project's resident corpus, then load the current one.
 
     Dropping FIRST is not a style choice: the process already holds ~24GB (model,
     browse matrix, full corpus) against a 32Gi ceiling, so building a replacement
@@ -1851,22 +1878,21 @@ def _full_refresh_worker() -> None:
     """
     import gc
 
-    with _FULL_LOCK:
-        previous = _FULL["corpus"]
-        _FULL["corpus"] = None
-        _FULL["status"] = "loading"
-        _FULL["error"] = ""
-        _FULL["started"] = time.time()
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        previous = slot["corpus"]
+        slot["corpus"] = None
+        slot["status"] = "loading"
+        slot["error"] = ""
+        slot["started"] = time.time()
     del previous
-    with _FULL_SEG_LOCK:
-        _FULL_SEG_IDS.clear()
     gc.collect()
-    _full_load_worker()
+    _full_load_worker(project)
 
 
 @app.post("/api/full_corpus_refresh")
-def full_corpus_refresh(if_changed: bool = False) -> dict:
-    """Reload the full corpus from the current Lance, picking up new rows.
+def full_corpus_refresh(if_changed: bool = False, project: str = deployment.DEFAULT) -> dict:
+    """Reload one project's corpus from its current Lance, picking up new rows.
 
     Returns immediately; the reload runs on a background thread and is
     observable through /api/full_corpus_status. This instance only: see
@@ -1881,18 +1907,20 @@ def full_corpus_refresh(if_changed: bool = False) -> dict:
     half-built corpus and start over, which is strictly worse than letting the
     first finish.
     """
-    with _FULL_LOCK:
-        if _FULL["status"] == "loading":
-            return {"status": "loading", "note": "refresh already in progress"}
-        resident = _FULL["corpus"]
+    _project_or_404(project)
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        if slot["status"] == "loading":
+            return {"status": "loading", "project": project, "note": "refresh already in progress"}
+        resident = slot["corpus"]
     if if_changed:
-        verdict = _corpus_version_check(resident)
+        verdict = _corpus_version_check(resident, project)
         if not verdict["changed"]:
-            return {"status": "ready", **verdict}
+            return {"status": "ready", "project": project, **verdict}
     threading.Thread(
-        target=_full_refresh_worker, name="full-corpus-refresh", daemon=True
+        target=_full_refresh_worker, args=(project,), name=f"corpus-refresh-{project}", daemon=True
     ).start()
-    return {"status": "refreshing"}
+    return {"status": "refreshing", "project": project}
 
 
 # ------------------------- daily corpus refresh -----------------------------
@@ -1941,13 +1969,14 @@ def _seconds_until(hhmm: str, now: float) -> float:
     return target - now if target > now else target + 86400 - now
 
 
-def _corpus_version_check(resident) -> dict:
-    """Has the table moved since `resident` was read? One metadata call."""
+def _corpus_version_check(resident, project: str = deployment.DEFAULT) -> dict:
+    """Has the project's table moved since `resident` was read? One metadata call."""
     import full_corpus
 
     held = getattr(resident, "dataset_version", None)
-    latest = full_corpus.latest_version()
+    latest = full_corpus.latest_version(deployment.get(project).corpus_table_uri)
     _REFRESH["table_version"] = latest
+    _REFRESH.setdefault("table_versions", {})[project] = latest
     _REFRESH["last_check_utc"] = _utc(int(time.time()))
     # An unknown version is not evidence of sameness. Refresh rather than skip:
     # the cost of a needless reload is minutes of one instance, the cost of a
@@ -1956,30 +1985,37 @@ def _corpus_version_check(resident) -> dict:
     return {"changed": changed, "held_version": held, "table_version": latest}
 
 
-def _corpus_refresh_tick() -> str:
-    """One scheduled check. Reloads only if the table has actually moved."""
-    with _FULL_LOCK:
-        status, resident = _FULL["status"], _FULL["corpus"]
+def _corpus_refresh_tick(project: str = deployment.DEFAULT) -> str:
+    """One scheduled check of one project. Reloads only if its table has moved."""
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        status, resident = slot["status"], slot["corpus"]
     if status == "loading":
         return "skipped: a load is already in flight"
     if resident is None:
         # Nothing resident to make stale. Starting a load here would be a
         # surprise on an instance that has not been asked for one.
         return "skipped: no corpus resident"
-    verdict = _corpus_version_check(resident)
+    verdict = _corpus_version_check(resident, project)
     if not verdict["changed"]:
         _REFRESH["skipped"] += 1
         return f"skipped: version {verdict['table_version']} unchanged"
-    _full_refresh_worker()  # inline: this thread has nothing else to do
-    with _FULL_LOCK:
-        after = _FULL["corpus"]
+    _full_refresh_worker(project)  # inline: this thread has nothing else to do
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        after, error = slot["corpus"], slot["error"]
     if after is None:
-        return f"failed: {_FULL['error']}"
+        return f"failed: {error}"
     _REFRESH["refreshes"] += 1
     return (
         f"reloaded {verdict['held_version']} -> {after.dataset_version} "
         f"({after.num_rows} rows)"
     )
+
+
+def _corpus_refresh_all() -> str:
+    """One scheduled check across every enabled project."""
+    return "; ".join(f"{p}: {_corpus_refresh_tick(p)}" for p in deployment.enabled())
 
 
 def _corpus_refresh_scheduler() -> None:
@@ -1990,7 +2026,7 @@ def _corpus_refresh_scheduler() -> None:
         _REFRESH["next_utc"] = _utc(int(time.time() + delay))
         time.sleep(delay)
         try:
-            result = _corpus_refresh_tick()
+            result = _corpus_refresh_all()
             _REFRESH["last_result"] = result
             _REFRESH["error"] = ""
             LOGGER.info("daily corpus refresh: %s", result)
@@ -2021,12 +2057,6 @@ def _start_corpus_refresh_schedule() -> None:
     )
 
 
-def full_corpus_module():
-    import full_corpus
-
-    return full_corpus
-
-
 class FullExportRequest(BaseModel):
     """Export from the FULL corpus, in-process. Replaces the offline Lilypad scan.
 
@@ -2036,6 +2066,7 @@ class FullExportRequest(BaseModel):
     when projected past `_FULL_EXACT_BUDGET_S` rather than silently downgraded.
     """
 
+    project: str = deployment.DEFAULT
     query: str
     tag: str = ""
     k: int | None = None
@@ -2062,6 +2093,7 @@ class CalibrateRequest(BaseModel):
     tag on the label-free mean+3*std heuristic with nothing saying so.
     """
 
+    project: str = deployment.DEFAULT
     query: str
     marks: list[Mark] = []
     objective: str = "f1"
@@ -2078,11 +2110,6 @@ class CalibrateRequest(BaseModel):
     segment_set_uuid: str | None = None
 
 
-# Segment-set membership resolved against the FULL corpus, cached per set uuid.
-# The resident corpus is pinned to one dataset version for its lifetime, so a
-# set's mask cannot go stale under it; the cache is cleared when it reloads.
-_FULL_SEG_IDS: dict[str, frozenset] = {}
-_FULL_SEG_LOCK = threading.Lock()
 
 
 def _full_lance_filter(lance_uri: str | None) -> dict:
@@ -2126,7 +2153,7 @@ def _full_filters(req) -> dict:
     """Filter kwargs for `full_corpus` from any request carrying the standard
     filter fields. One definition so no endpoint can quietly support a different
     subset than the others."""
-    corpus = _require_full_corpus()
+    corpus = _require_full_corpus(_project_of(req))
     start_unix, end_unix = _date_bounds(
         getattr(req, "from_date", None), getattr(req, "to_date", None), corpus
     )
@@ -2137,13 +2164,13 @@ def _full_filters(req) -> dict:
                 "run_uuids": set(_parse_drive_ids(getattr(req, "drive_id", None))) or None,
                 "date_range": (start_unix, end_unix) if (start_unix or end_unix) else None,
             },
-            _segment_set_filter(getattr(req, "segment_set_uuid", None)),
+            _segment_set_filter(getattr(req, "segment_set_uuid", None), _project_of(req)),
         ),
         _full_lance_filter(getattr(req, "filter_lance_uri", None)),
     )
 
 
-def _segment_set_filter(uuid: "str | None") -> dict:
+def _segment_set_filter(uuid: "str | None", project: str = deployment.DEFAULT) -> dict:
     """Filter kwargs restricting the corpus to a Data Explorer segment set.
 
     A set whose ids are still loading raises 503 rather than returning no filter.
@@ -2154,7 +2181,7 @@ def _segment_set_filter(uuid: "str | None") -> dict:
     if not uuid or not uuid.strip():
         return {}
     uuid = uuid.strip()
-    ids = _segment_ids(uuid)
+    ids = _segment_ids(uuid, _dora_host(project))
     if ids is None:
         state = _seg_state(uuid)
         if state["status"] == "error":
@@ -2330,6 +2357,7 @@ class RetrieveRequest(BaseModel):
     # frames, or the marks themselves -- these are five ways to arrive at one
     # 768-d direction, not five kinds of search, so they are inputs here rather
     # than endpoints of their own.
+    project: str = deployment.DEFAULT
     query: str = ""
     vector: list[float] | None = None
     window: "WindowRef | None" = None
@@ -2395,7 +2423,7 @@ def retrieve(req: RetrieveRequest, request: Request):
         raise HTTPException(400, "output must be hits, csv, vector or scores")
     if req.output in ("hits", "csv") and (req.k is None) == (req.threshold is None):
         raise HTTPException(400, "pass exactly one of k or threshold")
-    corpus = _require_full_corpus()
+    corpus = _require_full_corpus(_project_of(req))
     vec = _retrieve_vector(req, corpus)
 
     if req.output == "vector":
@@ -2718,6 +2746,7 @@ def _full_export_write(
     segset_label, segset_error = "", ""
     if req.create_segment_set:
         segset_label, segset_error = _create_export_segment_set(
+            req.project,
             table.column("segment_id").to_pylist(),
             base,
             provenance={
@@ -2789,6 +2818,7 @@ def _full_export_intervals(
     segset_label, segset_error = "", ""
     if req.create_segment_set:
         segset_label, segset_error = _create_export_segment_set(
+            req.project,
             (r["segment_id"] for r in rows),
             base,
             provenance={
@@ -2913,7 +2943,9 @@ def _arrow_csv(table) -> str:
 _SEGSET_MAX_SEGMENTS = int(os.getenv("NLS_SEGSET_MAX_SEGMENTS", "500000"))
 
 
-def _create_export_segment_set(seg_ids, name: str, *, provenance: dict) -> tuple[str, str]:
+def _create_export_segment_set(
+    project: str, seg_ids, name: str, *, provenance: dict
+) -> tuple[str, str]:
     """Register the exported segments as a DORA dataset. Returns ``(label, error)``.
 
     Best-effort by construction: a DORA failure comes back in the error string and
@@ -2931,7 +2963,9 @@ def _create_export_segment_set(seg_ids, name: str, *, provenance: dict) -> tuple
     meta = {k: v for k, v in provenance.items() if v not in (None, "", [])}
     meta["num_segments"] = len(ids)
     try:
-        uuid_str, version = dora_client.create_dataset(name, ids, custom_metadata=meta)
+        uuid_str, version = dora_client.create_dataset(
+            name, ids, custom_metadata=meta, hostname=_dora_host(project)
+        )
     except Exception as exc:  # noqa: BLE001 -- see the docstring: never fail the export
         LOGGER.warning(
             "export segment-set create failed (%s): %s", type(exc).__name__, exc,
@@ -3095,11 +3129,7 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
         raise HTTPException(400, "query must not be empty")
     if not _state.get("model_ready"):
         raise HTTPException(503, "model still loading")
-    with _FULL_LOCK:
-        corpus = _FULL["corpus"]
-    if corpus is None:
-        _full_corpus_begin_load()
-        raise HTTPException(503, "full corpus is loading; poll /api/full_corpus_status")
+    corpus = _require_full_corpus(req.project)
 
     vec = search_engine.encode_query(
         query, _state["processor"], _state["model"], _state["cfg"].device
@@ -3193,16 +3223,19 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
 
 
 @app.get("/api/full_corpus_status")
-def full_corpus_status() -> dict:
+def full_corpus_status(project: str = deployment.DEFAULT) -> dict:
     import full_corpus
 
-    with _FULL_LOCK:
-        status, error, started = _FULL["status"], _FULL["error"], _FULL["started"]
-        corpus = _FULL["corpus"]
+    spec = _project_or_404(project)
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        status, error, started = slot["status"], slot["error"], slot["started"]
+        corpus = slot["corpus"]
     out = {
+        "project": project,
         "status": status,
         "error": error,
-        "corpus_uri": full_corpus.DEFAULT_CORPUS_TABLE_URI,
+        "corpus_uri": spec.corpus_table_uri,
         "model": full_corpus.CORPUS_MODEL,
         "num_rows": corpus.num_rows if corpus is not None else 0,
         # A row count is not a searchable count: rows whose embedding was null
@@ -3221,9 +3254,9 @@ def full_corpus_status() -> dict:
 
 
 @app.post("/api/full_corpus_load")
-def full_corpus_load() -> dict:
-    """Begin (or report) the on-demand load. Returns immediately."""
-    return {"status": _full_corpus_begin_load()}
+def full_corpus_load(project: str = deployment.DEFAULT) -> dict:
+    """Begin (or report) the project's on-demand load. Returns immediately."""
+    return {"status": _full_corpus_begin_load(project), "project": project}
 
 
 def _rocchio(
@@ -3249,16 +3282,20 @@ def _rocchio(
     return w.astype(np.float32)
 
 
-def _require_full_corpus():
-    """The resident full corpus, or a 503 that starts the load."""
-    with _FULL_LOCK:
-        corpus, status, error = _FULL["corpus"], _FULL["status"], _FULL["error"]
+def _require_full_corpus(project: str = deployment.DEFAULT):
+    """The project's resident corpus, or a 503 that starts its load."""
+    _project_or_404(project)
+    with _CORPORA_LOCK:
+        slot = _slot(project)
+        corpus, status, error = slot["corpus"], slot["status"], slot["error"]
     if corpus is None:
         if status == "error":
-            raise HTTPException(503, f"full corpus load failed: {error}")
-        _full_corpus_begin_load()
+            raise HTTPException(503, f"{project} corpus load failed: {error}")
+        _full_corpus_begin_load(project)
         raise HTTPException(
-            503, "full corpus is loading (~2 min); poll /api/full_corpus_status and retry"
+            503,
+            f"{project} corpus is loading (~2 min); poll /api/full_corpus_status"
+            f"?project={project} and retry",
         )
     return corpus
 
