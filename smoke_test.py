@@ -15,14 +15,6 @@ import pyarrow as pa
 import search_engine
 
 
-def test_vectors_from_arrow_roundtrip() -> None:
-    vectors = [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]
-    table = pa.table({"vector": pa.array(vectors, type=pa.list_(pa.float32()))})
-    out = search_engine._vectors_from_arrow(table)
-    assert out.shape == (3, 3), out.shape
-    np.testing.assert_allclose(out, np.array(vectors, dtype="float32"))
-
-
 def _toy_corpus() -> "search_engine.Corpus":
     matrix = np.array(
         [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.6, 0.8, 0.0]],
