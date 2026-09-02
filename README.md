@@ -171,6 +171,11 @@ Cold start downloads the model (base model from HF, or the merged snapshot from
 | `NLS_PRESIGN_TTL_S` | `3600` | presigned MP4 URL lifetime |
 | `NLS_OWNER_EMAIL` | `""` | Comma-separated maintainer emails allowed to view the usage-analytics sidebar; empty = nobody (fail closed) |
 | `AWS_*` | -- | OCI S3-compat credentials + endpoint |
+| `NLS_PROJECTS` | `neuron` | Comma-separated projects this instance loads and serves (`neuron`, `frontier`). Every `/api/` call takes `project` (query param or body field), defaulting to `neuron` |
+| `NLS_<PROJECT>_CORPUS_TABLE_URI` | per project, see `deployment.py` | Override a project's Lance table |
+| `NLS_<PROJECT>_MP4_PREFIX` | per project | Override where a project's clips are stored |
+| `NLS_<PROJECT>_DORA_HOSTNAME` | per project | Override a project's Data Explorer gRPC host |
+| `NLS_MP4_PREFIX` | neuron clip prefix | Shared default clip prefix; `neuron` inherits it |
 
 ## OCI presigned-URL gotchas
 
