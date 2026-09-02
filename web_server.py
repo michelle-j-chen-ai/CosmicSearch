@@ -882,24 +882,13 @@ def save_vector(req: SaveVectorRequest, request: Request) -> dict:
 # runs HERE, off the request path, and persists its results to the scan_jobs rows. The
 # GET endpoint is then always a pure DB read that just kicks this and reports whether a
 # refresh is in flight, so the panel converges to live truth without ever blocking.
-_SCAN_REFRESH_LOCK = threading.Lock()
-_SCAN_REFRESH = {"running": False, "last": 0.0}
-_SCAN_REFRESH_MIN_INTERVAL_S = 15.0
-
-
 @app.get("/api/scans")
 def scans(limit: int = 50, live: bool = False) -> dict:
-    """Recent launched per-segment scans (newest first) for the Export tab's panel; each
-    entry: execution_id, status, tags, thresholds, counts, console_url, output lance,
-    segment-set info, timestamps.
-
-    Always a PURE DB read -- the response never blocks on Lilypad/DORA/OCI. Stale rows
-    (in-flight status, missing counts, pending segment-set) are refreshed by a throttled
-    single-flight background worker that this endpoint kicks; ``refreshing`` in the
-    response tells the client to re-poll shortly to pick up the refreshed rows.
-    ``live=1`` (the panel's Reload button) forces the kick past the throttle."""
+    """Recent in-app exports (newest first) for the Export tab's panel; each entry:
+    execution_id, status, tags, thresholds, counts, output parquet, segment-set
+    info, timestamps. A pure DB read: every row is final when written."""
     rows = db.list_scan_jobs(limit=limit)
-    refreshing = False  # nothing to poll: every row is final when written
+    refreshing = False
     jobs = [
         {
             "execution_id": row.get("execution_id"),
@@ -911,8 +900,7 @@ def scans(limit: int = 50, live: bool = False) -> dict:
             "output_dir": row.get("output_dir") or "",
             "lance_uri": row.get("lance_uri") or "",
             "console_url": row.get("console_url") or "",
-            # "lilypad" (offline launch) vs "app" (in-app full-corpus export).
-            "source": row.get("source") or "lilypad",
+            "source": row.get("source") or "app",
             "register_segset": bool(row.get("register_segset")),
             "segset_uuid": row.get("segset_uuid") or "",
             "segset_label": row.get("segset_label") or "",
@@ -1031,44 +1019,6 @@ def _score_histogram(scores: np.ndarray, tau: float | None, bins: int = 50) -> d
         "tau": (round(float(tau), 6) if tau is not None else None),
         "above_tau": (int(np.count_nonzero(finite >= tau)) if tau is not None else None),
     }
-
-
-# --- learned threshold policy: cached weights per embedding space -----------
-# Serving predicts the suggested tau with a dot product over cached weights (no
-# fit on the request path). Fitting happens in a background thread as episodes
-# accumulate, or via POST /api/refit_policy. Falls back to the heuristic when no
-# policy is fitted yet (< ~20 labeled tunes for the corpus).
-_policy_cache: dict[str, tuple[dict | None, float]] = {}
-_policy_lock = threading.Lock()
-_POLICY_TTL_S = 300.0
-_policy_episode_count = 0
-
-
-def _refit_policy(uri: str) -> dict | None:
-    """Fit + persist the ridge policy for one embedding space from its episodes."""
-    eps = [e for e in db.threshold_episodes() if (e.get("embeddings_uri") or "") == (uri or "")]
-    pol = search_engine.fit_threshold_policy(eps)
-    if pol:
-        pol["embeddings_uri"] = uri or ""
-        db.upsert_threshold_policy(pol)
-        with _policy_lock:
-            _policy_cache[uri or ""] = (pol, time.time())
-    return pol
-
-
-@app.post("/api/refit_policy")
-def refit_policy(request: Request) -> dict:
-    """Fit + persist the learned threshold policy for the active corpus now.
-    Returns the fit summary (or a note when there aren't enough episodes yet)."""
-    _require_ready()
-    uri = _state["active_uri"]
-    pol = _refit_policy(uri)
-    if not pol:
-        return {"fitted": False, "embeddings_uri": uri,
-                "note": "Not enough labeled episodes yet for this corpus (need ~20). Heuristic stays live."}
-    return {"fitted": True, "embeddings_uri": uri, "feature_names": pol["feature_names"],
-            "weights": pol["weights"], "n_episodes": pol["n_episodes"],
-            "mae_policy": pol["mae_policy"], "mae_heuristic": pol["mae_heuristic"]}
 
 
 @app.post("/api/export_config")
@@ -1752,36 +1702,16 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
         or "<tr><td colspan=8 class=empty>No exports recorded yet — hit Download on a search to create one.</td></tr>"
     )
 
-    # ---- Threshold-tuning feedback (👍/👎) ----
-    # Every threshold-sweep fit logs an episode with the running 👍/👎 tally; this is
-    # the durable record of the labeling done in the refine+threshold steps. (Marks
-    # also ride along on saved searches -- shown per-row in "Recent exports" above.)
-    episodes = db.threshold_episodes(limit=2000)
-    # Distinct human judgments (one per query+segment+user). NOT sum(n_pos) over
-    # episodes: each episode logs a session's *running* tally, so summing them
-    # re-counts the same thumbs ~17x (that was the inflated 22k/13k). The ledger
-    # (feedback_marks) is one row per judgment, so its counts are the true totals.
+    # ---- Feedback labels (👍/👎) ----
+    # feedback_marks is one row per distinct judgment (query, segment, user), so
+    # its counts are the true totals.
     fb = db.feedback_totals()
     fb_total_up = fb["up"]
     fb_total_down = fb["down"]
     fb_queries = fb["queries"]
-    fb_rows = (
-        "".join(
-            f"<tr><td>{_fmt_ts(e.get('created_at'))}</td>"
-            f"<td class=tag>{_esc(e.get('tag'))}</td>"
-            f"<td class=num>{_esc(e.get('n_pos'))}&#128077;</td>"
-            f"<td class=num>{_esc(e.get('n_neg'))}&#128078;</td>"
-            f"<td class=num>{('' if e.get('fit_tau') is None else format(float(e['fit_tau']), '.3f'))}</td>"
-            f"<td class=num>{('' if e.get('f1') is None else format(float(e['f1']), '.2f'))}</td></tr>"
-            for e in episodes[:40]
-        )
-        or "<tr><td colspan=6 class=empty>No threshold-tuning feedback recorded yet — "
-        "label 👍/👎 during a threshold sweep to create the first.</td></tr>"
-    )
-
     unavailable = (
         ""
-        if (exports or seg_sets or episodes)
+        if (exports or seg_sets)
         else "<p class=warn>exp-db returned no rows (it may be empty, or unreachable — "
         "saves are best-effort). Run a search and Download to create the first row.</p>"
     )
@@ -1838,12 +1768,8 @@ def analytics_page(limit: int = 200) -> HTMLResponse:
   </table>
 
   <h2>Feedback labels ({fmtint(fb_total_up)} &#128077; / {fmtint(fb_total_down)} &#128078; distinct, over {fmtint(fb_queries)} queries)</h2>
-  <p class=sub>Each 👍/👎 you label during the refine + threshold-sweep steps is recorded here
-     (from <span class=mono>{_esc(db.SCHEMA_NAME)}.threshold_episodes</span>).</p>
-  <table>
-    <thead><tr><th>When (UTC)</th><th>Tag</th><th>👍</th><th>👎</th><th>fit τ</th><th>F1</th></tr></thead>
-    <tbody>{fb_rows}</tbody>
-  </table>
+  <p class=sub>Each 👍/👎 you label during the refine + threshold steps is recorded here
+     (from <span class=mono>{_esc(db.SCHEMA_NAME)}.feedback_marks</span>).</p>
 </body></html>"""
     return HTMLResponse(body)
 

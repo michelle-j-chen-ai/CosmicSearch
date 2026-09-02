@@ -61,10 +61,7 @@ async function loadPlatform() {
     const tag = $("brandTag");
     if (p && p.label) { tag.textContent = p.label; tag.className = "tag " + (p.name === "trucks" ? "trucking" : "cars"); }
   } catch (e) { /* cosmetic */ }
-  // The scan list is an archive of past runs and their output artifacts, so it
-  // shows regardless of whether new scans can still be launched. Gating it on
-  // `offline_scan` hid every historical parquet/segments.lance the moment the
-  // launcher was turned off.
+  // The export list is an archive of past exports and their artifacts.
   $("scansSection").style.display = "block";
   renderExportPanel();
 }
@@ -85,10 +82,9 @@ function applyCorpus(c) {
   // default its date range to that corpus's span.
   { const f = $("sf-dateFrom"); if (f) { f.value = c.span_lo_date; f.min = c.span_lo_date; f.max = c.span_hi_date; }
     const t = $("sf-dateTo"); if (t) { t.value = c.span_hi_date; t.min = c.span_lo_date; t.max = c.span_hi_date; } }
-  // Export/offline-scan runs over the FULL main embedding space (the scan corpus, which
-  // spans far wider than the browse corpus), so its dates default to UNBOUNDED (blank =
-  // whole corpus). Don't pin them to the loaded span or the scan is silently narrowed
-  // (and don't constrain min/max, so earlier dates than the browse corpus stay pickable).
+  // Export runs over the full corpus, so its dates default to UNBOUNDED (blank =
+  // whole corpus); don't pin them to the loaded span or the export is silently
+  // narrowed.
   ["ex-dateFrom", "ex-dateTo"].forEach((id) => { const el = $(id); if (el) { el.value = ""; el.removeAttribute("min"); el.removeAttribute("max"); } });
 }
 
@@ -761,7 +757,7 @@ function vote(chunkId, dir) {
   updateRail();
   // While sweeping: plot the label immediately (local), then (debounced) re-fit the
   // threshold from the backend so τ moves with the labels — WITHOUT replacing the
-  // stratified grid (no video reload). Each fit is logged to threshold_episodes.
+  // stratified grid (no video reload).
   if (state.sweepActive && state.sweep) { drawSweep(); scheduleFit(); }
 }
 let _fitTimer = null;
@@ -1147,10 +1143,9 @@ function renderSampleMode() {
   if (seg) $("dedupInput").checked = true;
 }
 function renderExportPanel() {
-  const offline = state.offlineScan;
   const badge = $("mechBadge");
-  badge.textContent = offline ? "async" : "instant";
-  badge.className = "mech-badge " + (offline ? "async" : "instant");
+  badge.textContent = "instant";
+  badge.className = "mech-badge instant";
   const n = state.selected.size;
   const note = $("selectionNote");
   if (n === 0) { note.className = "selection-note empty"; note.textContent = "No searches selected — check one or more rows above to export."; }
@@ -1161,8 +1156,7 @@ function renderExportPanel() {
   }
   const btn = $("exportBtn");
   btn.disabled = n === 0;
-  if (offline) { btn.textContent = "🚀 Export"; btn.className = "btn-export async"; $("exportNote").textContent = "Launches an offline scan — you'll get a link when it's ready."; }
-  else { btn.textContent = "⬇ Export"; btn.className = "btn-export instant"; $("exportNote").textContent = "Downloads a CSV immediately."; }
+  btn.textContent = "⬇ Export"; btn.className = "btn-export instant"; $("exportNote").textContent = "Downloads a CSV immediately.";
   $("jobStatus").classList.remove("show");
   renderCutoffField();
   renderSampleMode();
@@ -1188,9 +1182,8 @@ function _thresholdEndpoint() {
   return "/api/calibrate";
 }
 
-// Export straight from the resident 34M-row corpus. This is the online
-// replacement for the Lilypad scan: the ranking pass is the same one a search
-// runs, so the only extra cost is materializing the rows.
+// Export straight from the resident corpus: the ranking pass is the same one a
+// search runs, so the only extra cost is materializing the rows.
 async function fullExport() {
   const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
   if (!rows.length) return;
@@ -1256,14 +1249,14 @@ async function fullExport() {
 }
 
 
-/* ===================== recent scans ===================== */
+/* ===================== recent exports ===================== */
 function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
 let _scansRepollTimer = null;
 async function loadScanJobs(live) {
   clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
   if (body && !(state.scanJobs && state.scanJobs.length)) {
-    body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent scans…</td></tr>`;
+    body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent exports…</td></tr>`;
   }
   // The list is a pure DB read server-side (never blocks on Lilypad/DORA/OCI); live=1
   // (Reload) forces the server's background refresher to kick. The timeout is a belt --
@@ -1280,7 +1273,7 @@ async function loadScanJobs(live) {
   } catch (e) {
     console.error("loadScanJobs failed", e);
     const msg = e.name === "AbortError" ? "timed out" : e.message;
-    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent scans: ${escapeHtml(msg)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent exports: ${escapeHtml(msg)}</td></tr>`;
     return;
   } finally { clearTimeout(timer); }
   renderScans();
@@ -1297,7 +1290,7 @@ function renderScans() {
     // One malformed row must not blank the whole archive -- this panel is the
     // only place some artifacts are discoverable.
     console.error("renderScans failed", e);
-    $("scansBody").innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Could not render the scan list: ${escapeHtml(e.message)}</td></tr>`;
+    $("scansBody").innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Could not render the export list: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 function _renderScans() {

@@ -50,21 +50,6 @@ class AppConfig:
     # NLS_OWNER_EMAIL as a comma-separated list. Empty -> nobody sees the view
     # (fail closed), so a misconfigured deploy never leaks usage to all users.
     maintainer_emails: frozenset[str]
-    # Offline full-corpus interval scan: the FULL embedding dataset the scan worker
-    # reads (the resident in-app corpus is a small subset). MUST be encoded by the
-    # same model as the app's query encoder + resident corpus (black dwarf) -- a
-    # query vector scored against a different model's video embeddings yields
-    # systematically depressed cosines, so a threshold calibrated in the app UI
-    # rejects everything. The scan writes intervals.{parquet,csv} under
-    # scan_output_bucket/scan_output_prefix/<id>/. Trucking overrides this with its
-    # own corpus via the NLS_SCAN_EMBEDDINGS_URI env var.
-    scan_embeddings_uri: str
-    scan_output_bucket: str
-    scan_output_prefix: str
-    # Default start date for the offline full-corpus scan -> latest. The scan
-    # covers the full dataset history from here, independent of the interactive
-    # date filter (which only scopes the in-app resident search).
-    scan_default_from_date: str
 
     @staticmethod
     def from_env() -> "AppConfig":
@@ -82,20 +67,6 @@ class AppConfig:
                 for e in os.environ.get("NLS_OWNER_EMAIL", "").split(",")
                 if e.strip()
             ),
-            scan_embeddings_uri=os.environ.get(
-                "NLS_SCAN_EMBEDDINGS_URI",
-                "s3://neuron-prod-data-intelligence-exploratory/michelle/nls_search/"
-                "black-dwarf/embeddings/cars/",
-            ).strip(),
-            scan_output_bucket=os.environ.get(
-                "NLS_SCAN_OUTPUT_BUCKET", "neuron-prod-data-intelligence-exploratory"
-            ).strip(),
-            scan_output_prefix=os.environ.get(
-                "NLS_SCAN_OUTPUT_PREFIX", "michelle/nls_search/nls_scans"
-            ).strip(),
-            scan_default_from_date=os.environ.get(
-                "NLS_SCAN_DEFAULT_FROM_DATE", "2025-07-01"
-            ).strip(),
         )
 
 
