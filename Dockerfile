@@ -24,15 +24,14 @@ RUN uv pip install -r requirements.lock
 FROM deps AS runtime
 # interval_core.py: dependency-light (numpy) interval-projection + arrow helpers,
 # shared with the offline Spark scan workflow; search_engine imports it.
-COPY config.py oci_s3.py local_cache.py interval_core.py search_engine.py analytics.py app.py ./
+COPY config.py oci_s3.py local_cache.py interval_core.py search_engine.py analytics.py ./
 # int8 PCA corpus backend (very large embedding sets); dispatched by search_engine.
-COPY gpu_corpus.py ./
 # Full-corpus search: full_corpus.py holds the consolidated corpus's int8/PCA
 # screen resident and ranks it; threshold_search/lance_writer/eps_bound are the
 # exact-threshold retrieval path it shares (PCA metadata reader + error bound).
 # search_engine imports threshold_search lazily, so a missing file here fails at
 # call time rather than at build -- hence copying them explicitly.
-COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
+COPY full_corpus.py lance_writer.py eps_bound.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
 # DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
 # image builds on a plain Cloud Build with NO internal pip index. `adp/` is
@@ -43,7 +42,7 @@ COPY full_corpus.py threshold_search.py lance_writer.py eps_bound.py ./
 # suffice. /app is on sys.path, so `import adp` resolves to this vendored copy.
 COPY adp/ ./adp/
 
-COPY web_server.py db.py dora_client.py machine_auth.py ./
+COPY web_server.py api_v1.py catalog.py deployment.py db.py dora_client.py machine_auth.py ./
 COPY web ./web
 
 # Cosmos-Embed loads custom remote code via trust_remote_code; allow the HF

@@ -294,7 +294,7 @@ def read_tag(
     cat = catalog.get()
     try:
         if output is None:
-            return cat.record(tag)
+            return _with_download_links(cat.record(tag))
         if output not in _OUTPUTS:
             raise _error(422, "bad_output", "output must be json, csv or parquet")
         v = cat.resolve_version(tag, version)
@@ -442,6 +442,19 @@ def _materialize(tag, v, ver, proj, th, output, params, request, response) -> di
     return _export_response(tag, v, proj, export, response)
 
 
+def _with_download_links(record: dict) -> dict:
+    """Presign each ready export's artifact so the record is directly usable."""
+    ws = _ws()
+    ttl = ws._state["cfg"].presign_ttl_s
+    for e in record.get("exports", []):
+        if e.get("status") == "ready" and e.get("uri"):
+            try:
+                e["download_url"] = oci_s3.presign_get(e["uri"], ws._state["s3"], ttl)
+            except Exception as exc:  # noqa: BLE001 -- the uri is still there
+                LOGGER.debug("presign skipped for %s: %s", e["uri"], exc)
+    return record
+
+
 def _export_response(tag, v, proj, export: dict, response: Response) -> dict:
     ws = _ws()
     block = {k: val for k, val in export.items() if k not in ("tag", "version", "project", "params")}
@@ -583,8 +596,6 @@ def _write_csv(text: str, base: str) -> str:
 
 def _passthrough(table, source_uri: str):
     """Join the source dataset's columns onto the export by segment_id."""
-    import pyarrow as pa
-
     src = _ws()._read_filter_table(source_uri)
     if "segment_id" not in src.column_names:
         return table
@@ -722,6 +733,7 @@ def health(response: Response) -> dict:
             slot = ws._slot(name)
             corpus, status, error, started = slot["corpus"], slot["status"], slot["error"], slot["started"]
         info: dict[str, Any] = {"ready": corpus is not None, "status": status,
+                                "corpus_table_uri": spec.corpus_table_uri,
                                 "clip_prefix": spec.mp4_prefix, "input_prefixes": input_prefixes(spec)}
         if corpus is not None:
             any_ready = True
