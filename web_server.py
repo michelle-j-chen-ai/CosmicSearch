@@ -417,14 +417,19 @@ def _lance_filter_ids(uri: str) -> tuple[str, frozenset[str]]:
     return key, ids
 
 
-# Downsample ids up to this count travel inline in the workload config (gRPC-friendly;
-# a segment_id is ~60 chars). Larger sets are written to a single-column parquet next to
-# the scan output and passed BY REFERENCE (filter_ids_uri / segment_set_ids_uri) -- the
-# worker reads them in one GET, so there is NO upper bound on the downsample size.
-_SCAN_INLINE_IDS_MAX = 10_000
+def _read_filter_table(uri: str):
+    """The whole downsample dataset at ``uri`` as an Arrow table, for exports that
+    carry its columns through. Uses the same on-disk copy `_lance_filter_ids`
+    keeps, so a dataset is downloaded once however it is used."""
+    _lance_filter_ids(uri)  # ensures the local copy exists
+    local_dir = _lance_filter_cache_dir(uri)
+    if uri.rstrip("/").endswith(".lance"):
+        import lance
 
+        return lance.dataset(str(local_dir)).to_table()
+    import pyarrow.parquet as pq
 
-_SCAN_MANIFEST_S3 = None  # cached fast_fail OCI client for manifest reads
+    return pq.read_table(str(local_dir))
 
 
 def _parse_vehicles(vehicle: str | None) -> frozenset[str]:
@@ -3390,3 +3395,10 @@ def _full_payload(
             "filter_lance_uri": req.filter_lance_uri or None,
         },
     }
+
+
+# The versioned API. Its handlers import this module lazily, so the mount is the
+# last thing here.
+import api_v1  # noqa: E402
+
+app.include_router(api_v1.router)

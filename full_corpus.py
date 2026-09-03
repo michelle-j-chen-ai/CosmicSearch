@@ -842,6 +842,40 @@ class FullCorpus:
             "rows_probed": int(rows.size),
         }
 
+    def created_at_unix(self) -> np.ndarray:
+        """Each row's insert time (seconds), read from the table on demand; only
+        the since-version filter needs it, so it is not held resident."""
+        col = self.dataset.to_table(columns=["created_at_unix_s"], scan_in_order=True)
+        return col.column("created_at_unix_s").combine_chunks().to_numpy(zero_copy_only=False).astype(np.float64)
+
+    def rows_for_chunk_ids(self, chunk_ids: "list[str]") -> "dict[str, int]":
+        """Row position of each `{run_uuid}#t{chunk_start_unix}` id that exists.
+
+        Ids that name a drive or start time this corpus does not hold are left
+        out of the result, so a caller can report them as unresolved rather than
+        scoring a wrong row. One pass over the resident arrays regardless of how
+        many ids are asked for.
+        """
+        wanted: dict[tuple[int, int], str] = {}
+        run_index = {u: i for i, u in enumerate(self._meta["run_uuid_uniques"])}
+        for cid in chunk_ids:
+            run, _, start = str(cid).rpartition("#t")
+            if not run or not start.isdigit() or run not in run_index:
+                continue
+            wanted[(run_index[run], int(start))] = cid
+        if not wanted:
+            return {}
+        codes = np.fromiter({c for c, _ in wanted}, dtype=self._meta["run_uuid"].dtype)
+        cand = np.flatnonzero(np.isin(self._meta["run_uuid"], codes))
+        starts = self._meta["chunk_start_unix"][cand]
+        runs = self._meta["run_uuid"][cand]
+        out: dict[str, int] = {}
+        for row, code, start in zip(cand.tolist(), runs.tolist(), starts.tolist()):
+            cid = wanted.get((code, start))
+            if cid is not None and cid not in out:
+                out[cid] = row
+        return out
+
     def vectors_for(self, rows: "list[int] | np.ndarray") -> np.ndarray:
         """The original 768-d embeddings for `rows`, in the order given.
 
