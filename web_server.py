@@ -1518,8 +1518,8 @@ def _retrieve_selection(req: "RetrieveRequest", corpus, vec, exclude, *, k=None)
 
 def _retrieve_hits(req: "RetrieveRequest", corpus, vec, exclude) -> dict:
     """A page of the selection, in the envelope the grid already renders."""
-    if req.limit <= 0 or req.limit > 1000:
-        raise HTTPException(400, "limit must be between 1 and 1000")
+    if req.limit <= 0 or req.limit > _FULL_MAX_DEPTH:
+        raise HTTPException(400, f"limit must be between 1 and {_FULL_MAX_DEPTH:,}")
     if req.page < 0:
         raise HTTPException(400, "page must not be negative")
     offset = req.page * req.limit

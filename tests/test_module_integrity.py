@@ -95,3 +95,20 @@ def test_the_frontend_only_calls_routes_that_exist():
     what the server exposes, never what the browser asks for."""
     missing = sorted(_frontend_endpoints() - _served_paths())
     assert not missing, f"web/app.js calls routes the app does not serve: {missing}"
+
+
+def test_the_frontend_batch_is_within_the_limit_the_endpoint_enforces():
+    """app.js fetches one buffer of FULL_BATCH results and pages it client-side,
+    so FULL_BATCH is sent as `limit`. Raising it to 2,000 to deepen the pager
+    left it above the 1,000 the endpoint enforced, and every full-corpus search
+    returned 400 -- the route existed, so the route test passed."""
+    batch = re.search(r"^const FULL_BATCH = (\d+);", (ROOT / "web" / "app.js").read_text(),
+                      re.M)
+    assert batch, "web/app.js no longer defines FULL_BATCH"
+    import web_server as ws
+    req = ws.RetrieveRequest(query="x", limit=int(batch.group(1)), page=0)
+    with pytest.raises(Exception) as exc:
+        ws._retrieve_hits(req, None, None, None)
+    assert "limit must be between" not in str(getattr(exc.value, "detail", "")), (
+        f"web/app.js sends limit={batch.group(1)}, which /ui/search rejects: "
+        f"{exc.value.detail}")
