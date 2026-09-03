@@ -13,10 +13,12 @@ import os
 
 
 def mp4_prefix() -> str:
-    """Where chunk MP4s live. The single definition: `gpu_corpus` and
-    `full_corpus` both reconstruct source_media_uri from it rather than holding
-    the column resident, and two copies meant an NLS_MP4_PREFIX override could
-    apply to one and not the other -- giving the same clip two different paths.
+    """Where a project's chunk MP4s live, unless `deployment.py` overrides it.
+
+    `full_corpus` reconstructs source_media_uri from this rather than holding the
+    column resident, so the prefix has one definition: two copies meant an
+    NLS_MP4_PREFIX override could apply to one and not the other, giving the same
+    clip two different paths.
     """
     return os.environ.get(
         "NLS_MP4_PREFIX",
