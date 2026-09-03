@@ -271,6 +271,7 @@ requests==2.34.2
     #   huggingface-hub
     #   streamlit
     #   transformers
+retrying==1.4.2
 rich==15.0.0
     # via -r requirements.txt
 rpds-py==2026.6.3
