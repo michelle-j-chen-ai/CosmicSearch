@@ -14,8 +14,10 @@ body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);-we
 .topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 0 0;margin-bottom:6px;}
 .brand{display:flex;align-items:center;gap:14px;}
 .brand .tag{font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:#0a0a0d;padding:3px 8px;border-radius:4px;font-weight:600;}
-.brand .tag.trucking,.brand .tag.trucks{background:#e0a030;}
-.brand .tag.cars{background:#5ec9e0;}
+.brand .tag.frontier{background:#e0a030;}
+.brand .tag.neuron{background:#5ec9e0;}
+.brand select.tag{border:0;appearance:none;-webkit-appearance:none;cursor:pointer;}
+.brand select.tag:disabled{cursor:default;opacity:1;}
 .brand .tag:empty{display:none;}
 .brand h1{font-size:17px;font-weight:600;margin:0;letter-spacing:-.01em;}
 .corpus-pill{font-family:var(--mono);font-size:12px;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:6px 14px;white-space:nowrap;}

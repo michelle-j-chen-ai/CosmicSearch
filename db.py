@@ -281,10 +281,48 @@ def init_schema() -> bool:
                 conn.execute(text(stmt))
         _schema_ready = True
         logger.info("DB: schema ready (%s)", _TABLE)
-        return True
     except (SQLAlchemyError, OSError) as exc:
         logger.warning("DB: init_schema failed (%s): %s", type(exc).__name__, exc)
         return False
+    try:
+        import catalog
+
+        catalog.get().init()
+        logger.info("DB: tag catalog ready (%s)", SCHEMA_NAME)
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: catalog init failed (%s): %s", type(exc).__name__, exc)
+        return False
+    return True
+
+
+_BACKFILL_ROWS = text(
+    f"""SELECT tag, query, threshold, user_email, created_at, parquet_uri, num_results,
+               search_vector::text AS search_vector
+        FROM {_TABLE}
+        WHERE tag IS NOT NULL AND tag <> ''
+        ORDER BY created_at"""
+)
+
+
+def backfill_catalog(*, project: str, model: str) -> int:
+    """Seed the tag catalog from export_log once per tag. Idempotent and
+    best-effort; returns the number of tags added (0 when nothing to do or the
+    database is unreachable)."""
+    try:
+        import catalog
+
+        if not _schema_ready and not init_schema():
+            return 0
+        with _get_engine().begin() as conn:
+            conn.execute(text(f"SET search_path TO {SCHEMA_NAME}"))
+            rows = [dict(r) for r in conn.execute(_BACKFILL_ROWS).mappings()]
+        n = catalog.get().backfill_export_log(rows, project=project, model=model)
+        if n:
+            logger.info("DB: catalog backfilled %d tags from export_log", n)
+        return n
+    except (SQLAlchemyError, OSError) as exc:
+        logger.warning("DB: catalog backfill failed (%s): %s", type(exc).__name__, exc)
+        return 0
 
 
 def insert_export(record: dict, upsert_by_tag: bool = True) -> bool:

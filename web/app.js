@@ -13,6 +13,7 @@ const escapeHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
 
 const state = {
   platform: null,
+  project: localStorage.getItem("nls.project") || null,
   corpus: null,
   embeddingsUri: null,
   query: "",
@@ -46,6 +47,25 @@ const state = {
 };
 let _issueSeq = 0;
 
+// Every /api call carries the project it addresses: as a query parameter, and
+// in the JSON body when there is one, so GET and POST routes read it the same way.
+function apiFetch(url, opts) {
+  const project = state.project;
+  if (project && typeof url === "string" && url.startsWith("/api/") && !/[?&]project=/.test(url)) {
+    url += (url.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(project);
+  }
+  if (project && opts && typeof opts.body === "string") {
+    try {
+      const b = JSON.parse(opts.body);
+      if (b && typeof b === "object" && !Array.isArray(b) && b.project == null) {
+        b.project = project;
+        opts = { ...opts, body: JSON.stringify(b) };
+      }
+    } catch (e) { /* not a JSON body */ }
+  }
+  return fetch(url, opts);
+}
+
 /* ===================== bootstrap ===================== */
 async function init() {
   wireEvents();
@@ -56,10 +76,21 @@ async function init() {
 
 async function loadPlatform() {
   try {
-    const p = await fetch("/api/platform").then((r) => r.json());
+    const p = await apiFetch("/api/platform").then((r) => r.json());
     state.platform = p;
-    const tag = $("brandTag");
-    if (p && p.label) { tag.textContent = p.label; tag.className = "tag " + (p.name === "trucks" ? "trucking" : "cars"); }
+    const enabled = (p.projects || []).filter((x) => x.enabled);
+    const names = enabled.map((x) => x.name);
+    if (!state.project || !names.includes(state.project)) {
+      state.project = names.includes(p.default) ? p.default : (names[0] || p.default);
+    }
+    localStorage.setItem("nls.project", state.project);
+    const sel = $("projectSelect");
+    sel.innerHTML = enabled.map((x) =>
+      `<option value="${escapeHtml(x.name)}"${x.name === state.project ? " selected" : ""}>${escapeHtml(x.label)}</option>`).join("");
+    sel.className = "tag " + state.project;
+    sel.disabled = enabled.length < 2;
+    // Every view is scoped to one corpus, so switching restarts the app on the other.
+    sel.onchange = () => { localStorage.setItem("nls.project", sel.value); location.reload(); };
   } catch (e) { /* cosmetic */ }
   // The export list is an archive of past exports and their artifacts.
   $("scansSection").style.display = "block";
@@ -91,7 +122,7 @@ function applyCorpus(c) {
 async function loadDefaultCorpusWhenReady() {
   for (let i = 0; i <= 240; i++) {
     try {
-      const r = await fetch("/api/corpus");
+      const r = await apiFetch("/api/corpus");
       if (r.ok) { const c = await r.json(); if (c && c.num_rows != null) { applyCorpus(c); return; } }
       $("corpusPill").textContent = "warming up — loading model + corpus…";
     } catch (e) { $("corpusPill").textContent = "warming up — loading model + corpus…"; }
@@ -183,7 +214,7 @@ function setPage(which) {
 // produce an error the user cannot act on.
 async function loadCorpus() {
   try {
-    const c = await fetch("/api/corpus").then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
+    const c = await apiFetch("/api/corpus").then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
     applyCorpus(c);
     $("embeddings-uri").value = c.embeddings_uri || "";
     setNote("corpus-note", `${fmtInt(c.num_rows)} clips · segment_id ${c.has_segment_id ? "present ✓" : "absent"}`);
@@ -193,7 +224,7 @@ async function loadModel() {
   const uri = $("model-uri").value.trim();
   setNote("model-note", "loading model (into memory, ~minutes)…");
   try {
-    const m = await fetch("/api/model?uri=" + encodeURIComponent(uri)).then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
+    const m = await apiFetch("/api/model?uri=" + encodeURIComponent(uri)).then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
     setNote("model-note", "model: " + m.label);
     if (state.corpus) { state.corpus.model = m.label; state.corpus.model_uri = m.model_uri; applyCorpus(state.corpus); }
     if (state.query) reload({ page: 0 });
@@ -235,7 +266,7 @@ function _makeDxCombo(cfg) {
     timer = setTimeout(async () => {
       if (note) note.textContent = "loading segment sets…";
       try {
-        items = (await fetch("/api/segment_sets?name_filter=" + encodeURIComponent(v)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); })) || [];
+        items = (await apiFetch("/api/segment_sets?name_filter=" + encodeURIComponent(v)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); })) || [];
         if (!items.length) { menu.innerHTML = '<div class="combo-msg">no sets match that name</div>'; show(); if (note) note.textContent = "no sets match that name"; return; }
         menu.innerHTML = items.map((s, i) => `<div class="combo-opt" data-i="${i}" role="option"><span class="opt-name">${escapeHtml(s.name)}</span><span class="opt-meta">v${escapeHtml(String(s.version))} · ${fmtInt(s.num_segments)} segments</span></div>`).join("");
         menu.querySelectorAll(".combo-opt").forEach((o) => o.addEventListener("mousedown", (e) => {
@@ -245,7 +276,7 @@ function _makeDxCombo(cfg) {
           combo.classList.add("chosen");
           if (note) note.textContent = `using ${s.name} v${s.version} (${fmtInt(s.num_segments)} segs)`;
           hide();
-          fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
+          apiFetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
           cfg.onChoose(s);
         }));
         show();
@@ -398,7 +429,7 @@ async function handleUpload(file) {
       _uploadNote(`Encoding ${frames.length} frames sampled from ${span.toFixed(1)}s${dur > span ? ` (of ${dur.toFixed(0)}s)` : ""}…`);
       noteAfter = dur > _UPLOAD_SAMPLE_WINDOW_S ? `Sampled a ${span.toFixed(0)}s window — clips match best at ~2-4s.` : "";
     }
-    const enc = await fetch("/api/retrieve", {
+    const enc = await apiFetch("/api/retrieve", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frames_b64, output: "vector" }),
     }).then((r) => r.ok ? r.json() : r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); }));
@@ -439,7 +470,7 @@ function reload(startOpts) {
 // Show the corpus the next search will actually use, not the resident one.
 async function refreshCorpusPill() {
   let st = null;
-  try { st = await fetch("/api/full_corpus_status").then((r) => r.json()); } catch (e) { return; }
+  try { st = await apiFetch("/api/full_corpus_status").then((r) => r.json()); } catch (e) { return; }
   if (!st) return;
   const model = (state.corpus && state.corpus.model) || st.model || "model";
   if (st.status === "ready" && st.num_rows) {
@@ -463,14 +494,14 @@ function wireFullCorpusToggles() { refreshCorpusPill(); }
 async function _ensureFullCorpus() {
   $("emptyState").style.display = "none";
   $("resultsState").style.display = "block";
-  const status = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+  const status = await apiFetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
   if (status && status.status === "ready") return true;
-  await fetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
+  await apiFetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
   $("gridStatus").textContent =
     "Loading the full corpus (first use, a few minutes) — this search will start automatically.";
   for (let i = 0; i < 60; i++) {
     await new Promise((res) => setTimeout(res, 10000));
-    const s = await fetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
+    const s = await apiFetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
     if (!s) continue;
     if (s.status === "error") { $("gridStatus").textContent = "Full corpus failed to load: " + s.error; return false; }
     if (s.status === "ready") return true;
@@ -508,7 +539,7 @@ async function _fullFetch(endpoint, extra, page, key) {
   $("gridStatus").textContent = "Searching all clips…";
   let data;
   try {
-    data = await fetch(endpoint, {
+    data = await apiFetch(endpoint, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ..._fullFilterBody(), ...extra }),
     }).then((r) => {
@@ -603,7 +634,7 @@ async function rescoreVisible() {
   if (!rows.length) return;
   let data;
   try {
-    data = await fetch("/api/retrieve", {
+    data = await apiFetch("/api/retrieve", {
       method: "POST", headers: { "Content-Type": "application/json" },
       // The vector the ranking used, NOT the query text. A refine, window or
       // upload has no text that reproduces its direction, and sending `query`
@@ -646,7 +677,7 @@ async function _issue(endpoint, body) {
   $("gridStatus").textContent = state.mode === "refine" ? "Re-ranking…" : "Searching…";
   let data;
   try {
-    data = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+    data = await apiFetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
       .then((r) => { if (!r.ok) return r.json().then((j) => { let m = j.detail; if (Array.isArray(m)) m = m.map((e) => `${(e.loc || []).join(".")}: ${e.msg}`).join("; "); throw new Error(m || ("HTTP " + r.status)); }); return r.json(); });
   } catch (e) {
     if (seq === _issueSeq) $("gridStatus").textContent = "Search failed: " + e.message;
@@ -767,7 +798,7 @@ async function fitOnly() {
   const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark, index: m.index, row: m.row, segment_id: m.segment_id || "" }));
   const f = _searchFilters();
   try {
-    const thr = await fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
+    const thr = await apiFetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null);
     if (!thr) return;
     state.suggestedTau = thr.suggested_threshold;
     const fitTau = thr.threshold;
@@ -832,7 +863,7 @@ async function refreshSweep() {
       // separate distribution endpoint scored the same 34.4M rows for the same
       // answer.
       Promise.resolve(null),
-      fetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
+      apiFetch(_thresholdEndpoint(), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9, val_fraction: 0.0, sample_size: 12, ...f }) }).then((r) => r.ok ? r.json() : null),
     ]);
     const hist = (dist && dist.edges) ? dist : (thr && thr.histogram) ? thr.histogram : null;
     if (!hist) { showToast("Could not compute distribution"); return; }
@@ -959,7 +990,7 @@ async function finalSave() {
     const _mark = (chunk_id, m) => ({ chunk_id, segment_id: m.segment_id, index: m.index, rank: m.rank, score: m.score });
     const thumbs_up = Object.entries(state.marks).filter(([, m]) => m.mark === "up").map(([c, m]) => _mark(c, m));
     const thumbs_down = Object.entries(state.marks).filter(([, m]) => m.mark === "down").map(([c, m]) => _mark(c, m));
-    const r = await fetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+    const r = await apiFetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
       tag, query: state.query, k: 50, threshold: tau,
       // The direction these results were ranked by. Required: a refined vector
       // cannot be recovered by re-encoding the query text, and the server keeps
@@ -987,7 +1018,7 @@ function _uriShort(u) { const p = String(u || "").replace(/\/+$/, "").split("/")
 function _fmtDates(f) { const from = (f && f.from_date) || "", to = (f && f.to_date) || ""; return (from || to) ? `${from || "…"} → ${to || "latest"}` : "—"; }
 
 async function loadSaved() {
-  try { const d = await fetch("/api/tags_catalog").then((r) => r.json()); state.savedRows = d.entries || []; }
+  try { const d = await apiFetch("/api/tags_catalog").then((r) => r.json()); state.savedRows = d.entries || []; }
   catch (e) { state.savedRows = []; }
   renderTable();
   renderExportPanel();
@@ -1045,7 +1076,7 @@ function renderTable() {
 async function resumeSession(id) {
   setPage("search"); showToast("Loading saved search…");
   let s;
-  try { s = await fetch("/api/search_session/" + encodeURIComponent(id)).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }); }
+  try { s = await apiFetch("/api/search_session/" + encodeURIComponent(id)).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }); }
   catch (e) { showToast("Could not load: " + e.message); return; }
   if (!s.vector || !s.vector.length) { showToast("That saved search has no stored vector"); return; }
   $("searchInput2").value = s.query || ""; state.query = s.query || "";
@@ -1058,7 +1089,7 @@ async function resumeSession(id) {
   $("sf-lance").value = s.filter_lance_uri || ""; $("sf-vehicle").value = s.vehicle || ""; $("sf-drive").value = s.drive_id || "";
   state.searchSegUuid = s.segment_set_uuid || null; state.searchSegName = s.segment_set_name || null;
   if ($("sf-dxset")) $("sf-dxset").value = s.segment_set_name || "";
-  if (s.segment_set_uuid) fetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.segment_set_uuid)).catch(() => {});
+  if (s.segment_set_uuid) apiFetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.segment_set_uuid)).catch(() => {});
   state.resumeVec = s.vector; state.resumeLabel = s.query || ""; state.mode = "resume";
   updateRail();
   await runVectorSearch({ page: 0 });
@@ -1209,7 +1240,7 @@ async function fullExport() {
       };
       if (topk) body.k = kForRow(e) || 50;
       else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
-      const resp = await fetch("/api/retrieve", {
+      const resp = await apiFetch("/api/retrieve", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
@@ -1265,7 +1296,7 @@ async function loadScanJobs(live) {
   const timer = setTimeout(() => ctrl.abort(), 20000);
   let refreshing = false;
   try {
-    const r = await fetch("/api/scans?limit=100" + (live ? "&live=1" : ""), { signal: ctrl.signal });
+    const r = await apiFetch("/api/scans?limit=100" + (live ? "&live=1" : ""), { signal: ctrl.signal });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const d = await r.json();
     state.scanJobs = d.jobs || [];
@@ -1393,7 +1424,7 @@ async function openPreview(uri) {
   $("overlay").classList.add("open");
   $("previewModal").classList.add("open");
   try {
-    const r = await fetch(`/api/export_preview?uri=${encodeURIComponent(uri)}&limit=${PREVIEW_ROWS}`);
+    const r = await apiFetch(`/api/export_preview?uri=${encodeURIComponent(uri)}&limit=${PREVIEW_ROWS}`);
     if (!r.ok) {
       let d; try { d = (await r.json()).detail; } catch (_e) { }
       throw new Error(d || `HTTP ${r.status}`);
