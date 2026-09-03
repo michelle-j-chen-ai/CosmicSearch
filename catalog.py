@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 THRESHOLD_MODES = ("suggested", "explicit", "fitted")
 EXPORT_STATUSES = ("pending", "running", "ready", "error")
+# A claimed export whose worker has been gone this long is reclaimable. The row
+# is the only record that a job is in flight, so an instance killed mid-export
+# -- Cloud Run recycles min-instances about daily -- would otherwise leave it
+# `running` forever: every later caller gets claimed=False and the same row
+# back, no worker ever restarts, and the poll never finishes. Well above the
+# 30-minute exact-score budget a real export is allowed.
+EXPORT_STALE_AFTER_S = 3 * 60 * 60
 # Fields of a threshold record that are stored; anything else a caller passes is
 # dropped rather than persisted under a name nothing reads back.
 _THRESHOLD_FIELDS = ("value", "mode", "selected", "precision", "recall", "f1",
@@ -437,12 +444,28 @@ class Catalog:
         E = self.t["exports"]
         with self._begin() as conn:
             r = conn.execute(sa.select(E).where(E.c.export_id == eid)).mappings().first()
-            if r is not None:
+            if r is not None and not self._reclaimable(r):
                 return self._export_public(r), False
+            if r is not None:
+                logger.warning("export %s reclaimed: %s since %s", eid, r["status"],
+                               _iso(r["started_at"] or r["created_at"]))
+                conn.execute(sa.delete(E).where(E.c.export_id == eid))
             conn.execute(sa.insert(E).values(export_id=eid, tag=tag, version=version, project=project,
                                              output=output, params=params, status="running",
                                              created_by=created_by, started_at=_now()))
         return self.export_get(eid), True
+
+    def _reclaimable(self, row) -> bool:
+        """Whether a claimed export can be handed to a new worker: its own thread
+        is gone, so nothing will ever finish or fail the row it left behind."""
+        if row["status"] not in ("pending", "running"):
+            return False
+        since = row["started_at"] or row["created_at"]
+        if since is None:
+            return True
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=dt.timezone.utc)
+        return (_now() - since).total_seconds() > EXPORT_STALE_AFTER_S
 
     def export_finish(self, eid: str, **fields) -> None:
         E = self.t["exports"]

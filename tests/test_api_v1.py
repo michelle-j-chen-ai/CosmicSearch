@@ -217,3 +217,38 @@ def test_a_frontier_only_service_serves_unqualified_requests_from_frontier(clien
     assert r.status_code == 404 and r.json()["detail"]["code"] == "unknown_tag"
     assert ws.deployment.default() == "frontier"
     assert ws._project_of(object()) == "frontier"
+
+
+def test_paging_stops_where_the_browser_stops(client):
+    """Each page re-runs the cascade, so depth is cost. The /ui path capped this
+    at _FULL_MAX_DEPTH; the API did not, and page=1000 asked for a 500k-deep
+    selection."""
+    c, cat = client
+    cat.create(tag="deep", project="neuron", source={"type": "text", "text": "x"},
+               vector=[0.1] * 8, model="black_dwarf",
+               threshold={"value": 0.3, "mode": "explicit"})
+    r = c.get("/api/v1/tags/deep", params={"output": "json", "page": 1000, "page_size": 500})
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "page_too_deep"
+
+
+def test_storage_failure_is_a_503_with_a_code_not_a_bare_500(client, monkeypatch):
+    """A revoked object-store key reached the browser as a 500 whose plain-text
+    body broke response.json() -- the symptom read as a frontend bug."""
+    c, cat = client
+    cat.create(tag="unreachable", project="neuron", source={"type": "text", "text": "x"},
+               vector=[0.1] * 8, model="black_dwarf",
+               threshold={"value": 0.3, "mode": "explicit"})
+
+    class _Corpus:
+        dataset_version = 1
+        num_rows = 8
+
+        def select(self, *a, **kw):
+            raise OSError("Wrapped error: LanceError(IO): 403 Forbidden SignatureDoesNotMatch")
+
+    monkeypatch.setattr(ws, "_require_full_corpus", lambda project=None: _Corpus())
+    monkeypatch.setattr(ws, "_full_filters", lambda req: {})
+    r = c.get("/api/v1/tags/unreachable", params={"output": "json"})
+    assert r.status_code == 503
+    assert r.json()["detail"]["code"] == "corpus_unreachable"
+    assert r.headers["retry-after"]

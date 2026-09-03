@@ -211,3 +211,44 @@ def test_projects_column_tracks_the_thresholds_map(cat):
     assert latest["projects"] == ",frontier,neuron,"
     assert latest["thresholds"]["frontier"]["stale"] is True
     assert latest["thresholds"]["neuron"]["stale"] is False
+
+
+def test_an_export_orphaned_by_a_dead_worker_is_reclaimed(cat, monkeypatch):
+    """The row is the only record that a job is in flight. An instance killed
+    mid-export leaves it `running`, and without reclaim every later caller gets
+    claimed=False and the same row back -- the poll never finishes."""
+    import datetime as dt
+
+    _make(cat)
+    first, claimed = cat.export_claim(tag="motorcycle_filtering", version=1, project="neuron",
+                                      output="csv", params={}, created_by="m@x")
+    assert claimed and first["status"] == "running"
+
+    # A second caller while the worker is alive must not start a duplicate.
+    _again, claimed_again = cat.export_claim(tag="motorcycle_filtering", version=1,
+                                             project="neuron", output="csv", params={})
+    assert claimed_again is False
+
+    # Age the claim past the staleness bound: the worker is gone.
+    E = cat.t["exports"]
+    stale = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=catalog.EXPORT_STALE_AFTER_S + 60)
+    with cat.engine.begin() as conn:
+        conn.execute(sa.update(E).where(E.c.export_id == first["export_id"])
+                     .values(started_at=stale))
+
+    retry, reclaimed = cat.export_claim(tag="motorcycle_filtering", version=1, project="neuron",
+                                        output="csv", params={})
+    assert reclaimed is True
+    assert retry["status"] == "running"
+    assert retry["export_id"] == first["export_id"]  # same params, same id
+
+
+def test_a_ready_export_is_never_reclaimed(cat):
+    _make(cat)
+    e, _ = cat.export_claim(tag="motorcycle_filtering", version=1, project="neuron",
+                            output="csv", params={})
+    cat.export_finish(e["export_id"], uri="s3://b/x.csv", num_rows=10)
+    again, claimed = cat.export_claim(tag="motorcycle_filtering", version=1, project="neuron",
+                                      output="csv", params={})
+    assert claimed is False and again["status"] == "ready" and again["uri"] == "s3://b/x.csv"
