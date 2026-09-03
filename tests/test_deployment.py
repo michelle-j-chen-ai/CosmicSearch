@@ -117,3 +117,114 @@ def test_unconfigured_dora_host_names_the_config_not_a_missing_module(monkeypatc
     with pytest.raises(dora_client.DoraUnavailable) as exc:
         dora_client._get_stub(None)
     assert "URSA_SDK_GRPC_HOSTNAME" in str(exc.value)
+
+
+def test_absent_credentials_raise_instead_of_reaching_the_metadata_server(monkeypatch):
+    """object_store treats an incomplete option set as "find credentials
+    yourself" and walks to the GCE metadata server, which answers 403 Missing
+    required header: Metadata-Flavor -- naming neither this app's config nor the
+    bucket. Fail on the config instead."""
+    import oci_s3
+
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    with pytest.raises(oci_s3.CredentialsMissing) as exc:
+        oci_s3.lance_storage_options()
+    assert "AWS_ACCESS_KEY_ID" in str(exc.value)
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "id")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    opts = oci_s3.lance_storage_options()
+    assert opts["aws_access_key_id"] == "id" and opts["aws_secret_access_key"] == "secret"
+
+
+def _fake_dataset(*, model="black_dwarf", model_id="black-dwarf", storage="2.0",
+                  drop=(), pca_dim=4, artifact=""):
+    """A stand-in with just the surface `full_corpus.validate` reads."""
+    import base64
+    import io
+
+    import numpy as np
+    import pyarrow as pa
+
+    import full_corpus
+
+    def enc(a):
+        buf = io.BytesIO()
+        np.save(buf, a)
+        return base64.b64encode(buf.getvalue())
+
+    meta = {
+        full_corpus.META_KEY_PCA_COMPONENTS: enc(np.zeros((pca_dim, 8), dtype=np.float32)),
+        full_corpus.META_KEY_QUANT_SCALES: enc(np.ones(pca_dim, dtype=np.float32)),
+    }
+    if model_id is not None:
+        meta[full_corpus.META_KEY_MODEL_ID] = model_id.encode()
+    if artifact:
+        meta[full_corpus.META_KEY_MODEL_ARTIFACT_URI] = artifact.encode()
+
+    fields = [
+        pa.field(full_corpus.embedding_column(model), pa.list_(pa.int8(), pca_dim)),
+        pa.field(full_corpus.vector_fp_column(model), pa.list_(pa.float32(), pca_dim)),
+        pa.field(full_corpus.vector_full_column(model), pa.list_(pa.float32(), 8), metadata=meta),
+        *(pa.field(c, pa.string()) for c in full_corpus.REQUIRED_COLUMNS),
+    ]
+    fields = [f for f in fields if f.name not in drop]
+
+    class _DS:
+        schema = pa.schema(fields)
+        data_storage_version = storage
+
+    return _DS()
+
+
+def test_validate_accepts_the_production_tables_as_they_are_written():
+    """Both fleets' tables report model_id "black-dwarf" with a hyphen, against a
+    "black_dwarf" column suffix, at data_storage_version 2.0. An earlier version
+    of this check required an exact model_id match and a 2.1 floor, so it
+    rejected both of the tables it was meant to protect."""
+    import full_corpus
+
+    assert full_corpus.validate(_fake_dataset()) == "black-dwarf"
+    assert full_corpus.validate(_fake_dataset(model_id="black_dwarf")) == "black_dwarf"
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"model_id": None}, "nls.model_id"),
+        ({"model_id": "some_other_encoder"}, "some_other_encoder"),
+        ({"drop": ("segment_id",)}, "segment_id"),
+        ({"drop": ("vector_fp_black_dwarf",)}, "vector_fp_black_dwarf"),
+    ],
+)
+def test_validate_rejects_a_table_the_app_cannot_serve(kwargs, expected):
+    """A wrong-model corpus returns a confident ranked list with nothing in it to
+    signal every score is meaningless, so the identity check has to be fatal."""
+    import full_corpus
+
+    with pytest.raises(full_corpus.CorpusContractError) as exc:
+        full_corpus.validate(_fake_dataset(**kwargs))
+    assert expected in str(exc.value)
+
+
+def test_a_checkpoint_mismatch_warns_rather_than_rejecting(monkeypatch, caplog):
+    """Every checkpoint of this family reports the same model_id, so only the
+    artifact URI separates them -- but each fleet keeps its own copy under its
+    own bucket, so paths differ where the checkpoint does not. Compare the
+    checkpoint name, and only log: a false rejection here takes a fleet down."""
+    import logging
+
+    import full_corpus
+
+    monkeypatch.setenv("NLS_MODEL_ARTIFACT_URI",
+                       "s3://neuron-prod-data-intelligence-exploratory/x/models/maxsim-mainfull-ckpt14500/")
+    same = _fake_dataset(artifact="s3://frontier-perception-datasets/model_assets/maxsim-mainfull-ckpt14500/")
+    with caplog.at_level(logging.WARNING):
+        assert full_corpus.validate(same) == "black-dwarf"
+    assert "checkpoint" not in caplog.text
+
+    other = _fake_dataset(artifact="s3://frontier-perception-datasets/model_assets/maxsim-mainfull-ckpt9000/")
+    with caplog.at_level(logging.WARNING):
+        assert full_corpus.validate(other) == "black-dwarf"
+    assert "ckpt9000" in caplog.text

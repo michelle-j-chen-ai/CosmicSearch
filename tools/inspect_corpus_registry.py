@@ -26,7 +26,7 @@ import deployment
 import full_corpus
 import oci_s3
 
-REQUIRED_COLUMNS = ("chunk_id", "run_uuid", "segment_id", "chunk_start_unix")
+REQUIRED_COLUMNS = full_corpus.REQUIRED_COLUMNS
 
 
 def _fmt(n: int) -> str:
@@ -67,23 +67,24 @@ def inspect(name: str) -> bool:
 
     ok = True
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in ds.schema.names]
-    if missing:
-        print(f"  FAIL       missing required columns: {missing}")
-        ok = False
-
-    # The basis, from the field metadata the app actually reads.
+    # Exactly the check `load()` runs, so this cannot pass a table the app rejects.
     try:
-        pca, scales, model_id = full_corpus._read_field_pca(ds, full_corpus.CORPUS_MODEL)
-        print(f"  basis      pca {pca.shape} {pca.dtype}, scales {scales.shape}, "
-              f"model_id {model_id or '(absent)'}")
-        if model_id and model_id != full_corpus.CORPUS_MODEL:
-            print(f"  WARN       model_id {model_id!r} != this build's {full_corpus.CORPUS_MODEL!r}")
+        model_id = full_corpus.validate(ds, full_corpus.CORPUS_MODEL)
+        pca, scales, _ = full_corpus._read_field_pca(ds, full_corpus.CORPUS_MODEL)
+        print(f"  contract   OK  model_id {model_id}, pca {pca.shape} {pca.dtype}, "
+              f"scales {scales.shape}")
+        meta = ds.schema.field(full_corpus.vector_full_column()).metadata or {}
+        artifact = (meta.get(full_corpus.META_KEY_MODEL_ARTIFACT_URI) or b"").decode()
+        if artifact:
+            print(f"  checkpoint {full_corpus._checkpoint(artifact)}")
         # Resident int8 footprint is what decides whether the service fits.
         gib = rows * pca.shape[0] / (1024 ** 3)
         print(f"  resident   {gib:.2f} GiB int8 screen ({pca.shape[0]}-d) + ~5 GiB encoder")
         if gib > 20:
             print("  WARN       screen + encoder leaves little headroom under a 32Gi ceiling")
+    except full_corpus.CorpusContractError as exc:
+        print(f"  FAIL       contract: {exc}")
+        ok = False
     except Exception as exc:  # noqa: BLE001
         print(f"  FAIL       basis unreadable: {type(exc).__name__}: {str(exc)[:200]}")
         ok = False

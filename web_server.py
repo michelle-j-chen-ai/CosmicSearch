@@ -13,6 +13,7 @@ Run locally:
 from __future__ import annotations
 
 import csv
+import contextlib
 import dataclasses
 import base64
 import binascii
@@ -1205,6 +1206,33 @@ def _segment_set_filter(uuid: "str | None", project: str | None = None) -> dict:
 # OOM-kills the container, so exports are serialized rather than queued
 # per-request.
 _FULL_EXPORT_LOCK = threading.Lock()
+
+# A full-corpus scoring pass allocates one float32 per row -- ~216MB at 54M --
+# on top of the resident screen and the encoder, against a 32Gi ceiling. Exports
+# hold _FULL_EXPORT_LOCK, but tag creation and refinement score too and used to
+# be unbounded: enough concurrent callers could OOM the container, and Cloud Run
+# answers an OOM by killing the instance, search included. Two at a time leaves
+# headroom; a caller that cannot get a slot is told to retry rather than queued
+# behind an unbounded wait.
+_SCORING_SLOTS = threading.BoundedSemaphore(2)
+_SCORING_WAIT_S = 20.0
+
+
+@contextlib.contextmanager
+def scoring_slot():
+    """Permission to run one full-corpus scoring pass. 503s when saturated."""
+    if not _SCORING_SLOTS.acquire(timeout=_SCORING_WAIT_S):
+        raise HTTPException(
+            503,
+            {"code": "scoring_busy",
+             "message": "too many full-corpus scans in flight; retry shortly",
+             "status": 503},
+            headers={"Retry-After": "10"},
+        )
+    try:
+        yield
+    finally:
+        _SCORING_SLOTS.release()
 
 # Hard ceiling on a threshold export regardless of what the caller asks for.
 # A permissive tau matches a tenth of the corpus (a mean+3*std cutoff selected

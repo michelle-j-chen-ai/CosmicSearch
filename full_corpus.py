@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 
 import lance
@@ -131,6 +132,7 @@ def vector_fp_column(model: str = CORPUS_MODEL) -> str:
 META_KEY_PCA_COMPONENTS = b"nls.pca_components"
 META_KEY_QUANT_SCALES = b"nls.quant_scales"
 META_KEY_MODEL_ID = b"nls.model_id"
+META_KEY_MODEL_ARTIFACT_URI = b"nls.model_artifact_uri"
 
 
 def decode_metadata_array(encoded: bytes) -> np.ndarray:
@@ -139,6 +141,75 @@ def decode_metadata_array(encoded: bytes) -> np.ndarray:
     import io
 
     return np.load(io.BytesIO(base64.b64decode(encoded)))
+
+
+# Columns without which the corpus cannot be served at all.
+REQUIRED_COLUMNS = ("run_uuid", "segment_id", "chunk_start_unix")
+
+# `nls.model_id` records the encoder family, and the column suffix spells the
+# same name with underscores ("black-dwarf" on the field, `vector_black_dwarf`
+# as the column), so the two are compared with separators normalized.
+def _same_model(a: str, b: str) -> bool:
+    return a.strip().lower().replace("-", "_") == b.strip().lower().replace("-", "_")
+
+
+def _checkpoint(uri: str) -> str:
+    """Last path segment of a model artifact URI, which is the checkpoint name.
+    Each fleet keeps its own copy of the same checkpoint under its own bucket,
+    so the paths differ where the checkpoint does not."""
+    return uri.strip().rstrip("/").rsplit("/", 1)[-1]
+
+
+class CorpusContractError(ValueError):
+    """The table does not satisfy what this build reads from it."""
+
+
+def validate(dataset: "lance.LanceDataset", model: str = CORPUS_MODEL) -> str:
+    """Check a table against what this build reads, and return its model_id.
+
+    One function for both callers -- `load` and `tools/inspect_corpus_registry`
+    -- so the pre-flight gate and the runtime cannot disagree about what a
+    servable table is.
+
+    The encoder identity is checked, not just recorded: a corpus embedded by
+    another model yields a confident ranked list with nothing in it to signal
+    that every score is meaningless, so a mismatch has to fail loudly here.
+    """
+    names = set(dataset.schema.names)
+    for column in (embedding_column(model), vector_fp_column(model),
+                   vector_full_column(model), *REQUIRED_COLUMNS):
+        if column not in names:
+            raise CorpusContractError(
+                f"missing column {column!r} (have: {sorted(names)[:12]}...)"
+            )
+
+    _pca, _scales, model_id = _read_field_pca(dataset, model)
+    if not model_id:
+        raise CorpusContractError(
+            f"{vector_full_column(model)} field metadata has no {META_KEY_MODEL_ID.decode()}; "
+            "without the encoder identity a wrong-model corpus cannot be detected"
+        )
+    if not _same_model(model_id, model):
+        raise CorpusContractError(
+            f"table was embedded by {model_id!r}, this build scores {model!r}"
+        )
+
+    # The checkpoint is the sharper question -- every checkpoint of this family
+    # reports the same model_id, so only the artifact URI distinguishes them --
+    # but each fleet holds its own copy of the same checkpoint under its own
+    # bucket, and a copy could legitimately be renamed. Logged, not fatal: a
+    # false rejection here takes a fleet offline, and the earlier version of
+    # this check did exactly that to both of them.
+    meta = dataset.schema.field(vector_full_column(model)).metadata or {}
+    table_artifact = (meta.get(META_KEY_MODEL_ARTIFACT_URI) or b"").decode()
+    want = os.environ.get("NLS_MODEL_ARTIFACT_URI", "").strip()
+    if table_artifact and want and _checkpoint(table_artifact) != _checkpoint(want):
+        LOGGER.warning(
+            "corpus was embedded by checkpoint %s but this instance encodes with %s; "
+            "scores are only comparable if these are the same weights",
+            _checkpoint(table_artifact), _checkpoint(want),
+        )
+    return model_id
 
 
 def _read_field_pca(
@@ -1169,12 +1240,8 @@ def load(
 
     so = oci_s3.lance_storage_options()
     ds = lance.dataset(table_uri, storage_options=so)
+    validate(ds, model)
     i8_col = embedding_column(model)
-    if i8_col not in ds.schema.names:
-        raise ValueError(
-            f"{table_uri} has no column {i8_col!r} "
-            f"(available: {sorted(n for n in ds.schema.names if 'embedding' in n)})"
-        )
     pca, scale, model_id = _read_field_pca(ds, model)
 
     # Decoded batch by batch into one preallocated array rather than via
