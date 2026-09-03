@@ -282,7 +282,7 @@ def list_tags(project: str | None = None, q: str | None = None, created_by: str 
 @router.get("/tags/{tag}")
 def read_tag(
     tag: str, request: Request, response: Response,
-    project: str = deployment.DEFAULT, version: int | None = None, output: str | None = None,
+    project: str | None = None, version: int | None = None, output: str | None = None,
     k: int | None = None, page: int = 1, page_size: int = 50,
     interval: bool = False, segment_mode: bool = True, confidence: bool = False,
     include_below_threshold: bool = False, passthrough_columns: bool = False,

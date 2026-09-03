@@ -6,9 +6,12 @@ the Data Explorer cluster its segment sets live on. Everything else -- the
 encoder, the S3 endpoint and credentials, the export prefix -- is shared, so a
 request differs between projects only in which table it is scored against.
 
-`NLS_PROJECTS` is the comma-separated list of projects this instance loads
-(default: the default project alone). A project's values can be overridden per
-deployment with NLS_<PROJECT>_CORPUS_TABLE_URI, NLS_<PROJECT>_MP4_PREFIX and
+`NLS_PROJECTS` is the comma-separated list of projects this instance loads. A
+service that lists one project serves only that project, and it is what a
+request that names none gets: neuron and frontier are deployed as two services
+off this image, each with its own corpus, its own Data Explorer cluster and its
+own Postgres schema. A project's values can be overridden per deployment with
+NLS_<PROJECT>_CORPUS_TABLE_URI, NLS_<PROJECT>_MP4_PREFIX and
 NLS_<PROJECT>_DORA_HOSTNAME.
 """
 
@@ -19,7 +22,9 @@ import os
 
 import config
 
-DEFAULT = "neuron"
+# The project a build falls back to when NLS_PROJECTS is unset. Not the default
+# for a running instance -- that is `default()`, the first project it loads.
+FALLBACK = "neuron"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,7 +75,7 @@ def is_known(name: str | None) -> bool:
 def get(name: str | None) -> Project:
     """The project's resolved values. Raises KeyError for a name this build does
     not know, so a typo cannot fall through to the default corpus."""
-    key = (name or DEFAULT).strip().lower()
+    key = (name or default()).strip().lower()
     if key not in _BUILTIN:
         raise KeyError(key)
     built = _BUILTIN[key]
@@ -91,10 +96,18 @@ def enabled() -> list[str]:
     """Projects this instance loads, in NLS_PROJECTS order. Unknown names are
     dropped; an empty result falls back to the default so the service always
     serves something."""
-    raw = os.environ.get("NLS_PROJECTS", DEFAULT)
+    raw = os.environ.get("NLS_PROJECTS", FALLBACK)
     out: list[str] = []
     for part in raw.split(","):
         key = part.strip().lower()
         if key in _BUILTIN and key not in out:
             out.append(key)
-    return out or [DEFAULT]
+    return out or [FALLBACK]
+
+
+def default() -> str:
+    """The project a request that names none is served from: this instance's
+    first enabled project. A single-project service therefore answers unqualified
+    requests from the corpus it actually holds, rather than 503-ing on one it
+    was never configured to load."""
+    return enabled()[0]
