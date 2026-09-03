@@ -9,7 +9,7 @@ import full_corpus
 
 
 def test_default_project_is_the_neuron_table():
-    p = deployment.get(deployment.DEFAULT)
+    p = deployment.get(deployment.FALLBACK)
     assert p.name == "neuron"
     assert p.corpus_table_uri == full_corpus.DEFAULT_CORPUS_TABLE_URI
 
@@ -23,7 +23,7 @@ def test_frontier_has_its_own_table_prefix_and_cluster():
 
 def test_names_are_case_insensitive_and_none_means_default():
     assert deployment.get("FRONTIER").name == "frontier"
-    assert deployment.get(None).name == deployment.DEFAULT
+    assert deployment.get(None).name == deployment.default()
 
 
 def test_unknown_project_is_an_error_not_the_default():
@@ -66,9 +66,24 @@ def test_enabled_parses_nls_projects(monkeypatch, raw, expected):
     assert deployment.enabled() == expected
 
 
-def test_enabled_defaults_to_the_default_project(monkeypatch):
+def test_enabled_defaults_to_the_fallback_project(monkeypatch):
     monkeypatch.delenv("NLS_PROJECTS", raising=False)
-    assert deployment.enabled() == [deployment.DEFAULT]
+    assert deployment.enabled() == [deployment.FALLBACK]
+
+
+def test_a_single_project_service_defaults_to_the_corpus_it_holds(monkeypatch):
+    """neuron and frontier deploy as two services off one image. A frontier-only
+    service must answer an unqualified request from frontier -- defaulting to a
+    project it never loaded would 503 every call that omitted one."""
+    monkeypatch.setenv("NLS_PROJECTS", "frontier")
+    assert deployment.default() == "frontier"
+    assert deployment.get(None).name == "frontier"
+    assert deployment.get(None).corpus_table_uri.startswith("s3://frontier-perception-datasets/")
+
+
+def test_the_default_is_the_first_listed_project(monkeypatch):
+    monkeypatch.setenv("NLS_PROJECTS", "frontier,neuron")
+    assert deployment.default() == "frontier"
 
 
 def test_media_uri_is_the_project_prefix_plus_the_shared_layout():
@@ -89,3 +104,16 @@ def test_unknown_project_is_a_404_on_the_api():
     with pytest.raises(HTTPException) as e:
         ws._require_full_corpus("cars")
     assert e.value.status_code == 404
+
+
+def test_unconfigured_dora_host_names_the_config_not_a_missing_module(monkeypatch):
+    """The slim image omits trino/simian on purpose. With no hostname set,
+    _get_stub used to fall through to the SDK's own get_stub and fail with
+    ModuleNotFoundError, pointing at a dependency instead of the empty config."""
+    import dora_client
+
+    monkeypatch.delenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", raising=False)
+    monkeypatch.delenv("URSA_SDK_GRPC_HOSTNAME", raising=False)
+    with pytest.raises(dora_client.DoraUnavailable) as exc:
+        dora_client._get_stub(None)
+    assert "URSA_SDK_GRPC_HOSTNAME" in str(exc.value)

@@ -79,7 +79,7 @@ async function loadPlatform() {
     const h = await fetch("/api/v1/health").then((r) => r.json());
     state.health = h;
     const names = Object.keys(h.projects || {});
-    const def = names.includes("neuron") ? "neuron" : names[0];
+    const def = names[0];  // the server's default too: the first project it loads
     if (!state.project || !names.includes(state.project)) state.project = def;
     localStorage.setItem("nls.project", state.project);
     const sel = $("projectSelect");

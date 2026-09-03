@@ -114,7 +114,7 @@ def _load_engine() -> None:
     _state["s3"] = oci_s3.s3_client()
     # The default project's table, stamped onto persisted rows (exported
     # vectors) as the space those numbers belong to.
-    _state["active_uri"] = deployment.get(deployment.DEFAULT).corpus_table_uri
+    _state["active_uri"] = deployment.get(None).corpus_table_uri
     threading.Thread(target=_warm_engine, name="engine-warmup", daemon=True).start()
     # Pre-warm each project's DORA gRPC channel + the machine token now
     # (independent of the model), so the first segment-set selection doesn't pay
@@ -147,7 +147,7 @@ def _warm_engine() -> None:
         db.init_schema()  # best-effort; logs + continues if exp-db is unreachable
         import full_corpus
 
-        db.backfill_catalog(project=deployment.DEFAULT, model=full_corpus.CORPUS_MODEL)
+        db.backfill_catalog(project=deployment.default(), model=full_corpus.CORPUS_MODEL)
         # Start every enabled project's corpus load here rather than waiting
         # for someone to search: the read and decode take minutes, and paying
         # that on a user's first query reads as a hang. Each runs on its own
@@ -167,7 +167,7 @@ def _warm_engine() -> None:
 
 def _project_of(req) -> str:
     """The project a request addresses; the default when the model has no field."""
-    return getattr(req, "project", None) or deployment.DEFAULT
+    return getattr(req, "project", None) or deployment.default()
 
 
 def _project_or_404(name: str | None) -> "deployment.Project":
@@ -449,7 +449,7 @@ _UPLOAD_MAX_FRAME_BYTES = 8 * 1024 * 1024  # per decoded frame (a 448-ish jpeg i
 
 
 @app.get("/ui/segment_sets")
-def segment_sets(name_filter: str = "", prefetch: str = "", project: str = deployment.DEFAULT):
+def segment_sets(name_filter: str = "", prefetch: str = "", project: str | None = None):
     """Data Explorer sets whose name matches, for the downsample picker. With
     `prefetch`, start loading that set's ids in the background instead, so the
     pull overlaps the user composing a query."""
@@ -899,9 +899,9 @@ def _full_load_worker(project: str) -> None:
             slot["error"] = f"{type(exc).__name__}: {exc}"
 
 
-def _full_corpus_begin_load(project: str = deployment.DEFAULT) -> str:
+def _full_corpus_begin_load(project: str | None = None) -> str:
     """Start the project's background load if it is not already running/ready."""
-    _project_or_404(project)
+    project = _project_or_404(project).name
     with _CORPORA_LOCK:
         slot = _slot(project)
         if slot["status"] in ("loading", "ready"):
@@ -927,7 +927,7 @@ _FULL_MAX_DEPTH = 5000
 _WINDOW_MAX_POOL = 512
 
 
-def _full_refresh_worker(project: str = deployment.DEFAULT) -> None:
+def _full_refresh_worker(project: str | None = None) -> None:
     """Drop the project's resident corpus, then load the current one.
 
     Dropping FIRST is not a style choice: the process already holds ~24GB (model,
@@ -939,6 +939,7 @@ def _full_refresh_worker(project: str = deployment.DEFAULT) -> None:
     """
     import gc
 
+    project = project or deployment.default()
     with _CORPORA_LOCK:
         slot = _slot(project)
         previous = slot["corpus"]
@@ -997,10 +998,11 @@ def _seconds_until(hhmm: str, now: float) -> float:
     return target - now if target > now else target + 86400 - now
 
 
-def _corpus_version_check(resident, project: str = deployment.DEFAULT) -> dict:
+def _corpus_version_check(resident, project: str | None = None) -> dict:
     """Has the project's table moved since `resident` was read? One metadata call."""
     import full_corpus
 
+    project = project or deployment.default()
     held = getattr(resident, "dataset_version", None)
     latest = full_corpus.latest_version(deployment.get(project).corpus_table_uri)
     _REFRESH["table_version"] = latest
@@ -1013,8 +1015,9 @@ def _corpus_version_check(resident, project: str = deployment.DEFAULT) -> dict:
     return {"changed": changed, "held_version": held, "table_version": latest}
 
 
-def _corpus_refresh_tick(project: str = deployment.DEFAULT) -> str:
+def _corpus_refresh_tick(project: str | None = None) -> str:
     """One scheduled check of one project. Reloads only if its table has moved."""
+    project = project or deployment.default()
     with _CORPORA_LOCK:
         slot = _slot(project)
         status, resident = slot["status"], slot["corpus"]
@@ -1094,7 +1097,7 @@ class CalibrateRequest(BaseModel):
     tag on the label-free mean+3*std heuristic with nothing saying so.
     """
 
-    project: str = deployment.DEFAULT
+    project: str | None = None
     query: str
     marks: list[Mark] = []
     objective: str = "f1"
@@ -1171,13 +1174,13 @@ def _full_filters(req) -> dict:
     )
 
 
-def _segment_set_filter(uuid: "str | None", project: str = deployment.DEFAULT) -> dict:
+def _segment_set_filter(uuid: "str | None", project: str | None = None) -> dict:
     """Filter kwargs restricting the corpus to a Data Explorer segment set.
 
     A set whose ids are still loading raises 503 rather than returning no filter.
     Running unfiltered would answer a narrower question than the one asked, in the
     same wording and with no indication that the set was ignored -- the caller
-    should retry once ``/api/segment_set_status`` reports ready.
+    should retry once the set reports ready.
     """
     if not uuid or not uuid.strip():
         return {}
@@ -1236,7 +1239,7 @@ class RetrieveRequest(BaseModel):
     # frames, or the marks themselves -- these are five ways to arrive at one
     # 768-d direction, not five kinds of search, so they are inputs here rather
     # than endpoints of their own.
-    project: str = deployment.DEFAULT
+    project: str | None = None
     query: str = ""
     vector: list[float] | None = None
     window: "WindowRef | None" = None
@@ -1688,7 +1691,7 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
     same computation whether or not you have labels. With marks it also fits an
     operating point and returns the next clips worth labelling; without them it
     reports the label-free suggestion over the same distribution. Splitting that
-    into `threshold_search` and `score_distribution` meant two endpoints scoring
+    two separate scoring paths meant two endpoints scoring
     the whole corpus to produce overlapping answers.
 
     Operating-point selection over the full corpus's screening scores. Marks are
@@ -1816,9 +1819,9 @@ def _rocchio(
     return w.astype(np.float32)
 
 
-def _require_full_corpus(project: str = deployment.DEFAULT):
+def _require_full_corpus(project: str | None = None):
     """The project's resident corpus, or a 503 that starts its load."""
-    _project_or_404(project)
+    project = _project_or_404(project).name
     with _CORPORA_LOCK:
         slot = _slot(project)
         corpus, status, error = slot["corpus"], slot["status"], slot["error"]
@@ -1828,8 +1831,7 @@ def _require_full_corpus(project: str = deployment.DEFAULT):
         _full_corpus_begin_load(project)
         raise HTTPException(
             503,
-            f"{project} corpus is loading (~2 min); poll /api/full_corpus_status"
-            f"?project={project} and retry",
+            f"{project} corpus is loading (~2 min); poll /api/v1/health and retry",
         )
     return corpus
 

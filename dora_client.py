@@ -136,6 +136,15 @@ def _build_secure_stub(stub_type, hostname: str = ""):
     import grpc
 
     hostname = hostname or os.getenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", "")
+    if not hostname:
+        # An unconfigured deployment must say so. Falling through to the SDK's
+        # own get_stub below would import adp.public.strada.dora, which pulls
+        # trino + simian -- deliberately absent from the slim image -- so the
+        # error would name a missing module instead of the missing hostname.
+        raise DoraUnavailable(
+            "no Data Explorer hostname configured; set URSA_SDK_GRPC_HOSTNAME "
+            "or NLS_<PROJECT>_DORA_HOSTNAME for this deployment"
+        )
     if not hostname.startswith("grpc."):
         from adp.public.strada import dora
 
