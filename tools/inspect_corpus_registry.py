@@ -73,6 +73,10 @@ def inspect(name: str) -> bool:
         pca, scales, _ = full_corpus._read_field_pca(ds, full_corpus.CORPUS_MODEL)
         print(f"  contract   OK  model_id {model_id}, pca {pca.shape} {pca.dtype}, "
               f"scales {scales.shape}")
+        meta = ds.schema.field(full_corpus.vector_full_column()).metadata or {}
+        artifact = (meta.get(full_corpus.META_KEY_MODEL_ARTIFACT_URI) or b"").decode()
+        if artifact:
+            print(f"  checkpoint {full_corpus._checkpoint(artifact)}")
         # Resident int8 footprint is what decides whether the service fits.
         gib = rows * pca.shape[0] / (1024 ** 3)
         print(f"  resident   {gib:.2f} GiB int8 screen ({pca.shape[0]}-d) + ~5 GiB encoder")
