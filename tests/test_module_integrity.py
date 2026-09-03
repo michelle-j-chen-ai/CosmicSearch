@@ -18,6 +18,10 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 STDLIB_OK = {"__future__"}
+# Gitignored proprietary artifacts (AGENTS.md): repopulated locally before a
+# deploy and COPYed into the image, so they are absent in a clean checkout and
+# in CI. Their absence is expected; a missing first-party module is not.
+VENDORED = {"adp", "lilypad_py"}
 
 
 def _deferred_imports(path: pathlib.Path):
@@ -39,7 +43,7 @@ def test_every_deferred_import_resolves(path):
     missing = [
         f"{path.name}:{line} imports {mod!r}"
         for mod, line in _deferred_imports(path)
-        if mod not in STDLIB_OK and importlib.util.find_spec(mod) is None
+        if mod not in STDLIB_OK and mod not in VENDORED and importlib.util.find_spec(mod) is None
     ]
     assert not missing, "function-level imports of modules that do not exist: " + "; ".join(missing)
 
