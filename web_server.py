@@ -1691,7 +1691,7 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
     same computation whether or not you have labels. With marks it also fits an
     operating point and returns the next clips worth labelling; without them it
     reports the label-free suggestion over the same distribution. Splitting that
-    into `threshold_search` and `score_distribution` meant two endpoints scoring
+    two separate scoring paths meant two endpoints scoring
     the whole corpus to produce overlapping answers.
 
     Operating-point selection over the full corpus's screening scores. Marks are

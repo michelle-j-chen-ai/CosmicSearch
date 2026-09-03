@@ -21,11 +21,11 @@ it wrong.
 The consolidated table stores one column family per encoder
 (`embedding_i8_<model>`), so it can carry several models side by side; the
 active one is `CORPUS_MODEL`. Its PCA basis and quantization scales live on the
-FIELD metadata of that family's float column, alongside the encoder identity, so
-they are read from the corpus itself. A sibling table carries a copy, but two
-copies can drift: projecting a query through a basis that no longer matches the
-vectors it is scored against still returns a confident ranked list, just a
-meaningless one, and nothing errors.
+FIELD metadata of that family's float column, alongside the encoder identity,
+and that is the only copy: projecting a query through a basis that no longer
+matches the vectors it is scored against still returns a confident ranked list,
+just a meaningless one, and nothing errors. So the basis travels with the
+vectors, and `deployment.py` is the only thing that says which table to read.
 """
 
 from __future__ import annotations
@@ -39,7 +39,6 @@ import numpy as np
 
 import config
 import eps_bound
-import lance_writer
 import oci_s3
 
 LOGGER = logging.getLogger(__name__)
@@ -124,23 +123,40 @@ def vector_fp_column(model: str = CORPUS_MODEL) -> str:
     return f"vector_fp_{model}"
 
 
+# The on-table metadata contract. The embedding pipeline writes the basis and
+# the quantization scales into the float column's FIELD metadata, base64'd npy;
+# these keys and the decoder are all a reader needs. The corpus URI comes from
+# `deployment.py` and the basis comes from the table itself, so there is no
+# third place for either to be wrong.
+META_KEY_PCA_COMPONENTS = b"nls.pca_components"
+META_KEY_QUANT_SCALES = b"nls.quant_scales"
+META_KEY_MODEL_ID = b"nls.model_id"
+
+
+def decode_metadata_array(encoded: bytes) -> np.ndarray:
+    """Recover an array from field metadata (base64-wrapped .npy)."""
+    import base64
+    import io
+
+    return np.load(io.BytesIO(base64.b64decode(encoded)))
+
+
 def _read_field_pca(
     dataset: "lance.LanceDataset", model: str
 ) -> "tuple[np.ndarray, np.ndarray, str]":
     """(pca, scales, model_id) from the float column's FIELD metadata.
 
-    `lance_writer.read_pca_metadata` looks at SCHEMA-level metadata, where this
-    table carries only `embedding_dim`/`pca_dim`. The basis itself sits on the
-    field, which is the copy that travels with the vectors it describes, and it
-    brings the encoder identity with it -- so a corpus built by a different model
-    can be rejected rather than silently scored against.
+    The basis sits on the field rather than on the schema: that is the copy
+    which travels with the vectors it describes, and it carries the encoder
+    identity too -- so a corpus built by a different model can be rejected
+    rather than silently scored against.
     """
     column = vector_full_column(model)
     field = dataset.schema.field(column)
     meta = field.metadata or {}
     missing = [
         k.decode()
-        for k in (lance_writer.META_KEY_PCA_COMPONENTS, lance_writer.META_KEY_QUANT_SCALES)
+        for k in (META_KEY_PCA_COMPONENTS, META_KEY_QUANT_SCALES)
         if k not in meta
     ]
     if missing:
@@ -148,9 +164,9 @@ def _read_field_pca(
             f"{column} field metadata is missing {missing}; the basis must travel "
             "with the vectors it describes"
         )
-    pca = lance_writer.decode_array(meta[lance_writer.META_KEY_PCA_COMPONENTS])
-    scale = lance_writer.decode_array(meta[lance_writer.META_KEY_QUANT_SCALES])
-    model_id = (meta.get(b"nls.model_id") or b"").decode()
+    pca = decode_metadata_array(meta[META_KEY_PCA_COMPONENTS])
+    scale = decode_metadata_array(meta[META_KEY_QUANT_SCALES])
+    model_id = (meta.get(META_KEY_MODEL_ID) or b"").decode()
     return pca, scale, model_id
 
 
@@ -220,7 +236,7 @@ class Selection:
 def _dictionary_codes(column: object) -> tuple[np.ndarray, list]:
     """Arrow string column -> (int32 codes, uniques). Code -1 is NULL.
 
-    Mirrors `threshold_search._dictionary_codes`: filters then compare int32
+    Filters by dictionary code rather than string: compare int32
     codes (SIMD) instead of Python strings, and the uniques list is tiny next
     to the per-row column it replaces.
     """
@@ -396,7 +412,7 @@ class FullCorpus:
     ) -> np.ndarray | None:
         """AND of the given filters; None when nothing was asked for.
 
-        Unlike `threshold_search._filter_mask`, `vehicles` is a SET: the app's
+        `vehicles` is a SET, not a single value: the app's
         vehicle box accepts a list, and a single-value filter silently dropped
         every vehicle but one.
 
@@ -799,8 +815,8 @@ class FullCorpus:
     def probe_vector_fp(self, sample: int = 64) -> dict:
         """Is `vector_fp` the true pre-quantization projection, or a fallback?
 
-        `lance_writer` populates that column from a real fp32 PCA projection when
-        one was supplied at write time, and otherwise from the int8 dequantized
+        The embedding pipeline populates that column from a real fp32 PCA
+        projection when it has one, and otherwise from the int8 dequantized
         back to fp32. The two are indistinguishable by schema -- no flag records
         which -- but not by content: the fallback equals `i8 * scale / 127`
         exactly, because that is how it was produced.

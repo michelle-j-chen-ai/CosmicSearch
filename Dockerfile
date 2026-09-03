@@ -25,13 +25,12 @@ FROM deps AS runtime
 # interval_core.py: dependency-light (numpy) interval-projection + arrow helpers,
 # shared with the offline Spark scan workflow; search_engine imports it.
 COPY config.py oci_s3.py local_cache.py interval_core.py search_engine.py analytics.py ./
-# int8 PCA corpus backend (very large embedding sets); dispatched by search_engine.
 # Full-corpus search: full_corpus.py holds the consolidated corpus's int8/PCA
-# screen resident and ranks it; threshold_search/lance_writer/eps_bound are the
-# exact-threshold retrieval path it shares (PCA metadata reader + error bound).
-# search_engine imports threshold_search lazily, so a missing file here fails at
+# screen resident, ranks it with its own numba kernel, and reads the PCA basis
+# from the table's field metadata; eps_bound proves the int8 screen's error
+# bound, which is what makes the cascade exact rather than approximate.
 # call time rather than at build -- hence copying them explicitly.
-COPY full_corpus.py lance_writer.py eps_bound.py ./
+COPY full_corpus.py eps_bound.py ./
 # FastAPI app (now the served frontend) + its modules and static assets.
 # DORA SDK proto stubs: data-explorer-py's `adp` package, VENDORED LOCALLY so the
 # image builds on a plain Cloud Build with NO internal pip index. `adp/` is
