@@ -138,8 +138,8 @@ def test_absent_credentials_raise_instead_of_reaching_the_metadata_server(monkey
     assert opts["aws_access_key_id"] == "id" and opts["aws_secret_access_key"] == "secret"
 
 
-def _fake_dataset(*, model="black_dwarf", model_id="black_dwarf", storage="2.2",
-                  drop=(), pca_dim=4):
+def _fake_dataset(*, model="black_dwarf", model_id="black-dwarf", storage="2.0",
+                  drop=(), pca_dim=4, artifact=""):
     """A stand-in with just the surface `full_corpus.validate` reads."""
     import base64
     import io
@@ -160,6 +160,8 @@ def _fake_dataset(*, model="black_dwarf", model_id="black_dwarf", storage="2.2",
     }
     if model_id is not None:
         meta[full_corpus.META_KEY_MODEL_ID] = model_id.encode()
+    if artifact:
+        meta[full_corpus.META_KEY_MODEL_ARTIFACT_URI] = artifact.encode()
 
     fields = [
         pa.field(full_corpus.embedding_column(model), pa.list_(pa.int8(), pca_dim)),
@@ -176,10 +178,15 @@ def _fake_dataset(*, model="black_dwarf", model_id="black_dwarf", storage="2.2",
     return _DS()
 
 
-def test_validate_accepts_a_table_that_meets_the_contract():
+def test_validate_accepts_the_production_tables_as_they_are_written():
+    """Both fleets' tables report model_id "black-dwarf" with a hyphen, against a
+    "black_dwarf" column suffix, at data_storage_version 2.0. An earlier version
+    of this check required an exact model_id match and a 2.1 floor, so it
+    rejected both of the tables it was meant to protect."""
     import full_corpus
 
-    assert full_corpus.validate(_fake_dataset()) == "black_dwarf"
+    assert full_corpus.validate(_fake_dataset()) == "black-dwarf"
+    assert full_corpus.validate(_fake_dataset(model_id="black_dwarf")) == "black_dwarf"
 
 
 @pytest.mark.parametrize(
@@ -187,7 +194,6 @@ def test_validate_accepts_a_table_that_meets_the_contract():
     [
         ({"model_id": None}, "nls.model_id"),
         ({"model_id": "some_other_encoder"}, "some_other_encoder"),
-        ({"storage": "2.0"}, "data_storage_version"),
         ({"drop": ("segment_id",)}, "segment_id"),
         ({"drop": ("vector_fp_black_dwarf",)}, "vector_fp_black_dwarf"),
     ],
@@ -200,3 +206,25 @@ def test_validate_rejects_a_table_the_app_cannot_serve(kwargs, expected):
     with pytest.raises(full_corpus.CorpusContractError) as exc:
         full_corpus.validate(_fake_dataset(**kwargs))
     assert expected in str(exc.value)
+
+
+def test_a_checkpoint_mismatch_warns_rather_than_rejecting(monkeypatch, caplog):
+    """Every checkpoint of this family reports the same model_id, so only the
+    artifact URI separates them -- but each fleet keeps its own copy under its
+    own bucket, so paths differ where the checkpoint does not. Compare the
+    checkpoint name, and only log: a false rejection here takes a fleet down."""
+    import logging
+
+    import full_corpus
+
+    monkeypatch.setenv("NLS_MODEL_ARTIFACT_URI",
+                       "s3://neuron-prod-data-intelligence-exploratory/x/models/maxsim-mainfull-ckpt14500/")
+    same = _fake_dataset(artifact="s3://frontier-perception-datasets/model_assets/maxsim-mainfull-ckpt14500/")
+    with caplog.at_level(logging.WARNING):
+        assert full_corpus.validate(same) == "black-dwarf"
+    assert "checkpoint" not in caplog.text
+
+    other = _fake_dataset(artifact="s3://frontier-perception-datasets/model_assets/maxsim-mainfull-ckpt9000/")
+    with caplog.at_level(logging.WARNING):
+        assert full_corpus.validate(other) == "black-dwarf"
+    assert "ckpt9000" in caplog.text
