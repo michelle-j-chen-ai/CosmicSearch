@@ -153,8 +153,8 @@ function wireEvents() {
 
   $("pagePrev").onclick = () => reload({ page: state.page - 1 });
   $("pageNext").onclick = () => reload({ page: state.page + 1 });
-  $("jumpRankBtn").onclick = () => { const r = parseInt($("jumpRank").value, 10); if (r >= 1) reload({ start_rank: r }); };
-  $("jumpSimBtn").onclick = () => { const s = parseFloat($("jumpSim").value); if (!Number.isNaN(s)) reload({ start_score: s }); };
+  $("jumpRankBtn").onclick = () => { const r = parseInt($("jumpRank").value, 10); if (r >= 1) _jumpToRank(r); };
+  $("jumpSimBtn").onclick = () => { const s = parseFloat($("jumpSim").value); if (!Number.isNaN(s)) _jumpToScore(s); };
   $("quickDedup").onchange = () => renderGrid();
   $("perPage").onchange = () => { state.pageSize = parseInt($("perPage").value, 10) || 24; if (state.query) reload({ page: 0 }); };
 
@@ -531,6 +531,41 @@ function _fullKey(q) {
           $("sf-vehicle").value, $("sf-drive").value,
           state.searchSegUuid || "",
           $("sf-lance") ? $("sf-lance").value : ""].join("|");
+}
+
+// The ranked list lives in the client-side buffer that _renderFullPage walks,
+// so a rank is a page by arithmetic -- no request needed. These used to pass
+// start_rank/start_score to /api/search, whose server-side support was deleted
+// on 2026-08-27; nothing has read either since, so both buttons did nothing.
+function _jumpBuffer() {
+  const buf = state.fullBuf;
+  if (!buf || !(buf.hits || []).length) { showToast("Run a search first"); return null; }
+  return buf;
+}
+
+function _jumpToRank(rank) {
+  const buf = _jumpBuffer();
+  if (!buf) return;
+  // Clamping to the last page would look like the jump worked. Say what is
+  // loaded instead, since the buffer is the whole reachable set.
+  if (rank > buf.hits.length) {
+    showToast(`Only the top ${fmtInt(buf.hits.length)} are loaded — export to reach rank ${fmtInt(rank)}`);
+    return;
+  }
+  _renderFullPage(Math.floor((rank - 1) / (state.pageSize || 24)));
+}
+
+function _jumpToScore(score) {
+  const buf = _jumpBuffer();
+  if (!buf) return;
+  // Hits are score-descending, so the first at or below the target is where
+  // that similarity starts.
+  const i = buf.hits.findIndex((h) => h.score <= score);
+  if (i < 0) {
+    showToast(`Nothing loaded scores at or below ${score} — the lowest is ${buf.hits[buf.hits.length - 1].score}`);
+    return;
+  }
+  _renderFullPage(Math.floor(i / (state.pageSize || 24)));
 }
 
 function _renderFullPage(page) {
