@@ -18,6 +18,7 @@ antlr4-python3-runtime==4.9.3
     # via omegaconf
 anyio==4.14.2
     # via
+    #   httpx2
     #   starlette
     #   streamlit
     #   watchfiles
@@ -97,13 +98,19 @@ grpcio==1.83.0
     #   -r requirements.txt
     #   cloud-sql-python-connector
 h11==0.16.0
-    # via uvicorn
+    # via
+    #   httpcore2
+    #   uvicorn
 hf-xet==1.5.2
     # via huggingface-hub
+httpcore2==2.12.0
+    # via httpx2
 httptools==0.8.0
     # via
     #   streamlit
     #   uvicorn
+httpx2==2.12.0
+    # via -r requirements.txt
 huggingface-hub==0.36.2
     # via
     #   tokenizers
@@ -113,6 +120,7 @@ humanize==4.16.0
 idna==3.18
     # via
     #   anyio
+    #   httpx2
     #   requests
     #   yarl
 iniconfig==2.3.0
@@ -313,6 +321,10 @@ tqdm==4.70.0
     #   transformers
 transformers==4.51.3
     # via -r requirements.txt
+truststore==0.10.4
+    # via
+    #   httpcore2
+    #   httpx2
 typing-extensions==4.16.0
     # via
     #   altair
