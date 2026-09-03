@@ -104,3 +104,16 @@ def test_unknown_project_is_a_404_on_the_api():
     with pytest.raises(HTTPException) as e:
         ws._require_full_corpus("cars")
     assert e.value.status_code == 404
+
+
+def test_unconfigured_dora_host_names_the_config_not_a_missing_module(monkeypatch):
+    """The slim image omits trino/simian on purpose. With no hostname set,
+    _get_stub used to fall through to the SDK's own get_stub and fail with
+    ModuleNotFoundError, pointing at a dependency instead of the empty config."""
+    import dora_client
+
+    monkeypatch.delenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", raising=False)
+    monkeypatch.delenv("URSA_SDK_GRPC_HOSTNAME", raising=False)
+    with pytest.raises(dora_client.DoraUnavailable) as exc:
+        dora_client._get_stub(None)
+    assert "URSA_SDK_GRPC_HOSTNAME" in str(exc.value)
