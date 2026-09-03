@@ -118,6 +118,16 @@ download+load of a 5k-row corpus took ~21s; the second load was ~0s (cache hit).
 
 ## Data prerequisite: the consolidated corpus
 
+### One image, one service per fleet
+
+neuron and frontier deploy as two Cloud Run services off the same image,
+differing only in `NLS_PROJECTS`. Two rather than one serving both, for memory:
+each resident int8 corpus is >13GB against a 32Gi ceiling and one process cannot
+hold both alongside the ~5GB encoder. The split also gives each fleet its own
+Postgres schema -- `db.py` derives it from `K_SERVICE` -- so tags, marks and
+exports never mix between fleets, and its own API-gateway keys. See
+`project.toml` and `project-trucking.toml`.
+
 Each project serves one Lance table, named in `deployment.py` (neuron:
 `s3://neuron-prod-data-intelligence-exploratory/vlm/corpus/video_embeddings.lance`,
 frontier: `s3://frontier-perception-datasets/vlm/corpus/video_embeddings.lance`).
@@ -175,7 +185,7 @@ Cold start downloads the model (base model from HF, or the merged snapshot from
 | `NLS_PRESIGN_TTL_S` | `3600` | presigned MP4 URL lifetime |
 | `NLS_OWNER_EMAIL` | `""` | Comma-separated maintainer emails allowed to view the usage-analytics sidebar; empty = nobody (fail closed) |
 | `AWS_*` | -- | OCI S3-compat credentials + endpoint |
-| `NLS_PROJECTS` | `neuron` | Comma-separated projects this instance loads and serves (`neuron`, `frontier`). Every `/api/` call takes `project` (query param or body field), defaulting to `neuron` |
+| `NLS_PROJECTS` | `neuron` | Comma-separated projects this instance loads and serves (`neuron`, `frontier`). Every `/api/` call takes `project` (query param or body field); one that omits it is served from the **first** project in this list |
 | `NLS_<PROJECT>_CORPUS_TABLE_URI` | per project, see `deployment.py` | Override a project's Lance table |
 | `NLS_<PROJECT>_MP4_PREFIX` | per project | Override where a project's clips are stored |
 | `NLS_<PROJECT>_DORA_HOSTNAME` | per project | Override a project's Data Explorer gRPC host |

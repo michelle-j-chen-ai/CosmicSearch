@@ -202,3 +202,18 @@ def test_legacy_routes_are_gone(client):
     for path in ("/api/retrieve", "/api/calibrate", "/api/save_vector", "/api/tags_catalog",
                  "/api/scans", "/api/export_config", "/api/full_corpus_status", "/api/platform"):
         assert c.post(path).status_code in (404, 405) and c.get(path).status_code in (404, 405), path
+
+
+def test_a_frontier_only_service_serves_unqualified_requests_from_frontier(client, monkeypatch):
+    """Each fleet is its own Cloud Run service off this image, with its own
+    corpus and its own Postgres schema. On the frontier service a call that
+    omits `project` must reach frontier: the old fixed default pointed at a
+    corpus that service never loads, so every such call would 503."""
+    c, _ = client
+    monkeypatch.setenv("NLS_PROJECTS", "frontier")
+    body = c.get("/api/v1/health").json()
+    assert set(body["projects"]) == {"frontier"}
+    r = c.get("/api/v1/tags/nothing_here")  # unknown tag, but resolved against frontier
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "unknown_tag"
+    assert ws.deployment.default() == "frontier"
+    assert ws._project_of(object()) == "frontier"

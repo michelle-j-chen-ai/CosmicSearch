@@ -7,7 +7,8 @@ Lance embedding tables; does not train models or generate embeddings.
 
 ## Architecture
 
-Single CPU Cloud Run service. Model (~5GB fp32) and the embedding matrix are
+One CPU Cloud Run service per fleet, both off this image (`project.toml`,
+`project-trucking.toml`), each with its own corpus and Postgres schema. Model (~5GB fp32) and the embedding matrix are
 loaded once and held resident; queries are ~100ms (encode ~40ms + numpy brute-
 force matmul ~58ms + presign). No GPU, no ANN index — flat matrix-vector product
 is exact and fast enough at this corpus size.
@@ -16,7 +17,7 @@ Core modules:
 - `config.py` — env-driven configuration.
 - `oci_s3.py` — OCI S3-compat client, Lance storage options, model download, presigning.
 - `local_cache.py` — disk cache for downloaded Lance corpora and model snapshots.
-- `deployment.py` — the project registry: which corpus table, clip prefix and Data Explorer host each project (`neuron`, `frontier`) uses.
+- `deployment.py` — the project registry: which corpus table, clip prefix and Data Explorer host each project (`neuron`, `frontier`) uses, and which of them this instance serves (`NLS_PROJECTS`; the first is the default).
 - `search_engine.py` — model load, text/frame encoding, threshold fitting.
 - `full_corpus.py` — the resident int8/PCA corpus and the search cascade.
 - `catalog.py` — tags, versions, per-project thresholds, marks, exports (SQLAlchemy Core).
