@@ -45,7 +45,6 @@ const state = {
   perTagK: {},               // tag -> top-K, for per-search K in a multi-tag Top-K export
   sampleMode: "interval",
 };
-let _issueSeq = 0;
 
 // Every /api call carries the project it addresses: as a query parameter, and
 // in the JSON body when there is one, so GET and POST routes read it the same way.
@@ -293,17 +292,10 @@ async function runSearch(startOpts) {
   if (!q) { showToast("Type a query first"); return; }
   $("searchInput2").value = q;
   state.query = q; state.mode = "search";
-  // Full-corpus mode ranks all ~34M clips instead of the loaded corpus. It is a
-  // different endpoint because that corpus is loaded on demand and has no paging
-  // or refine; the response envelope is identical, so the grid is unchanged.
-  if (_fullCorpusOn()) {
-    const page = (startOpts && startOpts.page) || 0;
-    // Same query and filters as the buffer we already hold -> page locally.
-    if (state.fullBuf && state.fullBuf.key === _fullKey(q)) { _renderFullPage(page); return; }
-    await _issueFullCorpus(q, page);
-    return;
-  }
-  await _issue("/api/search", { query: q, ...(startOpts || {}), ..._searchFilters() });
+  const page = (startOpts && startOpts.page) || 0;
+  // Same query and filters as the buffer we already hold -> page locally.
+  if (state.fullBuf && state.fullBuf.key === _fullKey(q)) { _renderFullPage(page); return; }
+  await _issueFullCorpus(q, page);
 }
 async function runRefine(startOpts) {
   if (!state.query) return;
@@ -311,14 +303,10 @@ async function runRefine(startOpts) {
   if (!marks.some((m) => m.mark === "up")) { showToast("Mark at least one 👍 to re-rank"); return; }
   state.mode = "refine";
   showToast(`Re-ranking with ${marks.filter((m) => m.mark === "up").length} 👍 / ${marks.filter((m) => m.mark === "down").length} 👎…`);
-  if (_fullCorpusOn()) {
-    await _issueFullVector("/ui/search", {
-      query: state.query, marks, k: FULL_BATCH, output: "hits",
-      negative_weight: 0.5, text_weight: 0.3, refine_from_marks: true,
-    }, (startOpts && startOpts.page) || 0);
-    return;
-  }
-  await _issue("/api/refine", { query: state.query, marks, negative_weight: 0.5, text_weight: 0.3, ...(startOpts || {}), ..._searchFilters() });
+  await _issueFullVector("/ui/search", {
+    query: state.query, marks, k: FULL_BATCH, output: "hits",
+    negative_weight: 0.5, text_weight: 0.3, refine_from_marks: true,
+  }, (startOpts && startOpts.page) || 0);
 }
 function _toNs(raw) {
   const v = (raw || "").trim().replace(/[_,\s]/g, ""); if (!v) return 0;
@@ -458,7 +446,6 @@ async function refreshCorpusPill() {
 // Search always covers the whole corpus. There is no toggle: offering the ~2M
 // resident subset as a choice meant users could silently search 6% of the data
 // and read the result as complete.
-function _fullCorpusOn() { return true; }
 function wireFullCorpusToggles() { refreshCorpusPill(); }
 // The corpus is read and decoded on first use (minutes, ~12GB), so the server
 // answers 503 until it is resident. Kick the load, show progress, and poll
@@ -532,7 +519,12 @@ async function _issueFullVector(endpoint, extra, page) {
 }
 
 // One request covers this many results; the pager slices them client-side.
-const FULL_BATCH = 200;
+// One fetch fills a buffer the pager then walks locally, so this IS how many
+// results are reachable: at 24 a page, 200 meant nine pages and no way to see a
+// 201st match. The server caps paging depth at _FULL_MAX_DEPTH (5,000), and the
+// cascade costs the same for a large k as a small one -- only the response and
+// the retained rows grow. Beyond this, an export is the honest answer.
+const FULL_BATCH = 2000;
 
 function _fullKey(q) {
   return [q, $("sf-dateFrom").value, $("sf-dateTo").value,
@@ -563,7 +555,9 @@ function _renderFullPage(page) {
     : " · no filters";
   $("resultCountText").textContent = buf.hits.length
     ? `searched ALL ${fmtInt(d.num_rows_searched)} clips in ${d.elapsed_ms} ms${filtLine}`
-      + ` · showing top ${fmtInt(buf.hits.length)}`
+      + (d.candidates > buf.hits.length
+          ? ` · showing top ${fmtInt(buf.hits.length)} of ${fmtInt(d.candidates)} matched — export for the rest`
+          : ` · showing all ${fmtInt(buf.hits.length)} matches`)
       // Exact scores carry no error bound; printing one next to them would be
       // stating an uncertainty that no longer applies.
       + (d.score_kind === "exact"
@@ -635,33 +629,6 @@ async function rescoreVisible() {
     d.score_kind = "exact";
   }
   _renderFullPage(state.page || 0);
-}
-async function _issue(endpoint, body) {
-  const seq = ++_issueSeq;
-  $("emptyState").style.display = "none";
-  $("resultsState").style.display = "block";
-  $("gridStatus").textContent = state.mode === "refine" ? "Re-ranking…" : "Searching…";
-  let data;
-  try {
-    data = await apiFetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
-      .then((r) => { if (!r.ok) return r.json().then((j) => { let m = j.detail; if (Array.isArray(m)) m = m.map((e) => `${(e.loc || []).join(".")}: ${e.msg}`).join("; "); throw new Error(m || ("HTTP " + r.status)); }); return r.json(); });
-  } catch (e) {
-    if (seq === _issueSeq) $("gridStatus").textContent = "Search failed: " + e.message;
-    return;
-  }
-  if (seq !== _issueSeq) return;
-  state.total = data.total; state.page = data.page; state.label = data.label || state.query;
-  state.hits = data.hits || []; state.scoreHi = data.score_hi || 0.4;
-  $("vectorChip").textContent = "vector: " + (state.mode === "refine" ? `text "${state.query}" + feedback` : (state.mode === "window" ? state.query : `text "${state.query}"`));
-  const filt = _funnelText(data);
-  $("resultCountText").textContent = data.total
-    ? `${fmtInt(data.total)} clips ranked in ${data.elapsed_ms} ms · similarity ${data.score_lo}–${data.score_hi}${filt}`
-    : "no clips match the current query + filters";
-  $("gridStatus").textContent = data.total ? "" : "Try widening the date range or segment set.";
-  renderQueryStrip(data);
-  renderGrid();
-  renderPager();
-  if (state.sweep && $("sweepPanel").classList.contains("open")) refreshSweep();
 }
 function _funnelText(data) {
   const f = data.funnel || {}; const bits = [];
