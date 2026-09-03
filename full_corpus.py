@@ -141,6 +141,68 @@ def decode_metadata_array(encoded: bytes) -> np.ndarray:
     return np.load(io.BytesIO(base64.b64decode(encoded)))
 
 
+# Readers accept anything at or above this: the version where fixed-width values
+# >= 128B first became full-zip, which is what makes take() cheap enough for the
+# eps band. A table rewritten at a lower version loads and then reads slowly, in
+# a way that looks like a network problem rather than a format one.
+MIN_DATA_STORAGE_VERSION = "2.1"
+
+# Columns without which the corpus cannot be served at all.
+REQUIRED_COLUMNS = ("run_uuid", "segment_id", "chunk_start_unix")
+
+
+class CorpusContractError(ValueError):
+    """The table does not satisfy what this build reads from it."""
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in str(version).split("."))
+
+
+def validate(dataset: "lance.LanceDataset", model: str = CORPUS_MODEL) -> str:
+    """Check a table against what this build reads, and return its model_id.
+
+    One function for both callers -- `load` and `tools/inspect_corpus_registry`
+    -- so the pre-flight gate and the runtime cannot disagree about what a
+    servable table is.
+
+    The encoder identity is checked, not just recorded: a corpus embedded by
+    another model yields a confident ranked list with nothing in it to signal
+    that every score is meaningless, so a mismatch has to fail loudly here.
+    """
+    names = set(dataset.schema.names)
+    for column in (embedding_column(model), vector_fp_column(model),
+                   vector_full_column(model), *REQUIRED_COLUMNS):
+        if column not in names:
+            raise CorpusContractError(
+                f"missing column {column!r} (have: {sorted(names)[:12]}...)"
+            )
+
+    storage = getattr(dataset, "data_storage_version", None)
+    if storage is not None:
+        try:
+            too_old = _version_tuple(storage) < _version_tuple(MIN_DATA_STORAGE_VERSION)
+        except ValueError:
+            too_old = False  # unparseable: not evidence of being old
+        if too_old:
+            raise CorpusContractError(
+                f"data_storage_version {storage} is below {MIN_DATA_STORAGE_VERSION}; "
+                "take() on the eps band would be too slow to serve"
+            )
+
+    _pca, _scales, model_id = _read_field_pca(dataset, model)
+    if not model_id:
+        raise CorpusContractError(
+            f"{vector_full_column(model)} field metadata has no {META_KEY_MODEL_ID.decode()}; "
+            "without the encoder identity a wrong-model corpus cannot be detected"
+        )
+    if model_id != model:
+        raise CorpusContractError(
+            f"table was embedded by {model_id!r}, this build scores {model!r}"
+        )
+    return model_id
+
+
 def _read_field_pca(
     dataset: "lance.LanceDataset", model: str
 ) -> "tuple[np.ndarray, np.ndarray, str]":
@@ -1169,12 +1231,8 @@ def load(
 
     so = oci_s3.lance_storage_options()
     ds = lance.dataset(table_uri, storage_options=so)
+    validate(ds, model)
     i8_col = embedding_column(model)
-    if i8_col not in ds.schema.names:
-        raise ValueError(
-            f"{table_uri} has no column {i8_col!r} "
-            f"(available: {sorted(n for n in ds.schema.names if 'embedding' in n)})"
-        )
     pca, scale, model_id = _read_field_pca(ds, model)
 
     # Decoded batch by batch into one preallocated array rather than via

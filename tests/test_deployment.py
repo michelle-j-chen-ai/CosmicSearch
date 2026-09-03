@@ -117,3 +117,86 @@ def test_unconfigured_dora_host_names_the_config_not_a_missing_module(monkeypatc
     with pytest.raises(dora_client.DoraUnavailable) as exc:
         dora_client._get_stub(None)
     assert "URSA_SDK_GRPC_HOSTNAME" in str(exc.value)
+
+
+def test_absent_credentials_raise_instead_of_reaching_the_metadata_server(monkeypatch):
+    """object_store treats an incomplete option set as "find credentials
+    yourself" and walks to the GCE metadata server, which answers 403 Missing
+    required header: Metadata-Flavor -- naming neither this app's config nor the
+    bucket. Fail on the config instead."""
+    import oci_s3
+
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    with pytest.raises(oci_s3.CredentialsMissing) as exc:
+        oci_s3.lance_storage_options()
+    assert "AWS_ACCESS_KEY_ID" in str(exc.value)
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "id")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    opts = oci_s3.lance_storage_options()
+    assert opts["aws_access_key_id"] == "id" and opts["aws_secret_access_key"] == "secret"
+
+
+def _fake_dataset(*, model="black_dwarf", model_id="black_dwarf", storage="2.2",
+                  drop=(), pca_dim=4):
+    """A stand-in with just the surface `full_corpus.validate` reads."""
+    import base64
+    import io
+
+    import numpy as np
+    import pyarrow as pa
+
+    import full_corpus
+
+    def enc(a):
+        buf = io.BytesIO()
+        np.save(buf, a)
+        return base64.b64encode(buf.getvalue())
+
+    meta = {
+        full_corpus.META_KEY_PCA_COMPONENTS: enc(np.zeros((pca_dim, 8), dtype=np.float32)),
+        full_corpus.META_KEY_QUANT_SCALES: enc(np.ones(pca_dim, dtype=np.float32)),
+    }
+    if model_id is not None:
+        meta[full_corpus.META_KEY_MODEL_ID] = model_id.encode()
+
+    fields = [
+        pa.field(full_corpus.embedding_column(model), pa.list_(pa.int8(), pca_dim)),
+        pa.field(full_corpus.vector_fp_column(model), pa.list_(pa.float32(), pca_dim)),
+        pa.field(full_corpus.vector_full_column(model), pa.list_(pa.float32(), 8), metadata=meta),
+        *(pa.field(c, pa.string()) for c in full_corpus.REQUIRED_COLUMNS),
+    ]
+    fields = [f for f in fields if f.name not in drop]
+
+    class _DS:
+        schema = pa.schema(fields)
+        data_storage_version = storage
+
+    return _DS()
+
+
+def test_validate_accepts_a_table_that_meets_the_contract():
+    import full_corpus
+
+    assert full_corpus.validate(_fake_dataset()) == "black_dwarf"
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({"model_id": None}, "nls.model_id"),
+        ({"model_id": "some_other_encoder"}, "some_other_encoder"),
+        ({"storage": "2.0"}, "data_storage_version"),
+        ({"drop": ("segment_id",)}, "segment_id"),
+        ({"drop": ("vector_fp_black_dwarf",)}, "vector_fp_black_dwarf"),
+    ],
+)
+def test_validate_rejects_a_table_the_app_cannot_serve(kwargs, expected):
+    """A wrong-model corpus returns a confident ranked list with nothing in it to
+    signal every score is meaningless, so the identity check has to be fatal."""
+    import full_corpus
+
+    with pytest.raises(full_corpus.CorpusContractError) as exc:
+        full_corpus.validate(_fake_dataset(**kwargs))
+    assert expected in str(exc.value)
