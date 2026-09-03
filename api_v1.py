@@ -109,6 +109,31 @@ def _corpus(project: str):
         raise
 
 
+def _storage_error(exc: BaseException) -> bool:
+    """Whether `exc` is the object store being unreachable rather than bad input.
+
+    Lance surfaces IO failures as OSError or ValueError carrying a LanceError
+    string, and ValueError is also how `select` reports bad arguments -- so the
+    two are told apart by content. Getting this wrong in the lenient direction
+    turns a 400 into a 503, which a caller retries; the strict direction hides
+    an outage behind "bad request".
+    """
+    if isinstance(exc, (OSError, oci_s3.CredentialsMissing)):
+        return True
+    return "LanceError" in str(exc) or "SignatureDoesNotMatch" in str(exc)
+
+
+def _unreachable(exc: BaseException) -> HTTPException:
+    LOGGER.warning("corpus unreachable: %s: %s", type(exc).__name__, str(exc)[:300])
+    return HTTPException(
+        503,
+        {"code": "corpus_unreachable",
+         "message": "the corpus could not be read from object storage",
+         "status": 503},
+        headers={"Retry-After": "60"},
+    )
+
+
 def _model_ready() -> None:
     if not _ws()._state.get("model_ready"):
         raise HTTPException(503, {"code": "loading", "message": "model is still loading",
@@ -220,7 +245,8 @@ def threshold_for(mode: str, value: float | None, vec: np.ndarray, corpus,
         raise _error(422, "bad_threshold_mode", "threshold_mode must be suggested or explicit")
     if mode == "explicit" and value is None:
         raise _error(422, "threshold_required", "threshold is required when threshold_mode is explicit")
-    scores, _err = corpus.score(vec)
+    with _ws().scoring_slot():
+        scores, _err = corpus.score(vec)
     if mode == "suggested":
         tau = float(search_engine.heuristic_threshold(search_engine.score_stats(scores)))
     else:
@@ -282,7 +308,7 @@ def list_tags(project: str | None = None, q: str | None = None, created_by: str 
 @router.get("/tags/{tag}")
 def read_tag(
     tag: str, request: Request, response: Response,
-    project: str = deployment.DEFAULT, version: int | None = None, output: str | None = None,
+    project: str | None = None, version: int | None = None, output: str | None = None,
     k: int | None = None, page: int = 1, page_size: int = 50,
     interval: bool = False, segment_mode: bool = True, confidence: bool = False,
     include_below_threshold: bool = False, passthrough_columns: bool = False,
@@ -294,7 +320,7 @@ def read_tag(
     cat = catalog.get()
     try:
         if output is None:
-            return cat.record(tag)
+            return _with_download_links(cat.record(tag))
         if output not in _OUTPUTS:
             raise _error(422, "bad_output", "output must be json, csv or parquet")
         v = cat.resolve_version(tag, version)
@@ -360,17 +386,29 @@ def _since_mask(corpus, since_version: int | None) -> np.ndarray | None:
 
 
 def _live_page(tag, v, ver, proj, th, k, page, page_size, filters, segment_mode, confidence) -> dict:
+    ws = _ws()
     if not 1 <= page_size <= LIMITS["page_size"]:
         raise _error(422, "bad_page_size", f"page_size must be 1-{LIMITS['page_size']}")
+    depth = page * page_size
+    # Each page re-runs the cascade, and its cost grows with depth, so paging is
+    # for the head of a ranked list. Reading deeper than this is an export.
+    if depth > ws._FULL_MAX_DEPTH:
+        raise _error(422, "page_too_deep",
+                     f"paging stops at {ws._FULL_MAX_DEPTH:,} results; use output=csv "
+                     "or output=parquet for bulk")
     corpus = _corpus(proj.name)
     vec = np.asarray(ver["vector"], dtype=np.float32)
     kw = _filter_kwargs(proj, corpus, filters)
-    depth = page * page_size
     try:
-        sel = corpus.select(vec, k=k, tau=None if k is not None else float(th["value"]),
-                            max_rows=depth if k is None else 0, refine="auto", **kw)
+        with ws.scoring_slot():
+            sel = corpus.select(vec, k=k, tau=None if k is not None else float(th["value"]),
+                                max_rows=depth if k is None else 0, refine="auto", **kw)
     except ValueError as exc:
+        if _storage_error(exc):
+            raise _unreachable(exc)
         raise _error(400, "bad_request", str(exc))
+    except OSError as exc:
+        raise _unreachable(exc)
     rows, scores = sel.rows, sel.scores
     if segment_mode:
         rows, scores = _first_per_segment(corpus, rows, scores)
@@ -442,6 +480,19 @@ def _materialize(tag, v, ver, proj, th, output, params, request, response) -> di
     return _export_response(tag, v, proj, export, response)
 
 
+def _with_download_links(record: dict) -> dict:
+    """Presign each ready export's artifact so the record is directly usable."""
+    ws = _ws()
+    ttl = ws._state["cfg"].presign_ttl_s
+    for e in record.get("exports", []):
+        if e.get("status") == "ready" and e.get("uri"):
+            try:
+                e["download_url"] = oci_s3.presign_get(e["uri"], ws._state["s3"], ttl)
+            except Exception as exc:  # noqa: BLE001 -- the uri is still there
+                LOGGER.debug("presign skipped for %s: %s", e["uri"], exc)
+    return record
+
+
 def _export_response(tag, v, proj, export: dict, response: Response) -> dict:
     ws = _ws()
     block = {k: val for k, val in export.items() if k not in ("tag", "version", "project", "params")}
@@ -469,7 +520,7 @@ def _run_export(eid: str, tag: str, v: int, ver: dict, proj: deployment.Project,
     try:
         corpus = ws._require_full_corpus(proj.name)
         vec = np.asarray(ver["vector"], dtype=np.float32)
-        with ws._FULL_EXPORT_LOCK:
+        with ws._FULL_EXPORT_LOCK, ws.scoring_slot():
             result = _build_export(eid, tag, v, proj, corpus, vec, th, output, params)
         cat.export_finish(eid, **result)
         LOGGER.info("export %s ready: %s (%s rows)", eid, result.get("uri"), result.get("num_rows"))
@@ -583,8 +634,6 @@ def _write_csv(text: str, base: str) -> str:
 
 def _passthrough(table, source_uri: str):
     """Join the source dataset's columns onto the export by segment_id."""
-    import pyarrow as pa
-
     src = _ws()._read_filter_table(source_uri)
     if "segment_id" not in src.column_names:
         return table
@@ -649,10 +698,16 @@ def _refine(tag: str, ver: dict, proj: deployment.Project, req: UpdateTag, who: 
         raise _error(422, "bad_mark", "mark must be up or down")
     if not pos:
         raise _error(422, "no_positive", "mark at least one clip up to refine")
-    mat = corpus.vectors_for(pos + neg)
+    try:
+        mat = corpus.vectors_for(pos + neg)
+    except (OSError, ValueError) as exc:
+        if _storage_error(exc):
+            raise _unreachable(exc)
+        raise
     prev = np.asarray(ver["vector"], dtype=np.float32)
     vec = ws._rocchio(mat[: len(pos)], mat[len(pos):], prev, req.negative_weight, req.anchor_weight)
-    scores, _err = corpus.score(vec)
+    with ws.scoring_slot():
+        scores, _err = corpus.score(vec)
     pos_s, neg_s = scores[np.asarray(pos)], scores[np.asarray(neg)] if neg else np.array([])
     if neg:
         fit = search_engine.fit_threshold(pos_s, neg_s, objective=req.objective)
@@ -722,6 +777,7 @@ def health(response: Response) -> dict:
             slot = ws._slot(name)
             corpus, status, error, started = slot["corpus"], slot["status"], slot["error"], slot["started"]
         info: dict[str, Any] = {"ready": corpus is not None, "status": status,
+                                "corpus_table_uri": spec.corpus_table_uri,
                                 "clip_prefix": spec.mp4_prefix, "input_prefixes": input_prefixes(spec)}
         if corpus is not None:
             any_ready = True

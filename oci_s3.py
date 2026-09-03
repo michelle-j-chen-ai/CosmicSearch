@@ -75,20 +75,41 @@ def s3_client(fast_fail: bool = False) -> object:
     )
 
 
+class CredentialsMissing(RuntimeError):
+    """AWS_* credentials for the OCI endpoint are not configured."""
+
+
 def lance_storage_options() -> dict[str, str]:
     """Storage options for lancedb.connect() against OCI S3-compat.
 
     lance uses the Rust object_store crate, whose keys differ from boto3's.
+
+    Raises if the credentials are absent rather than omitting them. object_store
+    treats an incomplete option set as "discover credentials yourself" and walks
+    its own provider chain to the GCE metadata server, which answers
+    ``403 Missing required header: Metadata-Flavor`` -- an error that names
+    neither this app's configuration nor the bucket it failed to read.
     """
-    opts: dict[str, str] = {}
     access_key = os.environ.get("AWS_ACCESS_KEY_ID")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if not access_key or not secret_key:
+        absent = [
+            name
+            for name, val in (
+                ("AWS_ACCESS_KEY_ID", access_key),
+                ("AWS_SECRET_ACCESS_KEY", secret_key),
+            )
+            if not val
+        ]
+        raise CredentialsMissing(
+            f"{' and '.join(absent)} not set; the OCI corpus and model cannot be read"
+        )
+    opts: dict[str, str] = {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
     endpoint = _endpoint_url()
     region = _region()
-    if access_key:
-        opts["aws_access_key_id"] = access_key
-    if secret_key:
-        opts["aws_secret_access_key"] = secret_key
     if endpoint:
         opts["aws_endpoint"] = endpoint
         opts["aws_virtual_hosted_style_request"] = "false"

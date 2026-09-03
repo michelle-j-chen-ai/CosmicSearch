@@ -36,12 +36,6 @@
       <input id="embeddings-uri" type="text" class="plain" readonly title="The corpus is fixed and cannot be switched" />
       <span id="corpus-note" class="note"></span>
     </div>
-    <div class="settings-row">
-      <span class="corpus-k">model</span>
-      <input id="model-uri" type="text" class="plain" placeholder="s3://…/models/<ckpt>/   (empty = base Cosmos-Embed1)" />
-      <button id="load-model" type="button" class="ghost">Load</button>
-      <span id="model-note" class="note"></span>
-    </div>
   </div>
 
   <!-- ============ SEARCH PAGE ============ -->
@@ -214,14 +208,13 @@
   <!-- ============ SAVED SEARCHES PAGE ============ -->
   <div class="page" id="page-saved">
     <div class="filterbar">
-      <input type="text" id="savedFilter" placeholder="Filter by query or tag…">
-      <select class="rt-select" id="modelFilter" title="Which model's saved searches to show (defaults to the loaded model)"></select>
+      <input type="text" id="savedFilter" placeholder="Filter by tag or description…">
       <button class="icon-btn-sm" id="newSearchBtn">+ New search</button>
       <button class="icon-btn-sm" id="savedReload">↻ Reload</button>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th style="width:30px"></th><th>Tag</th><th>Query</th><th>Corpus · model</th><th>Date range</th><th>Threshold</th><th></th></tr></thead>
+        <thead><tr><th style="width:30px"></th><th>Tag</th><th>Description</th><th>Version</th><th>Updated</th><th>Threshold</th><th></th></tr></thead>
         <tbody id="tbody"></tbody>
       </table>
     </div>
@@ -233,7 +226,6 @@
         <div class="field"><label>Date from</label><input type="date" id="ex-dateFrom"><div class="hint">blank = full corpus</div></div>
         <div class="field"><label>Date to</label><input type="date" id="ex-dateTo"><div class="hint">blank = full corpus</div></div>
         <div class="field"><label>Vehicle ID</label><input id="ex-vehicle" placeholder="e.g. truck-808, truck-810"></div>
-        <div class="field"><label>Drive ID (run_uuid)</label><input id="ex-drive" placeholder="e.g. 019eb27f-…"></div>
         <div class="field"><label>Data Explorer segment set (superset)</label>
           <div class="combo" id="ex-dxset-combo">
             <input id="ex-dxset" autocomplete="off" placeholder="type a keyword to search sets…">
@@ -282,8 +274,8 @@
         <label class="switch"><input type="checkbox" id="segsetInput" checked><span class="slider-toggle"></span></label>
       </div>
       <div class="toggle-row">
-        <div><div class="toggle-label">Exact scores</div><div class="toggle-sub">Re-scores the exported rows against the original 768-d embeddings instead of the quantized screen. Adds an S3 read, ~3s per 10,000 rows; refused if projected past 5 minutes.</div></div>
-        <label class="switch"><input type="checkbox" id="exactInput"><span class="slider-toggle"></span></label>
+        <div><div class="toggle-label">Format</div><div class="toggle-sub">Every export is scored against the original 768-d embeddings and written to S3; you get a download link when it is ready.</div></div>
+        <select class="rt-select" id="exportFormat"><option value="csv" selected>csv</option><option value="parquet">parquet</option></select>
       </div>
 
       <div class="export-action">
@@ -300,22 +292,12 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Created</th><th>Export</th><th>Tags (@threshold)</th><th>Filters</th><th>Status</th><th>Results</th><th>Output (parquet / segments.lance)</th><th>Data Explorer (segment set)</th></tr></thead>
+          <thead><tr><th>Created</th><th>Tag</th><th>What</th><th>Status</th><th>Rows</th><th>Output</th><th>Data Explorer (segment set)</th></tr></thead>
           <tbody id="scansBody"></tbody>
         </table>
       </div>
     </div>
   </div>
-</div>
-
-<!-- export preview (Recent exports) -->
-<div class="preview-modal" id="previewModal">
-  <div class="preview-head">
-    <div><h3 id="previewTitle">Export preview</h3><p id="previewUri"></p></div>
-    <button class="close-btn" id="previewClose">×</button>
-  </div>
-  <div class="preview-body" id="previewBody"></div>
-  <div class="preview-note" id="previewNote"></div>
 </div>
 
 <!-- save drawer (search page only) -->
@@ -332,7 +314,11 @@
     </div>
     <div class="dsection">
       <h5>Tag</h5>
-      <div class="field2"><input id="tagInput" placeholder="e.g. left-turn-v2"></div>
+      <div class="field2"><input id="tagInput" placeholder="e.g. unprotected_left  (letters, digits, underscores)"></div>
+    </div>
+    <div class="dsection">
+      <h5>Description</h5>
+      <div class="field2"><input id="tagDesc" placeholder="optional — what this tag is for"></div>
     </div>
     <button class="btn-export instant" style="width:100%;" id="finalSaveBtn">💾 Save</button>
     <div id="saveNote" class="note"></div>

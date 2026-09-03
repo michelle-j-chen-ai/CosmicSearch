@@ -2,7 +2,7 @@
 
 The threshold-retrieval workload needs ALL rows with true fp32 cosine score
 >= tau, not an approximate top-k. Screening happens on the resident int8 PCA
-column (`gpu_corpus._score_i8`'s input layout), which is a lossy dequantized
+column (`full_corpus._score_kernel`'s input layout), a lossy dequantized
 approximation of the true fp32 score. This module computes a hard error bound
 `eps` on that approximation and uses it to make `tau - eps` a *provable*
 superset threshold: any row with true score >= tau is mathematically
@@ -33,9 +33,9 @@ Scope of the guarantee: the math above bounds |q . e| where `e` is the
 per-row int8 quantization error against WHATEVER fp32 value the caller
 re-ranks against. The guarantee is against the true pre-quantization score
 only if that fp32 value genuinely is the pre-quantization projection.
-`lance_writer.py`'s current artifact contract does not always have one --
-see its module docstring -- in which case its `vector_fp` falls back to
-`dequant(int8)`, and re-ranking against it only re-derives the int8 screening
+The embedding pipeline does not always write one, in which case `vector_fp`
+falls back to `dequant(int8)` (see `full_corpus.probe_vector_fp`), and
+re-ranking against it only re-derives the int8 screening
 score in higher precision; the zero-false-negative property this module
 proves still holds (against `vector_fp`), but it is a materially weaker
 guarantee than "against the true fp32-256 embedding" in that configuration.
@@ -75,12 +75,12 @@ def eps_hoelder(query: np.ndarray, scale: np.ndarray) -> float:
 def score_i8(corpus_i8: np.ndarray, query_pca: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """Reference (pure numpy) int8 x fp32 dot product.
 
-    Mirrors `gpu_corpus._score_i8` / `GpuCorpus.gpu_score`'s dequant-fold
+    Mirrors `full_corpus._score_kernel`'s dequant-fold
     convention: the per-dim dequant scale is folded into the query
     (`w = query_pca * scale / 127`) so the corpus stays int8, then each row's
     int8 . w is the dequantized-corpus-vector . query score. Provided so
     tests can produce int8-space scores without importing the numba-jitted
-    kernel in `gpu_corpus.py`.
+    kernel in `full_corpus.py`.
     """
     corpus_i8 = np.asarray(corpus_i8, dtype=np.float64)
     query_pca = np.asarray(query_pca, dtype=np.float64)

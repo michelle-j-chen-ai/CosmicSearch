@@ -185,3 +185,70 @@ def test_first_per_segment_keeps_the_best_clip_of_each_segment():
     c._meta["segment_id"] = pa.array(["s1", "s1", None, "s2"], pa.large_string())
     rows, scores = api_v1._first_per_segment(c, np.array([1, 0, 2, 3]), np.array([0.9, 0.8, 0.7, 0.6]))
     assert rows.tolist() == [1, 2, 3] and scores.tolist() == [0.9, 0.7, 0.6]
+
+
+def test_the_public_surface_is_exactly_the_versioned_api():
+    """Everything under /api is v1; the browser's extras live under /ui."""
+    direct = [getattr(r, "path", "") for r in ws.app.routes]
+    assert not [p for p in direct if p and p.startswith("/api/")]
+    api = sorted({r.path for r in api_v1.router.routes})
+    assert api == ["/api/v1/health", "/api/v1/tags", "/api/v1/tags/{tag}", "/api/v1/video"]
+    ui = sorted({p for p in direct if p and p.startswith("/ui/")})
+    assert ui == ["/ui/calibrate", "/ui/search", "/ui/segment_sets", "/ui/video"]
+
+
+def test_legacy_routes_are_gone(client):
+    c, _ = client
+    for path in ("/api/retrieve", "/api/calibrate", "/api/save_vector", "/api/tags_catalog",
+                 "/api/scans", "/api/export_config", "/api/full_corpus_status", "/api/platform"):
+        assert c.post(path).status_code in (404, 405) and c.get(path).status_code in (404, 405), path
+
+
+def test_a_frontier_only_service_serves_unqualified_requests_from_frontier(client, monkeypatch):
+    """Each fleet is its own Cloud Run service off this image, with its own
+    corpus and its own Postgres schema. On the frontier service a call that
+    omits `project` must reach frontier: the old fixed default pointed at a
+    corpus that service never loads, so every such call would 503."""
+    c, _ = client
+    monkeypatch.setenv("NLS_PROJECTS", "frontier")
+    body = c.get("/api/v1/health").json()
+    assert set(body["projects"]) == {"frontier"}
+    r = c.get("/api/v1/tags/nothing_here")  # unknown tag, but resolved against frontier
+    assert r.status_code == 404 and r.json()["detail"]["code"] == "unknown_tag"
+    assert ws.deployment.default() == "frontier"
+    assert ws._project_of(object()) == "frontier"
+
+
+def test_paging_stops_where_the_browser_stops(client):
+    """Each page re-runs the cascade, so depth is cost. The /ui path capped this
+    at _FULL_MAX_DEPTH; the API did not, and page=1000 asked for a 500k-deep
+    selection."""
+    c, cat = client
+    cat.create(tag="deep", project="neuron", source={"type": "text", "text": "x"},
+               vector=[0.1] * 8, model="black_dwarf",
+               threshold={"value": 0.3, "mode": "explicit"})
+    r = c.get("/api/v1/tags/deep", params={"output": "json", "page": 1000, "page_size": 500})
+    assert r.status_code == 422 and r.json()["detail"]["code"] == "page_too_deep"
+
+
+def test_storage_failure_is_a_503_with_a_code_not_a_bare_500(client, monkeypatch):
+    """A revoked object-store key reached the browser as a 500 whose plain-text
+    body broke response.json() -- the symptom read as a frontend bug."""
+    c, cat = client
+    cat.create(tag="unreachable", project="neuron", source={"type": "text", "text": "x"},
+               vector=[0.1] * 8, model="black_dwarf",
+               threshold={"value": 0.3, "mode": "explicit"})
+
+    class _Corpus:
+        dataset_version = 1
+        num_rows = 8
+
+        def select(self, *a, **kw):
+            raise OSError("Wrapped error: LanceError(IO): 403 Forbidden SignatureDoesNotMatch")
+
+    monkeypatch.setattr(ws, "_require_full_corpus", lambda project=None: _Corpus())
+    monkeypatch.setattr(ws, "_full_filters", lambda req: {})
+    r = c.get("/api/v1/tags/unreachable", params={"output": "json"})
+    assert r.status_code == 503
+    assert r.json()["detail"]["code"] == "corpus_unreachable"
+    assert r.headers["retry-after"]

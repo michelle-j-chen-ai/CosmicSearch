@@ -72,7 +72,7 @@ def test_bad_config_disables_the_schedule_rather_than_crashing(monkeypatch):
 
 def test_unchanged_version_skips_the_reload(monkeypatch):
     resident = _Corpus(version=7)
-    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.DEFAULT: {"status": "ready", "corpus": resident,
+    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.default(): {"status": "ready", "corpus": resident,
                                       "error": "", "started": 0.0}})
     monkeypatch.setitem(ws._REFRESH, "skipped", 0)
     _no_reload(monkeypatch)
@@ -84,7 +84,7 @@ def test_unchanged_version_skips_the_reload(monkeypatch):
 def test_moved_version_triggers_the_reload(monkeypatch):
     resident = _Corpus(version=7)
     full = {"status": "ready", "corpus": resident, "error": "", "started": 0.0}
-    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.DEFAULT: full})
+    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.default(): full})
     _table_at(monkeypatch, 8)
 
     def _reload(project=None):
@@ -98,7 +98,7 @@ def test_unknown_version_reloads_rather_than_assuming_sameness(monkeypatch):
     """A reader that reports no version is not evidence the table stood still."""
     full = {"status": "ready", "corpus": _Corpus(version=None), "error": "",
             "started": 0.0}
-    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.DEFAULT: full})
+    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.default(): full})
     _table_at(monkeypatch, None)
     called = []
     monkeypatch.setattr(ws, "_full_refresh_worker",
@@ -110,7 +110,7 @@ def test_unknown_version_reloads_rather_than_assuming_sameness(monkeypatch):
 
 def test_no_resident_corpus_is_left_alone(monkeypatch):
     """Nothing is stale, and loading here would surprise an idle instance."""
-    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.DEFAULT: {"status": "idle", "corpus": None,
+    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.default(): {"status": "idle", "corpus": None,
                                       "error": "", "started": 0.0}})
     _no_reload(monkeypatch)
     assert ws._corpus_refresh_tick() == "skipped: no corpus resident"
@@ -118,7 +118,7 @@ def test_no_resident_corpus_is_left_alone(monkeypatch):
 
 def test_a_load_in_flight_is_not_restarted(monkeypatch):
     """Dropping a half-built corpus to start over is strictly worse than waiting."""
-    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.DEFAULT: {"status": "loading", "corpus": None,
+    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.default(): {"status": "loading", "corpus": None,
                                       "error": "", "started": 0.0}})
     _no_reload(monkeypatch)
     assert "already in flight" in ws._corpus_refresh_tick()
@@ -127,7 +127,7 @@ def test_a_load_in_flight_is_not_restarted(monkeypatch):
 def test_a_failed_reload_is_reported_not_counted(monkeypatch):
     full = {"status": "error", "corpus": _Corpus(version=7), "error": "boom",
             "started": 0.0}
-    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.DEFAULT: full})
+    monkeypatch.setattr(ws, "_CORPORA", {ws.deployment.default(): full})
     _table_at(monkeypatch, 8)
     monkeypatch.setattr(ws, "_full_refresh_worker",
                         lambda project=None: full.update(corpus=None))

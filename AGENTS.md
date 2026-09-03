@@ -7,7 +7,8 @@ Lance embedding tables; does not train models or generate embeddings.
 
 ## Architecture
 
-Single CPU Cloud Run service. Model (~5GB fp32) and the embedding matrix are
+One CPU Cloud Run service per fleet, both off this image (`project.toml`,
+`project-trucking.toml`), each with its own corpus and Postgres schema. Model (~5GB fp32) and the embedding matrix are
 loaded once and held resident; queries are ~100ms (encode ~40ms + numpy brute-
 force matmul ~58ms + presign). No GPU, no ANN index — flat matrix-vector product
 is exact and fast enough at this corpus size.
@@ -16,17 +17,18 @@ Core modules:
 - `config.py` — env-driven configuration.
 - `oci_s3.py` — OCI S3-compat client, Lance storage options, model download, presigning.
 - `local_cache.py` — disk cache for downloaded Lance corpora and model snapshots.
-- `search_engine.py` — model load, query encode, corpus load, ranking, centroid refinement.
-- `gpu_corpus.py` — int8/PCA corpus build and memory-reduced loading.
-- `app.py` — Streamlit UI (text search + relevance-feedback refinement).
-- `web_server.py` — FastAPI app served in production (`entrypoint.sh` → uvicorn).
-- `db.py`, `dora_client.py`, `interval_core.py` — metadata, DORA dataset access, interval logic.
+- `deployment.py` — the project registry: which corpus table, clip prefix and Data Explorer host each project (`neuron`, `frontier`) uses, and which of them this instance serves (`NLS_PROJECTS`; the first is the default).
+- `search_engine.py` — model load, text/frame encoding, threshold fitting.
+- `full_corpus.py` — the resident int8/PCA corpus and the search cascade.
+- `catalog.py` — tags, versions, per-project thresholds, marks, exports (SQLAlchemy Core).
+- `api_v1.py` — the public API: seven endpoints under `/api/v1`.
+- `web_server.py` — FastAPI app served in production (`entrypoint.sh` → uvicorn): corpus lifecycle, the browser's `/ui` routes, pages.
+- `db.py`, `dora_client.py`, `interval_core.py` — Cloud SQL engine and legacy tables, DORA dataset access, interval logic.
 - `smoke_test.py` — offline core checks (no model, no network).
 
 ## Dev workflow
 
-- Run locally (Streamlit): `python -m streamlit run app.py`
-- Serve prod-style (FastAPI): `uvicorn web_server:app` (see `entrypoint.sh`)
+- Run locally: `uvicorn web_server:app` (see `entrypoint.sh`)
 - Offline core test (no model/network): `python smoke_test.py`
 - Deploy: `apps-platform app deploy` (builds `Dockerfile`, deploys to Cloud Run)
 

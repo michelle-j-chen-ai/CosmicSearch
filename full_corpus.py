@@ -2,14 +2,14 @@
 
 The app's resident `search_engine.Corpus` holds fp32 768-d vectors, which caps
 it at a few million clips. This module serves the FULL corpus by holding the
-int8/PCA-256 screen resident instead: 34.4M x 256 = 8.8GB, swept by
-`gpu_corpus`'s numba kernel in ~180ms on 8 cores, versus ~105GB if the same
-rows were held as fp32.
+int8/PCA-256 screen resident instead: 34.4M x 256 = 8.8GB, swept by the
+numba kernel below in ~180ms on 8 cores, versus ~105GB if the same rows were
+held as fp32.
 
 Scores are the int8 screening scores, whose error against the exact PCA score
 is bounded by `eps_bound.eps_cauchy_schwarz` scaled by the projected query's
 norm (`Hit.score_error_bound`). Ranking off the screen needs no S3 at all.
-Exact scores are a separate, slower path (`threshold_search`), which fetches
+Exact scores are a separate, slower path (`exact_scores`), which fetches
 `vector_fp` per row and is worth it for curation, not for browsing.
 
 Why the corpus URI is a module constant and not a caller argument: pointing a
@@ -21,17 +21,18 @@ it wrong.
 The consolidated table stores one column family per encoder
 (`embedding_i8_<model>`), so it can carry several models side by side; the
 active one is `CORPUS_MODEL`. Its PCA basis and quantization scales live on the
-FIELD metadata of that family's float column, alongside the encoder identity, so
-they are read from the corpus itself. A sibling table carries a copy, but two
-copies can drift: projecting a query through a basis that no longer matches the
-vectors it is scored against still returns a confident ranked list, just a
-meaningless one, and nothing errors.
+FIELD metadata of that family's float column, alongside the encoder identity,
+and that is the only copy: projecting a query through a basis that no longer
+matches the vectors it is scored against still returns a confident ranked list,
+just a meaningless one, and nothing errors. So the basis travels with the
+vectors, and `deployment.py` is the only thing that says which table to read.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 
 import lance
@@ -39,7 +40,6 @@ import numpy as np
 
 import config
 import eps_bound
-import lance_writer
 import oci_s3
 
 LOGGER = logging.getLogger(__name__)
@@ -66,6 +66,32 @@ def media_uri(prefix: str, dt, run_uuid, chunk_start_unix) -> str:
     return prefix + _MEDIA_URI_SUFFIX.format(
         dt=dt, run_uuid=run_uuid, chunk_start_unix=int(chunk_start_unix)
     )
+
+# The int8 sweep. One fused pass dequantizes and accumulates fp32 with no
+# intermediate array, so the 12.2GB corpus is read once per query. numba is
+# imported lazily and the JIT compiled once, on first call -- `warm()` pays that
+# compile during the corpus load rather than on a user's first search.
+_SCORE_KERNEL = None
+
+
+def _score_kernel():
+    global _SCORE_KERNEL
+    if _SCORE_KERNEL is None:
+        from numba import njit, prange
+
+        @njit(parallel=True, fastmath=True, cache=True)
+        def _score_i8(ci, w, out):  # ci:(N,D) int8, w:(D,) fp32, out:(N,) fp32
+            n, d = ci.shape
+            for i in prange(n):
+                acc = np.float32(0.0)
+                row = ci[i]
+                for j in range(d):
+                    acc += np.float32(row[j]) * w[j]
+                out[i] = acc
+
+        _SCORE_KERNEL = _score_i8
+    return _SCORE_KERNEL
+
 
 # Rows per take() when fetching exact vectors for an export. take() has a ~1.65s
 # floor per call regardless of size, so bigger is cheaper -- but each chunk holds
@@ -98,23 +124,110 @@ def vector_fp_column(model: str = CORPUS_MODEL) -> str:
     return f"vector_fp_{model}"
 
 
+# The on-table metadata contract. The embedding pipeline writes the basis and
+# the quantization scales into the float column's FIELD metadata, base64'd npy;
+# these keys and the decoder are all a reader needs. The corpus URI comes from
+# `deployment.py` and the basis comes from the table itself, so there is no
+# third place for either to be wrong.
+META_KEY_PCA_COMPONENTS = b"nls.pca_components"
+META_KEY_QUANT_SCALES = b"nls.quant_scales"
+META_KEY_MODEL_ID = b"nls.model_id"
+META_KEY_MODEL_ARTIFACT_URI = b"nls.model_artifact_uri"
+
+
+def decode_metadata_array(encoded: bytes) -> np.ndarray:
+    """Recover an array from field metadata (base64-wrapped .npy)."""
+    import base64
+    import io
+
+    return np.load(io.BytesIO(base64.b64decode(encoded)))
+
+
+# Columns without which the corpus cannot be served at all.
+REQUIRED_COLUMNS = ("run_uuid", "segment_id", "chunk_start_unix")
+
+# `nls.model_id` records the encoder family, and the column suffix spells the
+# same name with underscores ("black-dwarf" on the field, `vector_black_dwarf`
+# as the column), so the two are compared with separators normalized.
+def _same_model(a: str, b: str) -> bool:
+    return a.strip().lower().replace("-", "_") == b.strip().lower().replace("-", "_")
+
+
+def _checkpoint(uri: str) -> str:
+    """Last path segment of a model artifact URI, which is the checkpoint name.
+    Each fleet keeps its own copy of the same checkpoint under its own bucket,
+    so the paths differ where the checkpoint does not."""
+    return uri.strip().rstrip("/").rsplit("/", 1)[-1]
+
+
+class CorpusContractError(ValueError):
+    """The table does not satisfy what this build reads from it."""
+
+
+def validate(dataset: "lance.LanceDataset", model: str = CORPUS_MODEL) -> str:
+    """Check a table against what this build reads, and return its model_id.
+
+    One function for both callers -- `load` and `tools/inspect_corpus_registry`
+    -- so the pre-flight gate and the runtime cannot disagree about what a
+    servable table is.
+
+    The encoder identity is checked, not just recorded: a corpus embedded by
+    another model yields a confident ranked list with nothing in it to signal
+    that every score is meaningless, so a mismatch has to fail loudly here.
+    """
+    names = set(dataset.schema.names)
+    for column in (embedding_column(model), vector_fp_column(model),
+                   vector_full_column(model), *REQUIRED_COLUMNS):
+        if column not in names:
+            raise CorpusContractError(
+                f"missing column {column!r} (have: {sorted(names)[:12]}...)"
+            )
+
+    _pca, _scales, model_id = _read_field_pca(dataset, model)
+    if not model_id:
+        raise CorpusContractError(
+            f"{vector_full_column(model)} field metadata has no {META_KEY_MODEL_ID.decode()}; "
+            "without the encoder identity a wrong-model corpus cannot be detected"
+        )
+    if not _same_model(model_id, model):
+        raise CorpusContractError(
+            f"table was embedded by {model_id!r}, this build scores {model!r}"
+        )
+
+    # The checkpoint is the sharper question -- every checkpoint of this family
+    # reports the same model_id, so only the artifact URI distinguishes them --
+    # but each fleet holds its own copy of the same checkpoint under its own
+    # bucket, and a copy could legitimately be renamed. Logged, not fatal: a
+    # false rejection here takes a fleet offline, and the earlier version of
+    # this check did exactly that to both of them.
+    meta = dataset.schema.field(vector_full_column(model)).metadata or {}
+    table_artifact = (meta.get(META_KEY_MODEL_ARTIFACT_URI) or b"").decode()
+    want = os.environ.get("NLS_MODEL_ARTIFACT_URI", "").strip()
+    if table_artifact and want and _checkpoint(table_artifact) != _checkpoint(want):
+        LOGGER.warning(
+            "corpus was embedded by checkpoint %s but this instance encodes with %s; "
+            "scores are only comparable if these are the same weights",
+            _checkpoint(table_artifact), _checkpoint(want),
+        )
+    return model_id
+
+
 def _read_field_pca(
     dataset: "lance.LanceDataset", model: str
 ) -> "tuple[np.ndarray, np.ndarray, str]":
     """(pca, scales, model_id) from the float column's FIELD metadata.
 
-    `lance_writer.read_pca_metadata` looks at SCHEMA-level metadata, where this
-    table carries only `embedding_dim`/`pca_dim`. The basis itself sits on the
-    field, which is the copy that travels with the vectors it describes, and it
-    brings the encoder identity with it -- so a corpus built by a different model
-    can be rejected rather than silently scored against.
+    The basis sits on the field rather than on the schema: that is the copy
+    which travels with the vectors it describes, and it carries the encoder
+    identity too -- so a corpus built by a different model can be rejected
+    rather than silently scored against.
     """
     column = vector_full_column(model)
     field = dataset.schema.field(column)
     meta = field.metadata or {}
     missing = [
         k.decode()
-        for k in (lance_writer.META_KEY_PCA_COMPONENTS, lance_writer.META_KEY_QUANT_SCALES)
+        for k in (META_KEY_PCA_COMPONENTS, META_KEY_QUANT_SCALES)
         if k not in meta
     ]
     if missing:
@@ -122,9 +235,9 @@ def _read_field_pca(
             f"{column} field metadata is missing {missing}; the basis must travel "
             "with the vectors it describes"
         )
-    pca = lance_writer.decode_array(meta[lance_writer.META_KEY_PCA_COMPONENTS])
-    scale = lance_writer.decode_array(meta[lance_writer.META_KEY_QUANT_SCALES])
-    model_id = (meta.get(b"nls.model_id") or b"").decode()
+    pca = decode_metadata_array(meta[META_KEY_PCA_COMPONENTS])
+    scale = decode_metadata_array(meta[META_KEY_QUANT_SCALES])
+    model_id = (meta.get(META_KEY_MODEL_ID) or b"").decode()
     return pca, scale, model_id
 
 
@@ -194,7 +307,7 @@ class Selection:
 def _dictionary_codes(column: object) -> tuple[np.ndarray, list]:
     """Arrow string column -> (int32 codes, uniques). Code -1 is NULL.
 
-    Mirrors `threshold_search._dictionary_codes`: filters then compare int32
+    Filters by dictionary code rather than string: compare int32
     codes (SIMD) instead of Python strings, and the uniques list is tiny next
     to the per-row column it replaces.
     """
@@ -314,11 +427,9 @@ class FullCorpus:
 
     def score(self, query: np.ndarray) -> tuple[np.ndarray, float]:
         """Screening score for every row. One sweep of the resident matrix."""
-        import gpu_corpus
-
         w, err = self._weights(query)
         out = np.empty(self.num_rows, dtype=np.float32)
-        gpu_corpus._cpu_score_kernel()(self.corpus_i8, w, out)
+        _score_kernel()(self.corpus_i8, w, out)
         return out, err
 
     def warm(self) -> None:
@@ -332,14 +443,10 @@ class FullCorpus:
         rather than raised: a warm-up that fails only restores the old behaviour.
         """
         try:
-            import gpu_corpus
-
             t0 = time.perf_counter()
             probe = np.ascontiguousarray(self.corpus_i8[: min(1024, self.num_rows)])
             out = np.empty(probe.shape[0], dtype=np.float32)
-            gpu_corpus._cpu_score_kernel()(
-                probe, np.zeros(probe.shape[1], dtype=np.float32), out
-            )
+            _score_kernel()(probe, np.zeros(probe.shape[1], dtype=np.float32), out)
             LOGGER.info("scoring kernel warm in %.1fs", time.perf_counter() - t0)
         except Exception as exc:  # noqa: BLE001 -- warm-up is an optimization
             LOGGER.warning("scoring kernel warm-up failed (%s); the first search "
@@ -376,7 +483,7 @@ class FullCorpus:
     ) -> np.ndarray | None:
         """AND of the given filters; None when nothing was asked for.
 
-        Unlike `threshold_search._filter_mask`, `vehicles` is a SET: the app's
+        `vehicles` is a SET, not a single value: the app's
         vehicle box accepts a list, and a single-value filter silently dropped
         every vehicle but one.
 
@@ -779,8 +886,8 @@ class FullCorpus:
     def probe_vector_fp(self, sample: int = 64) -> dict:
         """Is `vector_fp` the true pre-quantization projection, or a fallback?
 
-        `lance_writer` populates that column from a real fp32 PCA projection when
-        one was supplied at write time, and otherwise from the int8 dequantized
+        The embedding pipeline populates that column from a real fp32 PCA
+        projection when it has one, and otherwise from the int8 dequantized
         back to fp32. The two are indistinguishable by schema -- no flag records
         which -- but not by content: the fallback equals `i8 * scale / 127`
         exactly, because that is how it was produced.
@@ -1133,12 +1240,8 @@ def load(
 
     so = oci_s3.lance_storage_options()
     ds = lance.dataset(table_uri, storage_options=so)
+    validate(ds, model)
     i8_col = embedding_column(model)
-    if i8_col not in ds.schema.names:
-        raise ValueError(
-            f"{table_uri} has no column {i8_col!r} "
-            f"(available: {sorted(n for n in ds.schema.names if 'embedding' in n)})"
-        )
     pca, scale, model_id = _read_field_pca(ds, model)
 
     # Decoded batch by batch into one preallocated array rather than via

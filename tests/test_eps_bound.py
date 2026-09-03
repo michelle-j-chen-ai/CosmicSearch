@@ -17,7 +17,7 @@ def _case(rng: np.random.Generator, n: int, d: int = _D):
     """A (query, corpus_fp32, corpus_i8, scale) tuple quantized the production way.
 
     `scale_d = max|v[:, d]|` and `int8 = round(v * 127 / scale_d)`, matching
-    gpu_corpus's `dequant = int8 * scale / 127` contract -- each column is
+    the `dequant = int8 * scale / 127` contract -- each column is
     rounded onto a `scale_d / 127`-wide grid, the step eps_bound assumes.
     """
     q = rng.standard_normal(d)
