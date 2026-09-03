@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import pathlib
+import re
 
 import numpy as np
 import pytest
@@ -59,3 +60,38 @@ def test_the_int8_kernel_scores_a_row_as_a_plain_dot_product():
     out = np.empty(corpus_i8.shape[0], dtype=np.float32)
     kernel(corpus_i8, weights, out)
     assert np.allclose(out, [2.0, 5.0, -1.0])
+
+
+WEB_APP_JS = ROOT / "web" / "app.js"
+# Endpoints the browser calls, as they appear in app.js: plain strings and
+# template literals. `${...}` becomes a path parameter so `/api/v1/tags/${tag}`
+# matches the route `/api/v1/tags/{tag}`.
+_FETCH_CALL = re.compile(r"""(?:apiFetch|_fullFetch|_issueFullVector|fetch)\(\s*(["'`])(/[^"'`]+)\1""")
+_TEMPLATE_ARG = re.compile(r"\$\{[^}]*\}")
+
+
+def _frontend_endpoints() -> set[str]:
+    out = set()
+    for _quote, raw in _FETCH_CALL.findall(WEB_APP_JS.read_text()):
+        path = _TEMPLATE_ARG.sub("{}", raw.split("?", 1)[0]).rstrip("/")
+        out.add(path or "/")
+    return out
+
+
+def _served_paths() -> set[str]:
+    import api_v1
+    import web_server
+
+    paths = {getattr(r, "path", "") for r in web_server.app.routes}
+    paths |= {r.path for r in api_v1.router.routes}
+    # Normalise `{tag}` to `{}` so a template-literal argument matches it.
+    return {re.sub(r"\{[^}]*\}", "{}", p) for p in paths if p}
+
+
+def test_the_frontend_only_calls_routes_that_exist():
+    """Nothing type-checks a URL in a string. Deleting the legacy surface left
+    app.js still calling /api/search and /api/refine -- unreachable behind a
+    `return true`, so no error surfaced, and the route-surface test only checked
+    what the server exposes, never what the browser asks for."""
+    missing = sorted(_frontend_endpoints() - _served_paths())
+    assert not missing, f"web/app.js calls routes the app does not serve: {missing}"
