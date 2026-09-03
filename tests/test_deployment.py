@@ -114,8 +114,12 @@ def test_unconfigured_dora_host_names_the_config_not_a_missing_module(monkeypatc
 
     monkeypatch.delenv("DATA_EXPLORER_SDK_GRPC_HOSTNAME", raising=False)
     monkeypatch.delenv("URSA_SDK_GRPC_HOSTNAME", raising=False)
+    # Enter at _build_secure_stub, where the guard is: _get_stub imports the
+    # vendored proto stubs first, and adp/ is a gitignored artifact that a clean
+    # checkout does not have -- so going through it would test the environment
+    # rather than the guard.
     with pytest.raises(dora_client.DoraUnavailable) as exc:
-        dora_client._get_stub(None)
+        dora_client._build_secure_stub(object, "")
     assert "URSA_SDK_GRPC_HOSTNAME" in str(exc.value)
 
 
