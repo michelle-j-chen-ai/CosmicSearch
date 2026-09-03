@@ -185,3 +185,20 @@ def test_first_per_segment_keeps_the_best_clip_of_each_segment():
     c._meta["segment_id"] = pa.array(["s1", "s1", None, "s2"], pa.large_string())
     rows, scores = api_v1._first_per_segment(c, np.array([1, 0, 2, 3]), np.array([0.9, 0.8, 0.7, 0.6]))
     assert rows.tolist() == [1, 2, 3] and scores.tolist() == [0.9, 0.7, 0.6]
+
+
+def test_the_public_surface_is_exactly_the_versioned_api():
+    """Everything under /api is v1; the browser's extras live under /ui."""
+    direct = [getattr(r, "path", "") for r in ws.app.routes]
+    assert not [p for p in direct if p and p.startswith("/api/")]
+    api = sorted({r.path for r in api_v1.router.routes})
+    assert api == ["/api/v1/health", "/api/v1/tags", "/api/v1/tags/{tag}", "/api/v1/video"]
+    ui = sorted({p for p in direct if p and p.startswith("/ui/")})
+    assert ui == ["/ui/calibrate", "/ui/search", "/ui/segment_sets", "/ui/video"]
+
+
+def test_legacy_routes_are_gone(client):
+    c, _ = client
+    for path in ("/api/retrieve", "/api/calibrate", "/api/save_vector", "/api/tags_catalog",
+                 "/api/scans", "/api/export_config", "/api/full_corpus_status", "/api/platform"):
+        assert c.post(path).status_code in (404, 405) and c.get(path).status_code in (404, 405), path

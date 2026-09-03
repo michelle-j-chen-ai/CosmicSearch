@@ -17,10 +17,10 @@ enable_secrets = true
 # machine callers OUTSIDE Google (e.g. the CFC curation pipeline on neuron-oci,
 # which has no Google identity for IAP). Keys are per-app scoped and revocable
 # (apps-platform app apikey). The IAP browser path is unchanged. The gateway
-# exposes the /api surface (the platform requires greedy {path=**} patterns;
-# exact single-endpoint routes are not supported) -- no static/UI paths.
+# exposes the versioned API only (the platform requires greedy {path=**}
+# patterns); the browser's /ui routes and pages stay behind IAP.
 enable_api_gateway = true
-api_gateway_paths = ["/api/{path=**}"]
+api_gateway_paths = ["/api/v1/{path=**}"]
 enable_slack = false
 
 [cloudrun]

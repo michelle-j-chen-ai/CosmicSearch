@@ -2,14 +2,14 @@
 
 The app's resident `search_engine.Corpus` holds fp32 768-d vectors, which caps
 it at a few million clips. This module serves the FULL corpus by holding the
-int8/PCA-256 screen resident instead: 34.4M x 256 = 8.8GB, swept by
-`gpu_corpus`'s numba kernel in ~180ms on 8 cores, versus ~105GB if the same
-rows were held as fp32.
+int8/PCA-256 screen resident instead: 34.4M x 256 = 8.8GB, swept by the
+numba kernel below in ~180ms on 8 cores, versus ~105GB if the same rows were
+held as fp32.
 
 Scores are the int8 screening scores, whose error against the exact PCA score
 is bounded by `eps_bound.eps_cauchy_schwarz` scaled by the projected query's
 norm (`Hit.score_error_bound`). Ranking off the screen needs no S3 at all.
-Exact scores are a separate, slower path (`threshold_search`), which fetches
+Exact scores are a separate, slower path (`exact_scores`), which fetches
 `vector_fp` per row and is worth it for curation, not for browsing.
 
 Why the corpus URI is a module constant and not a caller argument: pointing a
@@ -66,6 +66,32 @@ def media_uri(prefix: str, dt, run_uuid, chunk_start_unix) -> str:
     return prefix + _MEDIA_URI_SUFFIX.format(
         dt=dt, run_uuid=run_uuid, chunk_start_unix=int(chunk_start_unix)
     )
+
+# The int8 sweep. One fused pass dequantizes and accumulates fp32 with no
+# intermediate array, so the 12.2GB corpus is read once per query. numba is
+# imported lazily and the JIT compiled once, on first call -- `warm()` pays that
+# compile during the corpus load rather than on a user's first search.
+_SCORE_KERNEL = None
+
+
+def _score_kernel():
+    global _SCORE_KERNEL
+    if _SCORE_KERNEL is None:
+        from numba import njit, prange
+
+        @njit(parallel=True, fastmath=True, cache=True)
+        def _score_i8(ci, w, out):  # ci:(N,D) int8, w:(D,) fp32, out:(N,) fp32
+            n, d = ci.shape
+            for i in prange(n):
+                acc = np.float32(0.0)
+                row = ci[i]
+                for j in range(d):
+                    acc += np.float32(row[j]) * w[j]
+                out[i] = acc
+
+        _SCORE_KERNEL = _score_i8
+    return _SCORE_KERNEL
+
 
 # Rows per take() when fetching exact vectors for an export. take() has a ~1.65s
 # floor per call regardless of size, so bigger is cheaper -- but each chunk holds
@@ -314,11 +340,9 @@ class FullCorpus:
 
     def score(self, query: np.ndarray) -> tuple[np.ndarray, float]:
         """Screening score for every row. One sweep of the resident matrix."""
-        import gpu_corpus
-
         w, err = self._weights(query)
         out = np.empty(self.num_rows, dtype=np.float32)
-        gpu_corpus._cpu_score_kernel()(self.corpus_i8, w, out)
+        _score_kernel()(self.corpus_i8, w, out)
         return out, err
 
     def warm(self) -> None:
@@ -332,14 +356,10 @@ class FullCorpus:
         rather than raised: a warm-up that fails only restores the old behaviour.
         """
         try:
-            import gpu_corpus
-
             t0 = time.perf_counter()
             probe = np.ascontiguousarray(self.corpus_i8[: min(1024, self.num_rows)])
             out = np.empty(probe.shape[0], dtype=np.float32)
-            gpu_corpus._cpu_score_kernel()(
-                probe, np.zeros(probe.shape[1], dtype=np.float32), out
-            )
+            _score_kernel()(probe, np.zeros(probe.shape[1], dtype=np.float32), out)
             LOGGER.info("scoring kernel warm in %.1fs", time.perf_counter() - t0)
         except Exception as exc:  # noqa: BLE001 -- warm-up is an optimization
             LOGGER.warning("scoring kernel warm-up failed (%s); the first search "

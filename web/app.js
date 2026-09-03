@@ -12,10 +12,10 @@ const escapeHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const state = {
-  platform: null,
+  health: null,
   project: localStorage.getItem("nls.project") || null,
   corpus: null,
-  embeddingsUri: null,
+  resumeTag: null, resumeQuery: "",
   query: "",
   label: "",
   mode: "search",            // search | refine | window | resume
@@ -51,7 +51,7 @@ let _issueSeq = 0;
 // in the JSON body when there is one, so GET and POST routes read it the same way.
 function apiFetch(url, opts) {
   const project = state.project;
-  if (project && typeof url === "string" && url.startsWith("/api/") && !/[?&]project=/.test(url)) {
+  if (project && typeof url === "string" && (url.startsWith("/api/") || url.startsWith("/ui/")) && !/[?&]project=/.test(url)) {
     url += (url.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(project);
   }
   if (project && opts && typeof opts.body === "string") {
@@ -76,27 +76,40 @@ async function init() {
 
 async function loadPlatform() {
   try {
-    const p = await apiFetch("/api/platform").then((r) => r.json());
-    state.platform = p;
-    const enabled = (p.projects || []).filter((x) => x.enabled);
-    const names = enabled.map((x) => x.name);
-    if (!state.project || !names.includes(state.project)) {
-      state.project = names.includes(p.default) ? p.default : (names[0] || p.default);
-    }
+    const h = await fetch("/api/v1/health").then((r) => r.json());
+    state.health = h;
+    const names = Object.keys(h.projects || {});
+    const def = names.includes("neuron") ? "neuron" : names[0];
+    if (!state.project || !names.includes(state.project)) state.project = def;
     localStorage.setItem("nls.project", state.project);
     const sel = $("projectSelect");
-    sel.innerHTML = enabled.map((x) =>
-      `<option value="${escapeHtml(x.name)}"${x.name === state.project ? " selected" : ""}>${escapeHtml(x.label)}</option>`).join("");
+    sel.innerHTML = names.map((n) =>
+      `<option value="${escapeHtml(n)}"${n === state.project ? " selected" : ""}>${escapeHtml(n.toUpperCase())}</option>`).join("");
     sel.className = "tag " + state.project;
-    sel.disabled = enabled.length < 2;
+    sel.disabled = names.length < 2;
     // Every view is scoped to one corpus, so switching restarts the app on the other.
     sel.onchange = () => { localStorage.setItem("nls.project", sel.value); location.reload(); };
   } catch (e) { /* cosmetic */ }
-  // The export list is an archive of past exports and their artifacts.
   $("scansSection").style.display = "block";
   renderExportPanel();
 }
 
+// /api/v1/health is the one status call: which projects exist, whether this
+// one's corpus is resident, and what it covers.
+async function _health() {
+  const r = await fetch("/api/v1/health");
+  const h = await r.json().catch(() => null);
+  if (h) state.health = h;
+  return h;
+}
+function _projectHealth(h) { return (h && h.projects && h.projects[state.project]) || null; }
+function _corpusFromHealth(p) {
+  return {
+    num_rows: p.rows, corpus_version: p.corpus_version, embeddings_uri: p.corpus_table_uri || "",
+    span_lo_date: p.date_span ? p.date_span[0] : "", span_hi_date: p.date_span ? p.date_span[1] : "",
+    model: (state.health && state.health.model && state.health.model.id) || "black_dwarf", has_segment_id: true,
+  };
+}
 function applyCorpus(c) {
   state.corpus = c;
   state.embeddingsUri = c.embeddings_uri;
@@ -119,24 +132,12 @@ function applyCorpus(c) {
   ["ex-dateFrom", "ex-dateTo"].forEach((id) => { const el = $(id); if (el) { el.value = ""; el.removeAttribute("min"); el.removeAttribute("max"); } });
 }
 
-async function loadDefaultCorpusWhenReady() {
-  for (let i = 0; i <= 240; i++) {
-    try {
-      const r = await apiFetch("/api/corpus");
-      if (r.ok) { const c = await r.json(); if (c && c.num_rows != null) { applyCorpus(c); return; } }
-      $("corpusPill").textContent = "warming up — loading model + corpus…";
-    } catch (e) { $("corpusPill").textContent = "warming up — loading model + corpus…"; }
-    await new Promise((res) => setTimeout(res, 3000));
-  }
-  $("corpusPill").textContent = "corpus unavailable — reload to retry";
-}
-
+async function loadDefaultCorpusWhenReady() { await refreshCorpusPill(); }
 /* ===================== event wiring ===================== */
 function wireEvents() {
   $("navSearch").onclick = () => setPage("search");
   $("navSaved").onclick = () => setPage("saved");
   $("settingsGear").onclick = () => $("settingsPop").classList.toggle("hidden");
-  $("load-model").onclick = loadModel;
 
   const go = () => runSearch();
   $("searchBtn").onclick = go;
@@ -166,19 +167,16 @@ function wireEvents() {
 
   $("saveOpenBtn").onclick = openSaveDrawer;
   $("drawerClose").onclick = closeDrawer;
-  $("overlay").onclick = () => { closeDrawer(); closePreview(); };
-  $("previewClose").onclick = closePreview;
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closePreview(); });
+  $("overlay").onclick = closeDrawer;
   $("finalSaveBtn").onclick = finalSave;
 
   $("savedReload").onclick = loadSaved;
   $("newSearchBtn").onclick = () => setPage("search");
   $("savedFilter").oninput = renderTable;
-  $("modelFilter").onchange = renderTable;
   $("scansReload").onclick = () => loadScanJobs(true);
   $("tbody").onclick = (e) => {
     const b = e.target.closest("button.resume-link");
-    if (b && b.dataset.id) resumeSession(b.dataset.id);
+    if (b && b.dataset.tag) resumeTag(b.dataset.tag);
   };
   $("tbody").onchange = (e) => {
     if (e.target.matches("input[type=checkbox]")) {
@@ -212,25 +210,6 @@ function setPage(which) {
 // Reports the pinned corpus; there is nothing to switch to. The server rejects
 // a `uri` that is not the pinned one, so offering the choice here would only
 // produce an error the user cannot act on.
-async function loadCorpus() {
-  try {
-    const c = await apiFetch("/api/corpus").then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
-    applyCorpus(c);
-    $("embeddings-uri").value = c.embeddings_uri || "";
-    setNote("corpus-note", `${fmtInt(c.num_rows)} clips · segment_id ${c.has_segment_id ? "present ✓" : "absent"}`);
-  } catch (e) { setNote("corpus-note", "corpus unavailable: " + e.message, true); $("corpusPill").textContent = "corpus unavailable"; }
-}
-async function loadModel() {
-  const uri = $("model-uri").value.trim();
-  setNote("model-note", "loading model (into memory, ~minutes)…");
-  try {
-    const m = await apiFetch("/api/model?uri=" + encodeURIComponent(uri)).then((r) => { if (!r.ok) return r.json().then((j) => { throw new Error(j.detail || r.status); }); return r.json(); });
-    setNote("model-note", "model: " + m.label);
-    if (state.corpus) { state.corpus.model = m.label; state.corpus.model_uri = m.model_uri; applyCorpus(state.corpus); }
-    if (state.query) reload({ page: 0 });
-  } catch (e) { setNote("model-note", "failed to load model: " + e.message, true); }
-}
-
 /* ===================== search-page filters ===================== */
 function toggleSearchFilters() {
   const p = $("searchFiltersPanel");
@@ -266,7 +245,7 @@ function _makeDxCombo(cfg) {
     timer = setTimeout(async () => {
       if (note) note.textContent = "loading segment sets…";
       try {
-        items = (await apiFetch("/api/segment_sets?name_filter=" + encodeURIComponent(v)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); })) || [];
+        items = (await apiFetch("/ui/segment_sets?name_filter=" + encodeURIComponent(v)).then((r) => { if (!r.ok) throw new Error("DORA " + r.status); return r.json(); })) || [];
         if (!items.length) { menu.innerHTML = '<div class="combo-msg">no sets match that name</div>'; show(); if (note) note.textContent = "no sets match that name"; return; }
         menu.innerHTML = items.map((s, i) => `<div class="combo-opt" data-i="${i}" role="option"><span class="opt-name">${escapeHtml(s.name)}</span><span class="opt-meta">v${escapeHtml(String(s.version))} · ${fmtInt(s.num_segments)} segments</span></div>`).join("");
         menu.querySelectorAll(".combo-opt").forEach((o) => o.addEventListener("mousedown", (e) => {
@@ -276,7 +255,7 @@ function _makeDxCombo(cfg) {
           combo.classList.add("chosen");
           if (note) note.textContent = `using ${s.name} v${s.version} (${fmtInt(s.num_segments)} segs)`;
           hide();
-          apiFetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.uuid)).catch(() => {});
+          apiFetch("/ui/segment_sets?prefetch=" + encodeURIComponent(s.uuid)).catch(() => {});
           cfg.onChoose(s);
         }));
         show();
@@ -304,7 +283,6 @@ function _searchFilters() {
     vehicle: _splitList($("sf-vehicle").value),
     drive_id: _splitList($("sf-drive").value),
     segment_set_uuid: state.searchSegUuid,
-    embeddings_uri: state.embeddingsUri,
   };
 }
 
@@ -334,7 +312,7 @@ async function runRefine(startOpts) {
   state.mode = "refine";
   showToast(`Re-ranking with ${marks.filter((m) => m.mark === "up").length} 👍 / ${marks.filter((m) => m.mark === "down").length} 👎…`);
   if (_fullCorpusOn()) {
-    await _issueFullVector("/api/retrieve", {
+    await _issueFullVector("/ui/search", {
       query: state.query, marks, k: FULL_BATCH, output: "hits",
       negative_weight: 0.5, text_weight: 0.3, refine_from_marks: true,
     }, (startOpts && startOpts.page) || 0);
@@ -354,7 +332,7 @@ async function runWindowSearch(startOpts) {
     state.windowReq = { run_uuid, segment_id, start_ns: _toNs($("vs-start").value), end_ns: _toNs($("vs-end").value), query: "video clip: " + (run_uuid || segment_id) };
   }
   state.mode = "window"; state.query = state.windowReq.query;
-  await _issueFullVector("/api/retrieve", {
+  await _issueFullVector("/ui/search", {
     window: state.windowReq, k: FULL_BATCH, output: "hits",
   }, (startOpts && startOpts.page) || 0);
 }
@@ -429,13 +407,13 @@ async function handleUpload(file) {
       _uploadNote(`Encoding ${frames.length} frames sampled from ${span.toFixed(1)}s${dur > span ? ` (of ${dur.toFixed(0)}s)` : ""}…`);
       noteAfter = dur > _UPLOAD_SAMPLE_WINDOW_S ? `Sampled a ${span.toFixed(0)}s window — clips match best at ~2-4s.` : "";
     }
-    const enc = await apiFetch("/api/retrieve", {
+    const enc = await apiFetch("/ui/search", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ frames_b64, output: "vector" }),
     }).then((r) => r.ok ? r.json() : r.json().then((j) => { throw new Error(j.detail || ("HTTP " + r.status)); }));
     // The uploaded example is now just a query vector -> reuse the resume path so
     // paging, refine, sweep, save, and offline-scan export all work unchanged.
-    state.resumeVec = enc.vector;
+    state.resumeVec = enc.vector; state.resumeTag = null;
     state.resumeLabel = (isVideo ? "🎬 " : "🖼️ ") + (enc.label || "uploaded example");
     state.query = state.resumeLabel;
     state.mode = "resume";
@@ -445,20 +423,12 @@ async function handleUpload(file) {
   } catch (e) { _uploadNote("Could not search by upload: " + e.message, true); }
 }
 async function runVectorSearch(startOpts) {
-  if (!state.resumeVec) return;
+  if (!state.resumeVec && !state.resumeTag) return;
   state.mode = "resume";
-  // Resuming a saved search must cover the same corpus a fresh search does.
-  // Falling through to /api/search_by_vector ranked the reloaded tag over the
-  // 2M resident corpus while the identical text query covered 34M -- same UI,
-  // same wording, quietly different corpus.
-  if (_fullCorpusOn()) {
-    await _issueFullVector("/api/retrieve", {
-      vector: state.resumeVec, query: state.resumeLabel || state.query || "",
-      k: FULL_BATCH, output: "hits",
-    }, (startOpts && startOpts.page) || 0);
-    return;
-  }
-  await _issue("/api/search_by_vector", { vector: state.resumeVec, query: state.resumeLabel || state.query || "", ...(startOpts || {}), ..._searchFilters() });
+  const extra = state.resumeTag
+    ? { tag: state.resumeTag, query: state.resumeLabel || state.query || "", k: FULL_BATCH, output: "hits" }
+    : { vector: state.resumeVec, query: state.resumeLabel || state.query || "", k: FULL_BATCH, output: "hits" };
+  await _issueFullVector("/ui/search", extra, (startOpts && startOpts.page) || 0);
 }
 function reload(startOpts) {
   if (state.mode === "refine") return runRefine(startOpts);
@@ -469,20 +439,22 @@ function reload(startOpts) {
 
 // Show the corpus the next search will actually use, not the resident one.
 async function refreshCorpusPill() {
-  let st = null;
-  try { st = await apiFetch("/api/full_corpus_status").then((r) => r.json()); } catch (e) { return; }
-  if (!st) return;
-  const model = (state.corpus && state.corpus.model) || st.model || "model";
-  if (st.status === "ready" && st.num_rows) {
-    $("corpusPill").innerHTML = `🗂 <b>${fmtInt(st.num_rows)} clips</b> · full corpus · ${escapeHtml(model)}`;
-  } else if (st.status === "loading") {
-    $("corpusPill").innerHTML = `🗂 <b>full corpus loading…</b> ${Math.round(st.elapsed_s || 0)}s · ${escapeHtml(model)}`;
+  const h = await _health().catch(() => null);
+  const p = _projectHealth(h);
+  if (!p) return;
+  const model = (h.model && h.model.id) || "model";
+  if (p.ready) {
+    $("corpusPill").innerHTML = `🗂 <b>${fmtInt(p.rows)} clips</b> · corpus v${p.corpus_version} · ${escapeHtml(model)}`;
+    if (!state.corpus) applyCorpus(_corpusFromHealth(p));
+    $("embeddings-uri").value = p.corpus_table_uri || "";
+    setNote("corpus-note", `${fmtInt(p.rows)} clips · ${p.date_span ? p.date_span.join(" → ") : ""}`);
+  } else if (p.status === "error") {
+    $("corpusPill").innerHTML = `🗂 <b>corpus failed</b> · ${escapeHtml(p.error || "")}`;
+  } else {
+    $("corpusPill").innerHTML = `🗂 <b>corpus loading…</b> ${Math.round(p.elapsed_s || 0)}s · ${escapeHtml(model)}`;
     setTimeout(refreshCorpusPill, 10000);
-  } else if (st.status === "error") {
-    $("corpusPill").innerHTML = `🗂 <b>full corpus failed</b> · ${escapeHtml(model)}`;
   }
 }
-
 // Search always covers the whole corpus. There is no toggle: offering the ~2M
 // resident subset as a choice meant users could silently search 6% of the data
 // and read the result as complete.
@@ -494,26 +466,20 @@ function wireFullCorpusToggles() { refreshCorpusPill(); }
 async function _ensureFullCorpus() {
   $("emptyState").style.display = "none";
   $("resultsState").style.display = "block";
-  const status = await apiFetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
-  if (status && status.status === "ready") return true;
-  await apiFetch("/api/full_corpus_load", { method: "POST" }).catch(() => {});
-  $("gridStatus").textContent =
-    "Loading the full corpus (first use, a few minutes) — this search will start automatically.";
   for (let i = 0; i < 60; i++) {
+    const h = await _health().catch(() => null);
+    const p = _projectHealth(h);
+    if (p && p.ready) { if (!state.corpus) applyCorpus(_corpusFromHealth(p)); return true; }
+    if (p && p.status === "error") { $("gridStatus").textContent = "Corpus failed to load: " + (p.error || ""); return false; }
+    $("gridStatus").textContent = `Loading the ${state.project} corpus (a few minutes on a cold start)… ${Math.round((p && p.elapsed_s) || 0)}s`;
     await new Promise((res) => setTimeout(res, 10000));
-    const s = await apiFetch("/api/full_corpus_status").then((r) => r.json()).catch(() => null);
-    if (!s) continue;
-    if (s.status === "error") { $("gridStatus").textContent = "Full corpus failed to load: " + s.error; return false; }
-    if (s.status === "ready") return true;
-    $("gridStatus").textContent = `Loading the full corpus… ${Math.round(s.elapsed_s || 0)}s`;
   }
-  $("gridStatus").textContent = "Full corpus did not finish loading — try again.";
+  $("gridStatus").textContent = "Corpus did not finish loading — try again.";
   return false;
 }
-
 async function _issueFullCorpus(q, page) {
   if (!(await _ensureFullCorpus())) return;
-  await _fullFetch("/api/retrieve", { query: q, k: FULL_BATCH, output: "hits" }, page, _fullKey(q));
+  await _fullFetch("/ui/search", { query: q, k: FULL_BATCH, output: "hits" }, page, _fullKey(q));
 }
 
 // The filter half of every full-corpus request body, so text search, resume,
@@ -560,8 +526,8 @@ async function _fullFetch(endpoint, extra, page, key) {
 // previous buffer.
 async function _issueFullVector(endpoint, extra, page) {
   if (!(await _ensureFullCorpus())) return;
-  const key = [endpoint, _fullKey(state.query || ""), JSON.stringify(extra.marks || extra.vector || "").length,
-               JSON.stringify(extra.marks || "")].join("|");
+  const key = [endpoint, _fullKey(state.query || ""), JSON.stringify(extra.marks || extra.vector || extra.tag || "").length,
+               JSON.stringify(extra.marks || ""), extra.tag || ""].join("|");
   await _fullFetch(endpoint, extra, page, key);
 }
 
@@ -634,7 +600,7 @@ async function rescoreVisible() {
   if (!rows.length) return;
   let data;
   try {
-    data = await apiFetch("/api/retrieve", {
+    data = await apiFetch("/ui/search", {
       method: "POST", headers: { "Content-Type": "application/json" },
       // The vector the ranking used, NOT the query text. A refine, window or
       // upload has no text that reproduces its direction, and sending `query`
@@ -724,7 +690,7 @@ function renderGrid() {
     const m = state.marks[h.chunk_id];
     const vc = m && m.mark === "up" ? "voted-up" : (m && m.mark === "down" ? "voted-down" : "");
     const col = scoreColor(h.score);
-    const vsrc = "/api/video?uri=" + encodeURIComponent(h.source_media_uri || "");
+    const vsrc = "/ui/video?uri=" + encodeURIComponent(h.source_media_uri || "");
     return `<div class="card ${vc}" data-chunk="${escapeHtml(h.chunk_id)}">
       <div class="thumb">
         <span class="rank-badge">#${fmtInt(h.rank)}</span>
@@ -757,7 +723,7 @@ function renderQueryStrip(data) {
   if (!clips || !clips.length) { strip.classList.add("hidden"); strip.innerHTML = ""; return; }
   const cards = clips.map((h) => `<div class="card"><div class="thumb">
       <span class="score-badge" style="background:${scoreColor(h.score)}">${h.score.toFixed(3)}</span>
-      <video controls preload="metadata" playsinline src="/api/video?uri=${encodeURIComponent(h.source_media_uri || "")}#t=0.1"></video>
+      <video controls preload="metadata" playsinline src="/ui/video?uri=${encodeURIComponent(h.source_media_uri || "")}#t=0.1"></video>
       <span class="card-badge">query</span></div></div>`).join("");
   strip.innerHTML = `<div class="query-strip-head">Query clip — averaged ${fmtInt(data.query_chunk_count)} chunk(s)${data.query_span_seconds ? " · " + fmtInt(data.query_span_seconds) + "s" : ""}</div><div class="query-strip-row">${cards}</div>`;
   strip.classList.remove("hidden");
@@ -979,30 +945,32 @@ function closeDrawer() { $("overlay").classList.remove("open"); $("drawer").clas
 function _querySlug(q) { return (q || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40); }
 
 async function finalSave() {
-  const tag = $("tagInput").value.trim();
-  if (!tag) { setNote("saveNote", "Enter a tag name.", true); return; }
-  const tau = state.confirmedTau != null ? state.confirmedTau : (state.suggestedTau != null ? state.suggestedTau : 0);
+  const tag = $("tagInput").value.trim().toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 64);
+  if (!tag) { setNote("saveNote", "Enter a tag name (letters, digits, underscores).", true); return; }
+  if (state.mode === "resume" && !state.resumeTag) {
+    setNote("saveNote", "An uploaded image or video can't be saved as a tag — search by text or by a corpus clip instead.", true);
+    return;
+  }
   const btn = $("finalSaveBtn"); btn.disabled = true; setNote("saveNote", "Saving…");
   try {
-    // Persist the 👍/👎 marks with the saved search so Resume can restore them
-    // (session-restore reads these back into state.marks). Shape matches the resume
-    // reader: {chunk_id, segment_id, index, rank, score} per mark.
-    const _mark = (chunk_id, m) => ({ chunk_id, segment_id: m.segment_id, index: m.index, rank: m.rank, score: m.score });
-    const thumbs_up = Object.entries(state.marks).filter(([, m]) => m.mark === "up").map(([c, m]) => _mark(c, m));
-    const thumbs_down = Object.entries(state.marks).filter(([, m]) => m.mark === "down").map(([c, m]) => _mark(c, m));
-    const r = await apiFetch("/api/save_vector", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-      tag, query: state.query, k: 50, threshold: tau,
-      // The direction these results were ranked by. Required: a refined vector
-      // cannot be recovered by re-encoding the query text, and the server keeps
-      // no per-user "current search" to fall back on.
-      vector: (state.fullBuf && state.fullBuf.vector) || state.resumeVec || null,
-      from_date: $("sf-dateFrom").value || null, to_date: $("sf-dateTo").value || null,
-      segment_set_uuid: state.searchSegUuid, segment_set_name: state.searchSegName,
-      filter_lance_uri: _splitList($("sf-lance").value), vehicle: _splitList($("sf-vehicle").value), drive_id: _splitList($("sf-drive").value),
-      thumbs_up, thumbs_down,
-    }) });
-    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || ("HTTP " + r.status));
-    await r.json();
+    const input = (state.mode === "window" && state.windowReq)
+      ? { type: "video", run_uuid: state.windowReq.run_uuid || "", segment_id: state.windowReq.segment_id || "",
+          start_ns: state.windowReq.start_ns || 0, end_ns: state.windowReq.end_ns || 0, pooling: "mean" }
+      : { type: "text", text: state.resumeTag ? (state.resumeQuery || state.query) : state.query };
+    const body = { tag, project: state.project, input, description: ($("tagDesc") && $("tagDesc").value.trim()) || "" };
+    if (state.confirmedTau != null) { body.threshold_mode = "explicit"; body.threshold = +state.confirmedTau.toFixed(4); }
+    else body.threshold_mode = "suggested";
+    let r = await apiFetch("/api/v1/tags", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (r.status === 409) setNote("saveNote", "Tag already exists on this project — refining it with your feedback…");
+    else if (!r.ok) throw new Error(await _detail(r));
+    const marks = Object.entries(state.marks).map(([chunk_id, m]) => ({ chunk_id, mark: m.mark }));
+    if (marks.some((m) => m.mark === "up")) {
+      r = await apiFetch(`/api/v1/tags/${encodeURIComponent(tag)}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project: state.project, marks }),
+      });
+      if (!r.ok) throw new Error(await _detail(r));
+    }
     closeDrawer();
     showToast(`Saved "${tag}" — configure export below`);
     await loadSaved();
@@ -1012,90 +980,73 @@ async function finalSave() {
   } catch (e) { setNote("saveNote", "Save failed: " + e.message, true); }
   finally { btn.disabled = false; }
 }
-
+// The API's error body: {detail: {code, message, status}} or a plain string.
+function _detail(r) {
+  return r.json().then((j) => {
+    const d = j && j.detail;
+    if (d && d.message) return d.message;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) return d.map((e) => `${(e.loc || []).join(".")}: ${e.msg}`).join("; ");
+    return "HTTP " + r.status;
+  }).catch(() => "HTTP " + r.status);
+}
 /* ===================== saved searches table ===================== */
 function _uriShort(u) { const p = String(u || "").replace(/\/+$/, "").split("/").filter(Boolean); return p.length ? p[p.length - 1] : ""; }
 function _fmtDates(f) { const from = (f && f.from_date) || "", to = (f && f.to_date) || ""; return (from || to) ? `${from || "…"} → ${to || "latest"}` : "—"; }
 
 async function loadSaved() {
-  try { const d = await apiFetch("/api/tags_catalog").then((r) => r.json()); state.savedRows = d.entries || []; }
+  try { const d = await apiFetch("/api/v1/tags?page_size=500").then((r) => r.json()); state.savedRows = d.tags || []; }
   catch (e) { state.savedRows = []; }
   renderTable();
   renderExportPanel();
 }
-function _rowModel(e) { return e.model_label || _uriShort(e.model_uri) || "base"; }
 // Populate the model dropdown: loaded model first (default selection), then the
 // other models present in history, then "All models". Rebuilt only when the set
 // changes, preserving the user's current pick.
-function _syncModelFilter(all) {
-  const sel = $("modelFilter");
-  const loaded = state.corpus ? state.corpus.model : null;
-  const models = [...new Set(all.map(_rowModel))].filter(Boolean).sort();
-  const sig = (loaded || "") + "::" + models.join("|");
-  if (sel._sig === sig) return;
-  sel._sig = sig;
-  const seen = new Set(); const opts = [];
-  if (loaded) { opts.push(`<option value="${escapeHtml(loaded)}">${escapeHtml(loaded)} (loaded)</option>`); seen.add(loaded); }
-  models.forEach((m) => { if (!seen.has(m)) { opts.push(`<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`); seen.add(m); } });
-  opts.push(`<option value="__all__">All models</option>`);
-  const prev = sel.value;
-  sel.innerHTML = opts.join("");
-  if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;   // keep user's pick
-  else sel.value = (loaded && seen.has(loaded)) ? loaded : "__all__";             // default: loaded model
-}
 function renderTable() {
   const all = state.savedRows || [];
   const q = ($("savedFilter").value || "").trim().toLowerCase();
-  _syncModelFilter(all);
-  const modelSel = $("modelFilter").value;
-  const matched = all.map((e, i) => ({ e, i }))
-    .filter(({ e }) => modelSel === "__all__" || _rowModel(e) === modelSel);
-  const hidden = all.length - matched.length;
-  $("savedCount").textContent = matched.length ? `(${matched.length})` : "";
-  const body = matched.map(({ e, i }) => {
-    const hay = (e.tag + " " + (e.query || "")).toLowerCase();
+  $("savedCount").textContent = all.length ? `(${all.length})` : "";
+  const body = all.map((e, i) => {
+    const hay = (e.tag + " " + (e.description || "")).toLowerCase();
     if (q && !hay.includes(q)) return "";
-    const model = e.model_label || _uriShort(e.model_uri) || "base";
-    const dim = e.vec_dim ? `${e.vec_dim}-d` : "no vec";
-    const tau = (e.threshold > 0) ? e.threshold.toFixed(3) : "top-k";
+    const th = (e.thresholds || {})[state.project];
+    const tau = th
+      ? `τ ${Number(th.value).toFixed(3)} <span style="color:var(--muted-2)">${escapeHtml(th.mode)}${th.stale ? " · stale" : ""}</span>`
+      : `<span style="color:var(--muted-2)">no ${escapeHtml(state.project)} threshold</span>`;
+    const others = Object.keys(e.thresholds || {}).filter((p) => p !== state.project);
     return `<tr data-i="${i}" class="${state.selected.has(i) ? "checked" : ""}">
       <td><input type="checkbox" data-i="${i}" ${state.selected.has(i) ? "checked" : ""}></td>
       <td><span class="tag-pill">${escapeHtml(e.tag)}</span></td>
-      <td><div class="query-text">${escapeHtml(e.query && e.query !== e.tag ? e.query : "")}</div></td>
-      <td class="model-cell"><b>${escapeHtml(model)}</b><br>${dim}</td>
-      <td class="date-cell">${escapeHtml(_fmtDates(e.filters))}</td>
-      <td><span class="kt-pill numeric">τ ${tau}</span></td>
-      <td>${e.id != null ? `<button class="resume-link" data-id="${e.id}">resume ↗</button>` : ""}</td>
+      <td><div class="query-text">${escapeHtml(e.description || "")}</div></td>
+      <td class="model-cell">v${e.version}${e.pinned_version != null ? ` <span style="color:var(--muted-2)">pinned v${e.pinned_version}</span>` : ""}${others.length ? `<br><span style="color:var(--muted-2)">also on ${escapeHtml(others.join(", "))}</span>` : ""}</td>
+      <td class="date-cell">${escapeHtml(String(e.updated_at || "").slice(0, 10))}</td>
+      <td><span class="kt-pill numeric">${tau}</span></td>
+      <td><button class="resume-link" data-tag="${escapeHtml(e.tag)}">resume ↗</button></td>
     </tr>`;
   }).join("");
-  let html = body;
-  if (!body) html = `<tr><td colspan="8" style="color:var(--muted-2)">${all.length ? "No saved searches for this model / filter — pick another model above." : "No saved searches yet — run a search and Save."}</td></tr>`;
-  if (hidden > 0 && modelSel !== "__all__") html += `<tr><td colspan="8" style="color:var(--muted-2);font-size:12px;">${hidden} search${hidden === 1 ? "" : "es"} from other models hidden — choose “All models” above to see them.</td></tr>`;
-  $("tbody").innerHTML = html;
+  $("tbody").innerHTML = body || `<tr><td colspan="7" style="color:var(--muted-2)">${all.length ? "No saved searches match that filter." : "No saved searches yet — run a search and Save."}</td></tr>`;
 }
-async function resumeSession(id) {
+async function resumeTag(tag) {
   setPage("search"); showToast("Loading saved search…");
-  let s;
-  try { s = await apiFetch("/api/search_session/" + encodeURIComponent(id)).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }); }
+  let rec;
+  try { rec = await apiFetch(`/api/v1/tags/${encodeURIComponent(tag)}`).then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }); }
   catch (e) { showToast("Could not load: " + e.message); return; }
-  if (!s.vector || !s.vector.length) { showToast("That saved search has no stored vector"); return; }
-  $("searchInput2").value = s.query || ""; state.query = s.query || "";
-  $("tagInput").value = s.tag || "";
-  state.marks = {};
-  (s.thumbs_up || []).forEach((m) => { if (m && m.chunk_id) state.marks[m.chunk_id] = { mark: "up", segment_id: m.segment_id, index: m.index, rank: m.rank, score: m.score }; });
-  (s.thumbs_down || []).forEach((m) => { if (m && m.chunk_id) state.marks[m.chunk_id] = { mark: "down", segment_id: m.segment_id, index: m.index, rank: m.rank, score: m.score }; });
-  if (s.from_date) $("sf-dateFrom").value = s.from_date;
-  if (s.to_date) $("sf-dateTo").value = s.to_date;
-  $("sf-lance").value = s.filter_lance_uri || ""; $("sf-vehicle").value = s.vehicle || ""; $("sf-drive").value = s.drive_id || "";
-  state.searchSegUuid = s.segment_set_uuid || null; state.searchSegName = s.segment_set_name || null;
-  if ($("sf-dxset")) $("sf-dxset").value = s.segment_set_name || "";
-  if (s.segment_set_uuid) apiFetch("/api/segment_set_prefetch?uuid=" + encodeURIComponent(s.segment_set_uuid)).catch(() => {});
-  state.resumeVec = s.vector; state.resumeLabel = s.query || ""; state.mode = "resume";
+  const latest = rec.versions[rec.versions.length - 1] || {};
+  const src = latest.source || {};
+  const label = src.type === "text" ? src.text : `${tag} (${src.type})`;
+  $("searchInput2").value = label || ""; state.query = label || tag;
+  $("tagInput").value = tag;
+  state.marks = {}; state.resumeVec = null;
+  state.resumeTag = tag; state.resumeQuery = src.type === "text" ? src.text : "";
+  state.resumeLabel = label || tag; state.mode = "resume";
+  const th = (latest.thresholds || {})[state.project];
+  state.confirmedTau = th ? Number(th.value) : null;
+  if (state.confirmedTau != null) { $("threshVal").textContent = state.confirmedTau.toFixed(3); $("threshSummary").textContent = `τ ${state.confirmedTau.toFixed(3)}`; }
   updateRail();
   await runVectorSearch({ page: 0 });
-  showToast(`Resumed "${s.tag || "search"}"`);
+  showToast(`Resumed "${tag}" v${latest.version || ""}`);
 }
-
 /* ===================== export panel ===================== */
 function estimateTauFromK(k) {
   const n = (state.corpus && state.corpus.num_rows) || 2260540;
@@ -1195,12 +1146,10 @@ function renderExportPanel() {
 function _exportFilters() {
   return {
     from_date: $("ex-dateFrom").value || null, to_date: $("ex-dateTo").value || null,
-    filter_lance_uri: _splitList($("ex-lance").value), vehicle: _splitList($("ex-vehicle").value), drive_id: _splitList($("ex-drive").value),
-    segment_set_uuid: state.exportSegUuid, segment_set_name: state.exportSegName,
+    filter_lance_uri: _splitList($("ex-lance").value), vehicle: _splitList($("ex-vehicle").value),
+    segment_set_uuid: state.exportSegUuid,
   };
 }
-function _exportFilename(resp, fb) { const n = resp.headers.get("X-NLS-Export-Name") || ""; return n ? n + ".csv" : fb; }
-
 function doExport() {
   if (state.selected.size === 0) return;
   fullExport();
@@ -1209,111 +1158,75 @@ function doExport() {
 // endpoints address marks differently -- the resident one by `index`, the
 // full-corpus one by `row` -- and sending full-corpus marks to the resident
 // endpoint silently drops every label, which reads as "no labels yet".
-function _thresholdEndpoint() {
-  return "/api/calibrate";
-}
-
+function _thresholdEndpoint() { return "/ui/calibrate"; }
 // Export straight from the resident corpus: the ranking pass is the same one a
 // search runs, so the only extra cost is materializing the rows.
 async function fullExport() {
   const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
   if (!rows.length) return;
   const topk = state.cutoffMode === "topk";
+  const fmt = ($("exportFormat") && $("exportFormat").value) || "csv";
   const btn = $("exportBtn"); btn.disabled = true;
   const note = $("exportNote");
-  const filters = _exportFilters();
+  const f = _exportFilters();
   let done = 0;
   try {
     for (const e of rows) {
-      const tag = e.tag || e.query;
-      note.textContent = `Exporting ${tag} from all 34M clips… (${done + 1}/${rows.length})`;
-      const body = {
-        query: e.query || e.tag, tag, output: "csv",
-        interval: state.sampleMode === "interval",
-        dedupe_segment: $("dedupInput").checked,
-        exact: !!$("exactInput") && $("exactInput").checked,
-        from_date: filters.from_date, to_date: filters.to_date,
-        vehicle: filters.vehicle, drive_id: filters.drive_id,
-        segment_set_uuid: filters.segment_set_uuid,
-        filter_lance_uri: filters.filter_lance_uri,
-        create_segment_set: !!$("segsetInput") && $("segsetInput").checked,
-      };
-      if (topk) body.k = kForRow(e) || 50;
-      else body.threshold = e.threshold > 0 ? e.threshold : 0.3;
-      const resp = await apiFetch("/api/retrieve", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+      const q = new URLSearchParams({
+        output: fmt, interval: String(state.sampleMode === "interval"),
+        segment_mode: String($("dedupInput").checked),
+        create_segment_set: String(!!$("segsetInput") && $("segsetInput").checked),
       });
-      if (!resp.ok) {
-        let d; try { d = (await resp.json()).detail; } catch (_e) { }
-        throw new Error(`${tag}: ${d || "HTTP " + resp.status}`);
+      if (topk) q.set("k", String(kForRow(e) || 50));
+      for (const [k, v] of Object.entries(f)) if (v) q.set(k, v);
+      const url = `/api/v1/tags/${encodeURIComponent(e.tag)}?${q}`;
+      note.textContent = `Exporting ${e.tag}… (${done + 1}/${rows.length})`;
+      // The same URL starts the export and reports on it; poll until it is ready.
+      let body = null;
+      for (let attempt = 0; attempt < 360; attempt++) {
+        const r = await apiFetch(url);
+        if (!r.ok) throw new Error(`${e.tag}: ${await _detail(r)}`);
+        body = await r.json();
+        const st = body.export && body.export.status;
+        if (r.status !== 202 && st !== "running" && st !== "pending") break;
+        note.textContent = `Exporting ${e.tag}… ${st} (${attempt * 5}s)`;
+        await new Promise((res) => setTimeout(res, 5000));
       }
-      const h = (k) => resp.headers.get(k) || "";
-      const blob = await resp.blob(); const url = URL.createObjectURL(blob);
-      const a = document.createElement("a"); a.href = url;
-      a.download = _exportFilename(resp, tag + ".csv");
-      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      const ex = (body && body.export) || {};
+      if (ex.status !== "ready") throw new Error(`${e.tag}: ${ex.error || ex.status || "did not finish"}`);
+      if (ex.download_url) window.open(ex.download_url, "_blank", "noopener");
       done++;
-      const bits = [`${fmtInt(+h("X-NLS-Rows"))} rows`, `${h("X-NLS-Elapsed-Ms")} ms`];
-      if (h("X-NLS-Parquet")) bits.push(`parquet → ${h("X-NLS-Parquet")}`);
-      else bits.push("⚠ parquet not written");
-      if (h("X-NLS-Segset")) bits.push(`segment set ${h("X-NLS-Segset")}`);
-      if (h("X-NLS-Segset-Error")) bits.push(`⚠ ${h("X-NLS-Segset-Error")}`);
-      // A capped threshold export is a partial answer; say so on the same line
-      // as the row count rather than letting it read as the complete set.
-      if (h("X-NLS-Truncated") === "1") {
-        bits.push(`⚠ capped — ${fmtInt(+h("X-NLS-Candidates"))} matched`);
-      }
-      if (h("X-NLS-Score-Kind") === "bounded_approx") {
-        bits.push(`scores ±${h("X-NLS-Score-Error-Bound")}`);
-      }
-      note.textContent = `${tag}: ` + bits.join(" · ");
+      const bits = [`${fmtInt(ex.num_rows)} rows`, `corpus v${body.corpus_version}`];
+      if (ex.segment_set_uuid) bits.push(`segment set ${ex.segment_set_uuid}`);
+      note.textContent = `${e.tag}: ` + bits.join(" · ");
     }
-    showToast(`Exported ${done} tag(s) from the full corpus`);
-    // Publish-then-refresh, so the row other people will see is visible to the
-    // person who just made it -- an export that only exists in one browser's
-    // downloads folder is the thing this list is meant to prevent.
+    showToast(`Exported ${done} tag(s)`);
     loadScanJobs(true);
   } catch (err) {
     note.textContent = "Export failed: " + err.message;
   } finally { btn.disabled = false; }
 }
-
-
 /* ===================== recent exports ===================== */
-function _scanStatusClass(st) { const t = (st || "").toUpperCase(); if (/SUCCEEDED|COMPLETED/.test(t)) return "succeeded"; if (/FAILED|STOPPED/.test(t)) return "failed"; return "queued"; }
+function _scanStatusClass(st) { if (st === "ready") return "succeeded"; if (st === "error") return "failed"; return "queued"; }
 let _scansRepollTimer = null;
 async function loadScanJobs(live) {
   clearTimeout(_scansRepollTimer);
   const body = $("scansBody");
-  if (body && !(state.scanJobs && state.scanJobs.length)) {
-    body.innerHTML = `<tr><td colspan="8" style="color:var(--muted-2)">Loading recent exports…</td></tr>`;
-  }
-  // The list is a pure DB read server-side (never blocks on Lilypad/DORA/OCI); live=1
-  // (Reload) forces the server's background refresher to kick. The timeout is a belt --
-  // if anything is ever slow, the panel shows an error instead of an endless spinner.
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20000);
-  let refreshing = false;
+  const tags = (state.selected.size ? [...state.selected].map((i) => state.savedRows[i]) : (state.savedRows || []).slice(0, 25))
+    .filter(Boolean).map((e) => e.tag);
+  if (!tags.length) { body.innerHTML = `<tr><td colspan="7" style="color:var(--muted-2)">No exports yet — save a search and export it.</td></tr>`; return; }
+  if (!(state.scanJobs && state.scanJobs.length)) body.innerHTML = `<tr><td colspan="7" style="color:var(--muted-2)">Loading recent exports…</td></tr>`;
   try {
-    const r = await apiFetch("/api/scans?limit=100" + (live ? "&live=1" : ""), { signal: ctrl.signal });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const d = await r.json();
-    state.scanJobs = d.jobs || [];
-    refreshing = !!d.refreshing;
+    const recs = await Promise.all(tags.map((t) => apiFetch(`/api/v1/tags/${encodeURIComponent(t)}`).then((r) => (r.ok ? r.json() : null))));
+    state.scanJobs = recs.filter(Boolean).flatMap((rec) => (rec.exports || []).map((x) => ({ ...x, tag: rec.tag })));
+    state.scanJobs.sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
   } catch (e) {
-    console.error("loadScanJobs failed", e);
-    const msg = e.name === "AbortError" ? "timed out" : e.message;
-    if (body) body.innerHTML = `<tr><td colspan="8" style="color:var(--neg)">Failed to load recent exports: ${escapeHtml(msg)}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="7" style="color:var(--neg)">Failed to load recent exports: ${escapeHtml(e.message)}</td></tr>`;
     return;
-  } finally { clearTimeout(timer); }
-  renderScans();
-  // Converge to live truth: while the server is refreshing rows in the background (or
-  // jobs are still in flight), re-poll the cheap list until everything is settled.
-  const active = (state.scanJobs || []).some((j) => !/SUCCEEDED|COMPLETED|FAILED|ABORTED/.test((j.status || "").toUpperCase()));
-  if ((refreshing || active) && $("page-saved").classList.contains("active")) {
-    _scansRepollTimer = setTimeout(() => loadScanJobs(false), 7000);
   }
+  renderScans();
+  const active = state.scanJobs.some((j) => j.status === "running" || j.status === "pending");
+  if (active && $("page-saved").classList.contains("active")) _scansRepollTimer = setTimeout(() => loadScanJobs(false), 7000);
 }
 function renderScans() {
   try { _renderScans(); }
@@ -1327,75 +1240,31 @@ function renderScans() {
 function _renderScans() {
   const jobs = state.scanJobs || [];
   $("scansBody").innerHTML = jobs.length ? jobs.map((j) => {
-    const id = j.console_url ? `<a class="scan-name" href="${j.console_url}" target="_blank" rel="noopener">${escapeHtml(j.execution_id)}</a>` : `<span class="scan-name">${escapeHtml(j.execution_id)}</span>`;
-    const topK = j.filters && j.filters.top_k;
-    // Top-K mode ranks within the scope and IGNORES the per-tag thresholds, so don't
-    // print "@tau" for those scans -- show a top-K=N badge instead (else it reads as a
-    // threshold scan). Threshold scans keep the per-tag "@tau" suffix.
-    const tagList = (j.tags || []).map((t) => escapeHtml(t) + (!topK && j.thresholds && j.thresholds[t] != null ? ` @${j.thresholds[t]}` : "")).join(", ");
-    const modeBadge = topK ? `<span class="scan-mode-topk" title="Top-K ranking within the downsampled scope (per-tag thresholds ignored)">top-K=${topK}</span> ` : "";
-    // In-app exports and offline scans share this list, but a reader should not
-    // have to guess which produced a row: an app export is already complete and
-    // has no console to open, and its artifact is a parquet, not a segments.lance.
-    const srcBadge = j.source === "app"
-      ? `<span class="scan-mode-topk" title="Exported in-app from the full corpus — no offline job">in-app</span> `
-      : "";
-    const truncNote = j.counts && j.counts.truncated
-      ? `<div class="ct-sub" style="color:var(--neg)">⚠ capped — ${(j.counts.candidates || 0).toLocaleString()} matched</div>`
-      : "";
-    const filt = _fmtScanFilters(j.filters);
-    // An in-app export writes a parquet under the export prefix, which
-    // /api/export_file can presign -- so offer the artifact as a download, not
-    // just a path to copy. A Lilypad scan's segments.lance is a directory and
-    // has no single-object download, so it stays copy-only.
-    const isParquet = /\.parquet$/i.test(j.lance_uri || "");
-    const dl = isParquet
-      ? `<a class="scan-copy" href="/api/export_file?uri=${encodeURIComponent(j.lance_uri)}" title="Download this parquet">download</a>`
-      : "";
-    // Preview reads the parquet's first row group server-side, so it works for
-    // an export of any size. A Lilypad segments.lance is a directory, not a
-    // single object, so it gets no preview for the same reason it gets no download.
-    const pv = isParquet
-      ? `<button class="scan-copy" data-preview="${escapeHtml(j.lance_uri)}" title="Show the first rows of this export">preview</button>`
-      : "";
-    // Data Explorer: the registered set, or why there isn't one. "pending" only
-    // appears for a row that asked for registration and hasn't reported back.
-    let dx = `<span class="scan-dx none">—</span>`;
-    if (j.segset_label) dx = `<span class="scan-dx">${escapeHtml(j.segset_label)}</span>`;
-    else if (j.register_segset) dx = `<span class="scan-dx none">pending…</span>`;
-    const out = j.lance_uri
-      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.lance_uri)}">${escapeHtml(_uriShort(j.lance_uri))}</span>`
-        + `<button class="scan-copy" data-uri="${escapeHtml(j.lance_uri)}" title="Copy full path">copy</button>${dl}${pv}</div>`
-      : "—";
+    const p = j.params || {};
+    const what = [p.interval ? "intervals" : "clips", p.segment_mode ? "1 per segment" : "", p.k ? `top-${p.k}` : "", _fmtScanFilters(p)]
+      .filter((x) => x && x !== "—").join(" · ");
+    const out = j.uri
+      ? `<div class="scan-output"><span class="scan-uri" title="${escapeHtml(j.uri)}">${escapeHtml(_uriShort(j.uri))}</span>`
+        + `<button class="scan-copy" data-uri="${escapeHtml(j.uri)}" title="Copy full path">copy</button>`
+        + (j.download_url ? `<a class="scan-copy" href="${escapeHtml(j.download_url)}" target="_blank" rel="noopener">download</a>` : "") + `</div>`
+      : (j.error ? `<span style="color:var(--neg)">${escapeHtml(j.error)}</span>` : "—");
+    const dx = j.segment_set_uuid ? `<span class="scan-dx">${escapeHtml(j.segment_set_uuid)}</span>` : `<span class="scan-dx none">—</span>`;
     return `<tr>
       <td class="scan-time">${escapeHtml(j.created_at || "")}</td>
-      <td>${srcBadge}${id}</td>
-      <td class="scan-tags">${(j.tags || []).length} tag(s): ${modeBadge}${tagList}</td>
-      <td class="scan-filters">${escapeHtml(filt)}</td>
+      <td><span class="tag-pill">${escapeHtml(j.tag)}</span> v${j.version} · ${escapeHtml(j.project)}</td>
+      <td class="scan-filters">${escapeHtml(what)}</td>
       <td><span class="status-pill ${_scanStatusClass(j.status)}">${escapeHtml(j.status || "—")}</span></td>
-      <td class="scan-counts">${_fmtScanCounts(j.counts, j.status)}${truncNote}</td>
+      <td class="scan-counts">${j.num_rows != null ? fmtInt(j.num_rows) : "—"}</td>
       <td>${out}</td>
       <td>${dx}</td></tr>`;
-  }).join("") : `<tr><td colspan="8" style="color:var(--muted-2)">No exports or scans yet.</td></tr>`;
+  }).join("") : `<tr><td colspan="7" style="color:var(--muted-2)">No exports yet.</td></tr>`;
 }
 // Result counts (total segments + per-tag breakdown), mirroring the Data Explorer view.
-function _fmtScanCounts(c, status) {
-  if (!c) return /SUCCEEDED|COMPLETED/.test((status || "").toUpperCase()) ? `<span class="scan-dx none">…</span>` : `<span class="scan-dx none">—</span>`;
-  const total = c.num_segments != null ? c.num_segments.toLocaleString() : "?";
-  const unit = c.per_tag_is_segments ? "segments" : "intervals";
-  const perTag = c.per_tag || {};
-  const rows = Object.keys(perTag).sort((a, b) => (perTag[b] || 0) - (perTag[a] || 0))
-    .map((t) => `<div class="ct-row"><span class="ct-tag">${escapeHtml(t)}</span><span class="ct-n">${(perTag[t] || 0).toLocaleString()}</span></div>`).join("");
-  const clips = c.num_clips_scanned != null ? ` <span class="ct-sub">of ${c.num_clips_scanned.toLocaleString()} clips</span>` : "";
-  return `<div class="scan-counts-box"><div class="ct-total"><b>${total}</b> segments${clips}</div>`
-    + (rows ? `<div class="ct-list" title="${unit} per tag">${rows}</div>` : "") + `</div>`;
-}
 // Copy an output path, or open a preview of it (delegated so both survive
 // re-renders of the scans table).
 document.addEventListener("click", (e) => {
   const btn = e.target.closest(".scan-copy");
   if (!btn) return;
-  if (btn.dataset.preview) { openPreview(btn.dataset.preview); return; }
   const uri = btn.dataset.uri || "";
   if (!uri) return;
   navigator.clipboard.writeText(uri).then(
@@ -1404,60 +1273,12 @@ document.addEventListener("click", (e) => {
   );
 });
 
-/* ===================== export preview ===================== */
-const PREVIEW_ROWS = 25;
-// Columns worth right-aligning: scores and counts read as columns of numbers,
-// ids and uris do not.
-const _PREVIEW_NUM = /^(rank|score|peak_score|mean_score|duration_s|num_chunks|.*_unix|.*_ns)$/;
 
-function closePreview() {
-  $("previewModal").classList.remove("open");
-  $("overlay").classList.remove("open");
-}
-
-async function openPreview(uri) {
-  const body = $("previewBody"), note = $("previewNote");
-  $("previewUri").textContent = uri;
-  $("previewTitle").textContent = "Export preview";
-  body.innerHTML = `<div class="preview-note">Reading the export…</div>`;
-  note.textContent = "";
-  $("overlay").classList.add("open");
-  $("previewModal").classList.add("open");
-  try {
-    const r = await apiFetch(`/api/export_preview?uri=${encodeURIComponent(uri)}&limit=${PREVIEW_ROWS}`);
-    if (!r.ok) {
-      let d; try { d = (await r.json()).detail; } catch (_e) { }
-      throw new Error(d || `HTTP ${r.status}`);
-    }
-    const d = await r.json();
-    if (!d.rows.length) { body.innerHTML = `<div class="preview-note">This export has no rows.</div>`; return; }
-    const head = d.columns.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
-    const rows = d.rows.map((row) => {
-      const tds = d.columns.map((c) => {
-        const v = row[c];
-        const cls = _PREVIEW_NUM.test(c) ? ' class="num"' : "";
-        // The clip is the point of the row -- link it rather than printing a
-        // path nobody can act on.
-        if (c === "source_media_uri" && v) {
-          return `<td><a href="/api/video?uri=${encodeURIComponent(v)}" target="_blank" rel="noopener" title="${escapeHtml(v)}">▶ clip</a></td>`;
-        }
-        return `<td${cls} title="${escapeHtml(String(v ?? ""))}">${escapeHtml(String(v ?? ""))}</td>`;
-      }).join("");
-      return `<tr>${tds}</tr>`;
-    }).join("");
-    body.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
-    note.innerHTML = `Showing ${d.num_rows} of ${fmtInt(d.total_rows)} rows · `
-      + `<a href="/api/export_file?uri=${encodeURIComponent(uri)}">download the full parquet</a>`;
-  } catch (err) {
-    body.innerHTML = `<div class="preview-note" style="color:var(--neg)">Could not preview this export: ${escapeHtml(err.message)}</div>`;
-  }
-}
 function _fmtScanFilters(f) {
   if (!f) return "—"; const p = [];
   if (f.from_date || f.to_date) p.push(`${f.from_date || "…"}→${f.to_date || "latest"}`);
-  if (f.segment_set_name || f.segment_set_uuid) p.push("seg: " + (f.segment_set_name || f.segment_set_uuid));
+  if (f.segment_set_uuid) p.push("seg: " + f.segment_set_uuid);
   if (f.vehicle) p.push("veh: " + f.vehicle);
-  if (f.drive_id) p.push("drive: " + f.drive_id);
   if (f.filter_lance_uri) p.push("lance: " + _uriShort(f.filter_lance_uri));
   return p.join(" · ") || "—";
 }
