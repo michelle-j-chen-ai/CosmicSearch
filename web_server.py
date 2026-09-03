@@ -148,6 +148,9 @@ def _warm_engine() -> None:
         _state["model_ready"] = True  # endpoints unblock here
         LOGGER.info("model ready")
         db.init_schema()  # best-effort; logs + continues if exp-db is unreachable
+        import full_corpus
+
+        db.backfill_catalog(project=deployment.DEFAULT, model=full_corpus.CORPUS_MODEL)
         # Start every enabled project's corpus load here rather than waiting
         # for someone to search: the read and decode take minutes, and paying
         # that on a user's first query reads as a hang. Each runs on its own
