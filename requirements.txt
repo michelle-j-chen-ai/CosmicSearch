@@ -28,10 +28,9 @@ SQLAlchemy==2.0.51
 cloud-sql-python-connector[pg8000]==1.21.0
 pg8000==1.31.5
 # Runtime deps for the VENDORED DORA proto stubs (adp/, COPYed in the
-# Dockerfile). Mostly grpc + protobuf + the google.api annotations, but
-# dora_client imports adp.public.strada.dora for the auth interceptor, and that
-# package reaches `retrying` (pinned below). The rest of data-explorer-py's
-# extras (trino/matplotlib/simian) stay out.
+# Dockerfile). The stubs need only grpc + protobuf + the google.api annotations;
+# the heavy data-explorer-py extras (requests/retrying/trino/matplotlib/simian)
+# are NOT needed because dora_client avoids importing adp.public.strada.dora.
 grpcio==1.83.0
 protobuf==7.35.1
 googleapis-common-protos==1.75.0
@@ -47,11 +46,6 @@ msgspec==0.21.1
 aistore==1.25.0
 psutil==7.2.2
 click==8.4.2
-# Reached through adp.public.strada.dora, which dora_client imports for the
-# auth interceptor. Nothing else pinned here pulls it in, so it needs naming:
-# without it DORA prewarm fails with ModuleNotFoundError and segment-set search
-# is dead, which is how a staging deploy found this.
-retrying==1.4.2
 rich==15.0.0
 tenacity==9.1.4
 tabulate==0.10.0
