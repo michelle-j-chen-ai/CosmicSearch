@@ -970,7 +970,13 @@ def _full_refresh_worker(project: str | None = None) -> None:
 # NLS_CORPUS_REFRESH_UTC is "HH:MM" in UTC; empty disables the schedule. The
 # default is 10:00 UTC (~3am US Pacific), when a few minutes without
 # full-corpus search costs least.
+# "off" (or empty) disables it. Empty is unusable in practice: the NLS_* vars
+# are Secret Manager values so they survive a deploy, and Secret Manager will
+# not store an empty payload -- so there has to be a word that means off.
+_REFRESH_OFF = {"", "off", "none", "never", "disabled"}
 _REFRESH_AT = os.getenv("NLS_CORPUS_REFRESH_UTC", "10:00").strip()
+if _REFRESH_AT.lower() in _REFRESH_OFF:
+    _REFRESH_AT = ""
 
 # Spread across instances so they do not all drop their corpus in the same
 # window: a refresh takes full-corpus search offline on the instance running it,

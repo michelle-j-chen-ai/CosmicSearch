@@ -147,3 +147,27 @@ def _no_reload(monkeypatch):
     def _boom(project=None):
         raise AssertionError("reloaded when it should not have")
     monkeypatch.setattr(ws, "_full_refresh_worker", _boom)
+
+
+def test_the_daily_refresh_can_be_switched_off_by_name():
+    """The schedule is disabled by an empty value, but the NLS_* vars are Secret
+    Manager payloads so they survive a deploy -- and Secret Manager will not
+    store an empty one. Without a word that means off there is no way to turn
+    the schedule off durably."""
+    import importlib
+    import os
+
+    import web_server
+
+    try:
+        for value in ("off", "OFF", " never ", "none", "disabled", ""):
+            os.environ["NLS_CORPUS_REFRESH_UTC"] = value
+            importlib.reload(web_server)
+            assert web_server._REFRESH_AT == "", f"{value!r} should disable"
+        for value, expected in (("10:00", "10:00"), (" 09:30 ", "09:30")):
+            os.environ["NLS_CORPUS_REFRESH_UTC"] = value
+            importlib.reload(web_server)
+            assert web_server._REFRESH_AT == expected
+    finally:
+        os.environ.pop("NLS_CORPUS_REFRESH_UTC", None)
+        importlib.reload(web_server)
