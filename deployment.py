@@ -34,6 +34,7 @@ class Project:
     corpus_table_uri: str
     mp4_prefix: str
     dora_hostname: str
+    atlas_url: str
 
 
 # Built-in values. None means "the shared default": the neuron clip prefix is
@@ -47,6 +48,7 @@ _BUILTIN: dict[str, dict] = {
         ),
         "mp4_prefix": None,
         "dora_hostname": None,
+        "atlas_url": "https://vlm-embedding-atlas.experimental.apps.applied.dev/",
     },
     "frontier": {
         "label": "FRONTIER",
@@ -55,6 +57,7 @@ _BUILTIN: dict[str, dict] = {
         ),
         "mp4_prefix": "s3://frontier-perception-datasets/sibogeng/vlm/chunks_mp4_full/",
         "dora_hostname": "grpc.frontier.prod.applied.dev",
+        "atlas_url": "https://vlm-embed-atlas-trucking.experimental.apps.applied.dev/",
     },
 }
 
@@ -89,6 +92,9 @@ def get(name: str | None) -> Project:
             or built["dora_hostname"]
             or os.environ.get("URSA_SDK_GRPC_HOSTNAME", "").strip()
         ),
+        # Each fleet's atlas is its own service: two independent UMAP fits give
+        # incomparable coordinates, so there is no one map holding both corpora.
+        atlas_url=_override(key, "ATLAS_URL") or built["atlas_url"],
     )
 
 

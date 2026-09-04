@@ -88,9 +88,20 @@ async function loadPlatform() {
     sel.disabled = names.length < 2;
     // Every view is scoped to one corpus, so switching restarts the app on the other.
     sel.onchange = () => { localStorage.setItem("nls.project", sel.value); location.reload(); };
+    _setExploreLink(h);
   } catch (e) { /* cosmetic */ }
   $("scansSection").style.display = "block";
   renderExportPanel();
+}
+
+// The atlas is a separate service per fleet, so the map this instance should
+// open comes from the registry with the rest of the project's config.
+function _setExploreLink(h) {
+  const link = $("navExplore");
+  if (!link) return;
+  const url = ((h && h.projects && h.projects[state.project]) || {}).atlas_url || "";
+  link.hidden = !url;
+  if (url) link.href = url;
 }
 
 // /api/v1/health is the one status call: which projects exist, whether this
