@@ -160,7 +160,8 @@ Offline core test (no model, no network): `python smoke_test.py`.
 ## Deploy (Apps Platform V2)
 
 ```bash
-apps-platform app deploy        # builds Dockerfile, deploys to Cloud Run
+./deploy.sh                        # cars
+./deploy.sh project-trucking.toml  # trucks
 
 # AWS creds for OCI access, as secrets:
 apps-platform app secret set AWS_ACCESS_KEY_ID <key>    --service vlm-nls-search

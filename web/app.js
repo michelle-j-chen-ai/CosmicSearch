@@ -62,7 +62,32 @@ function apiFetch(url, opts) {
       }
     } catch (e) { /* not a JSON body */ }
   }
-  return fetch(url, opts);
+  return _fetchRetrying503(url, opts);
+}
+
+// A 503 from this app means one thing: the instance answering has no corpus
+// resident yet. Cloud Run caps a startup probe at 240s and this corpus takes
+// ~15 minutes to load, so an instance CANNOT refuse traffic while it warms --
+// it can only say "not yet". With more than one instance behind the service, a
+// retry is likely to land on one that is loaded, so retrying is the difference
+// between a user seeing an error and seeing a short pause.
+//
+// Only 503: the server has explicitly stated it did no work, so replaying a
+// POST cannot double-create anything.
+const _RETRY_503 = 3;
+
+async function _fetchRetrying503(url, opts) {
+  let response = await fetch(url, opts);
+  for (let attempt = 0; attempt < _RETRY_503 && response.status === 503; attempt++) {
+    const after = Number(response.headers.get("Retry-After"));
+    // Retry-After is the server's estimate of a full load; waiting it out would
+    // stall the UI for minutes. Back off enough to reach a different instance.
+    const waitMs = Math.min(Number.isFinite(after) && after > 0 ? after * 1000 : 0, 4000)
+                   || 1000 * (attempt + 1);
+    await new Promise((r) => setTimeout(r, waitMs));
+    response = await fetch(url, opts);
+  }
+  return response;
 }
 
 /* ===================== bootstrap ===================== */

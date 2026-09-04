@@ -30,7 +30,10 @@ Core modules:
 
 - Run locally: `uvicorn web_server:app` (see `entrypoint.sh`)
 - Offline core test (no model/network): `python smoke_test.py`
-- Deploy: `apps-platform app deploy` (builds `Dockerfile`, deploys to Cloud Run)
+- Deploy: `./deploy.sh` (cars) or `./deploy.sh project-trucking.toml` (trucks).
+  Wraps `apps-platform app deploy` so the new revision warms before it takes
+  traffic; a bare `apps-platform app deploy` routes to it immediately and costs
+  ~15 minutes of 503s while the corpus loads.
 
 Runtime config is env-driven (`NLS_*`, `AWS_*`); see README "Configuration".
 There is no Makefile/pyproject test runner — `smoke_test.py` is a plain

@@ -34,9 +34,13 @@ enable_slack = false
   cpu = "8"
   # Query latency is ~100ms, but the cold-start model+corpus load is minutes.
   timeout = "600s"
-  # Keep one instance warm so the resident model and matrix are not reloaded.
-  min_instances = 1
-  max_instances = 2
+  # Two, not one. Cloud Run replaces instances on its own -- host patching and
+  # rebalancing, seen roughly daily -- and its startup probe is capped at 240s
+  # while this corpus takes ~15 minutes to load, so a warming instance cannot
+  # refuse traffic. One instance therefore means every replacement is a total
+  # outage; two means a loaded instance is still there to answer the retry.
+  min_instances = 2
+  max_instances = 3
   # NOTE: startup CPU boost and CPU-always-allocated (no request-time throttling)
   # are NOT expressible in this schema, but both are required for responsiveness.
   # They are set out-of-band on the service and must be re-applied after any
