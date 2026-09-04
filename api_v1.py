@@ -778,7 +778,8 @@ def health(response: Response) -> dict:
             corpus, status, error, started = slot["corpus"], slot["status"], slot["error"], slot["started"]
         info: dict[str, Any] = {"ready": corpus is not None, "status": status,
                                 "corpus_table_uri": spec.corpus_table_uri,
-                                "clip_prefix": spec.mp4_prefix, "input_prefixes": input_prefixes(spec)}
+                                "clip_prefix": spec.mp4_prefix, "input_prefixes": input_prefixes(spec),
+                                "atlas_url": spec.atlas_url}
         if corpus is not None:
             any_ready = True
             lo, hi = corpus.time_span()
