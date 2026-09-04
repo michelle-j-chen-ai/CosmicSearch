@@ -200,6 +200,7 @@ function wireEvents() {
   $("cutoffSeg").onclick = (e) => { const b = e.target.closest("button[data-mode]"); if (b) setCutoffMode(b.dataset.mode); };
   $("sampleSeg").onclick = (e) => { const b = e.target.closest("button[data-mode]"); if (b) setSampleMode(b.dataset.mode); };
   $("exportBtn").onclick = doExport;
+  $("previewBtn").onclick = previewSelected;
 }
 
 /* ===================== page + settings ===================== */
@@ -1151,11 +1152,72 @@ function renderExportPanel() {
   }
   const btn = $("exportBtn");
   btn.disabled = n === 0;
+  const pv = $("previewBtn");
+  if (pv) pv.disabled = n === 0;
+  // The panel describes a selection; keeping it after that changes would show
+  // clips for tags no longer selected.
+  if (n === 0 && $("previewPanel")) { $("previewPanel").hidden = true; $("previewPanel").innerHTML = ""; }
   btn.textContent = "⬇ Export"; btn.className = "btn-export instant"; $("exportNote").textContent = "Downloads a CSV immediately.";
   $("jobStatus").classList.remove("show");
   renderCutoffField();
   renderSampleMode();
 }
+// Preview: what would this export contain? Each selected tag's top clips, side
+// by side, before committing to a scan that writes an artifact to S3.
+//
+// Deliberately on /ui/search rather than a route of its own. The tag's stored
+// vector already resolves there, so a preview is an ordinary ranked page with a
+// small k -- a new endpoint would be a second way to run the same search, and
+// those drift.
+const PREVIEW_K = 6;
+
+async function previewSelected() {
+  const rows = [...state.selected].map((i) => state.savedRows[i]).filter(Boolean);
+  const panel = $("previewPanel");
+  if (!rows.length) { panel.hidden = true; panel.innerHTML = ""; return; }
+  const btn = $("previewBtn");
+  btn.disabled = true;
+  panel.hidden = false;
+  panel.innerHTML = `<div class="preview-head">Previewing ${rows.length} search${rows.length === 1 ? "" : "es"}…</div>`;
+  const f = _exportFilters();
+  const blocks = [];
+  for (const e of rows) {
+    let data = null, err = null;
+    try {
+      const body = { tag: e.tag, k: PREVIEW_K, output: "hits", page: 0, limit: PREVIEW_K };
+      if (e.version != null) body.version = e.version;
+      for (const [k, v] of Object.entries(f)) if (v) body[k] = v;
+      const r = await apiFetch("/ui/search", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || ("HTTP " + r.status)); }
+      data = await r.json();
+    } catch (ex) { err = ex.message; }
+    blocks.push(_previewBlock(e, data, err));
+    panel.innerHTML = `<div class="preview-head">Top ${PREVIEW_K} per search — previews are not exports; nothing is written.</div>` + blocks.join("");
+  }
+  btn.disabled = false;
+}
+
+function _previewBlock(entry, data, err) {
+  const title = `<b>${escapeHtml(entry.tag)}</b>`;
+  if (err) return `<div class="preview-block"><div class="preview-tag">${title} <span class="preview-err">${escapeHtml(err)}</span></div></div>`;
+  const hits = (data && data.hits) || [];
+  if (!hits.length) return `<div class="preview-block"><div class="preview-tag">${title} <span class="preview-sub">no matches with these filters</span></div></div>`;
+  // `total` is what the export would contain; the cards are only the head of it.
+  const total = data && data.total != null ? `${fmtInt(data.total)} matched` : "";
+  const cards = hits.map((h) => `<div class="preview-card">
+      <span class="score-badge" style="background:${scoreColor(h.score)}">${h.score.toFixed(3)}</span>
+      <video controls preload="none" playsinline src="/ui/video?uri=${encodeURIComponent(h.source_media_uri || "")}#t=0.1"></video>
+      <div class="preview-id">${escapeHtml(h.segment_id || h.chunk_id)}</div>
+    </div>`).join("");
+  return `<div class="preview-block">
+      <div class="preview-tag">${title} <span class="preview-sub">${total}</span></div>
+      <div class="preview-row">${cards}</div>
+    </div>`;
+}
+
 function _exportFilters() {
   return {
     from_date: $("ex-dateFrom").value || null, to_date: $("ex-dateTo").value || null,

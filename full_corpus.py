@@ -330,6 +330,32 @@ def _dictionary_codes(column: object) -> tuple[np.ndarray, list]:
     return codes, encoded.dictionary.to_pylist()
 
 
+# A query is one direction or several. Text, an image, and a mean-pooled window
+# each give one; `pooling="individual"` keeps a clip's own chunks apart, and a
+# corpus row then scores as its BEST match against any of them (MaxSim). Mean
+# pooling averages a 30s manoeuvre together with the ordinary driving around it
+# and can match neither; a max over the chunks answers "did this occur at all".
+MAX_QUERY_DIRECTIONS = 64
+
+
+def as_directions(query: "np.ndarray") -> "np.ndarray":
+    """Query directions as a unit-norm (N, dim) matrix. 1-D input gives N=1."""
+    q = np.asarray(query, dtype=np.float32)
+    if q.ndim == 1:
+        q = q.reshape(1, -1)
+    if q.ndim != 2 or q.shape[0] == 0:
+        raise ValueError("query must be a vector, or a non-empty matrix of vectors")
+    if q.shape[0] > MAX_QUERY_DIRECTIONS:
+        raise ValueError(
+            f"query has {q.shape[0]} directions; at most {MAX_QUERY_DIRECTIONS}. "
+            "Each one costs a full corpus sweep -- narrow the window or mean-pool."
+        )
+    norms = np.linalg.norm(q, axis=1)
+    if not np.all(norms > 0):
+        raise ValueError("query vector is all zeros")
+    return (q / norms[:, None]).astype(np.float32)
+
+
 class FullCorpus:
     """The whole corpus, resident as an int8 screen, searchable top-k."""
 
@@ -426,10 +452,24 @@ class FullCorpus:
         return w, float(self.eps * np.linalg.norm(q_pca))
 
     def score(self, query: np.ndarray) -> tuple[np.ndarray, float]:
-        """Screening score for every row. One sweep of the resident matrix."""
-        w, err = self._weights(query)
+        """Screening score for every row: one sweep of the resident matrix per
+        query direction, reduced by max so each row keeps its best-matching one.
+
+        The error bound is the largest of the per-direction bounds -- which
+        direction wins varies by row, so only the worst case bounds every entry.
+        """
+        directions = as_directions(query)
+        w, err = self._weights(directions[0])
         out = np.empty(self.num_rows, dtype=np.float32)
         _score_kernel()(self.corpus_i8, w, out)
+        part = None
+        for q in directions[1:]:
+            w, e = self._weights(q)
+            if part is None:
+                part = np.empty(self.num_rows, dtype=np.float32)
+            _score_kernel()(self.corpus_i8, w, part)
+            np.maximum(out, part, out=out)
+            err = max(err, e)
         return out, err
 
     def warm(self) -> None:
@@ -778,11 +818,7 @@ class FullCorpus:
         rows = np.asarray(rows, dtype=np.int64)
         if rows.size == 0:
             return np.empty(0, dtype=np.float64)
-        q = np.asarray(query, dtype=np.float32).reshape(-1)
-        norm = float(np.linalg.norm(q))
-        if norm == 0.0:
-            raise ValueError("query vector is all zeros")
-        q = q / norm
+        directions = as_directions(query)
         col = vector_full_column(CORPUS_MODEL)
         # take() addresses by canonical position, so the fetch must be ordered;
         # results are scattered back to the caller's order at the end.
@@ -802,9 +838,9 @@ class FullCorpus:
                 zero_copy_only=False
             )
             mat = np.asarray(flat, dtype=np.float32).reshape(part.size, -1)
-            out[order[at : at + _EXACT_CHUNK_ROWS]] = np.einsum(
-                "ij,j->i", mat, q, dtype=np.float64
-            )
+            out[order[at : at + _EXACT_CHUNK_ROWS]] = (
+                mat @ directions.T
+            ).max(axis=1).astype(np.float64)
         return out
 
     def window_rows(
@@ -864,11 +900,9 @@ class FullCorpus:
         rows = np.asarray(rows, dtype=np.int64)
         if rows.size == 0:
             return np.empty(0, dtype=np.float64)
-        q = np.asarray(query, dtype=np.float32).reshape(-1)
-        norm = float(np.linalg.norm(q))
-        if norm == 0.0:
-            raise ValueError("query vector is all zeros")
-        q_pca = (self.pca @ (q / norm)).astype(np.float32)
+        # (N, pca_dim): a band decision has to use the same best-of-N the screen
+        # used, or a row admitted on one direction is judged on another.
+        q_pca = (as_directions(query) @ self.pca.T).astype(np.float32)
         col = vector_fp_column(CORPUS_MODEL)
         order = np.argsort(rows, kind="stable")
         ordered = rows[order]
@@ -878,9 +912,9 @@ class FullCorpus:
             tbl = self.dataset.take(part, columns=[col])
             flat = tbl.column(col).combine_chunks().values.to_numpy(zero_copy_only=False)
             mat = np.asarray(flat, dtype=np.float32).reshape(part.size, -1)
-            out[order[at : at + _EXACT_CHUNK_ROWS]] = np.einsum(
-                "ij,j->i", mat, q_pca, dtype=np.float64
-            )
+            out[order[at : at + _EXACT_CHUNK_ROWS]] = (mat @ q_pca.T).max(
+                axis=1
+            ).astype(np.float64)
         return out
 
     def probe_vector_fp(self, sample: int = 64) -> dict:
@@ -1159,13 +1193,9 @@ class FullCorpus:
         idx = np.asarray(sorted(set(int(r) for r in rows)), dtype=np.int64)
         if idx.size == 0:
             return {}
-        q = np.asarray(query, dtype=np.float32).reshape(-1)
-        if q.shape[0] != self.dim:
-            raise ValueError(f"query must be {self.dim}-d, got {q.shape[0]}")
-        norm = float(np.linalg.norm(q))
-        if norm == 0.0:
-            raise ValueError("query vector is all zeros")
-        q = q / norm
+        directions = as_directions(query)
+        if directions.shape[1] != self.dim:
+            raise ValueError(f"query must be {self.dim}-d, got {directions.shape[1]}")
 
         col = vector_full_column(CORPUS_MODEL)
         tbl = self.dataset.take(idx, columns=[col, "chunk_id"])
@@ -1180,7 +1210,7 @@ class FullCorpus:
                 )
         flat = tbl.column(col).combine_chunks().values.to_numpy(zero_copy_only=False)
         mat = np.asarray(flat, dtype=np.float32).reshape(idx.size, -1)
-        scores = np.einsum("ij,j->i", mat, q, dtype=np.float64)
+        scores = (mat @ directions.T).max(axis=1).astype(np.float64)
         return {int(r): float(sc) for r, sc in zip(idx, scores)}
 
     def _hit(self, i: int, rank: int, score: float, err: float) -> Hit:

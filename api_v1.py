@@ -206,13 +206,18 @@ def vector_for_input(inp: InputType, project: deployment.Project, corpus) -> np.
     if inp.type == "video":
         if inp.uri.strip():
             raise _error(422, "bad_input", "video by uri is not supported; give run_uuid or segment_id")
-        if inp.pooling != "mean":
-            raise _error(422, "bad_input", "a tag holds one vector, so pooling must be mean")
+        if inp.pooling not in ("mean", "individual"):
+            raise _error(422, "bad_input", "pooling must be mean or individual")
         if not (inp.run_uuid.strip() or inp.segment_id.strip()):
             raise _error(422, "bad_input", "video input needs run_uuid or segment_id")
         win = ws.WindowRef(run_uuid=inp.run_uuid, segment_id=inp.segment_id,
                            start_ns=inp.start_ns, end_ns=inp.end_ns)
-        return ws._window_vector(win, corpus)
+        try:
+            return ws._window_vector(win, corpus, inp.pooling)
+        except HTTPException as exc:
+            if exc.status_code == 422:
+                raise _error(422, "too_many_directions", str(exc.detail))
+            raise
     raise _error(422, "bad_input", "input.type must be text, image or video")
 
 
@@ -231,6 +236,20 @@ def _read_object(uri: str, max_bytes: int) -> bytes:
     if len(data) > max_bytes:
         raise _error(413, "too_large", f"image exceeds {max_bytes} bytes")
     return data
+
+
+def _vector_json(vec, places: int | None = None) -> list:
+    """The stored/echoed form of a query direction.
+
+    A single direction stays a flat list, exactly as every tag written before
+    multi-vector search: `np.asarray` reads both back, so nothing has to know
+    which shape it is looking at. `pooling="individual"` gives a list of lists.
+    """
+    arr = np.asarray(vec, dtype=np.float32)
+    fmt = (lambda x: round(float(x), places)) if places else float
+    if arr.ndim == 1:
+        return [fmt(x) for x in arr]
+    return [[fmt(x) for x in row] for row in arr]
 
 
 def threshold_for(mode: str, value: float | None, vec: np.ndarray, corpus,
@@ -275,13 +294,13 @@ def create_tag(req: CreateTag, request: Request, response: Response) -> dict:
         out = {
             "tag": tag, "version": None, "pinned_version": None, "description": req.description,
             "created_at": None, "created_by": actor(request), "model": corpus.model_id or "black_dwarf",
-            "source": source, "vector": [round(float(x), 6) for x in vec],
+            "source": source, "vector": _vector_json(vec, 6),
             "thresholds": {project.name: {**th, "set_at": None}},
         }
     else:
         try:
             out = catalog.get().create(
-                tag=tag, project=project.name, source=source, vector=[float(x) for x in vec],
+                tag=tag, project=project.name, source=source, vector=_vector_json(vec),
                 model=corpus.model_id or "black_dwarf", threshold=th,
                 description=req.description, created_by=actor(request),
             )
@@ -705,6 +724,14 @@ def _refine(tag: str, ver: dict, proj: deployment.Project, req: UpdateTag, who: 
             raise _unreachable(exc)
         raise
     prev = np.asarray(ver["vector"], dtype=np.float32)
+    if prev.ndim > 1:
+        # Rocchio moves ONE direction toward the positives and away from the
+        # negatives. With several there is no single thing to move, and picking
+        # one silently discards the rest of what the tag matches.
+        raise _error(409, "multi_vector_tag",
+                     f"{tag} v{ver['version']} holds {prev.shape[0]} directions "
+                     "(pooling=individual); marks refine a single-vector tag. "
+                     "Re-create it with pooling=mean to refine from feedback.")
     vec = ws._rocchio(mat[: len(pos)], mat[len(pos):], prev, req.negative_weight, req.anchor_weight)
     with ws.scoring_slot():
         scores, _err = corpus.score(vec)
