@@ -132,6 +132,23 @@ the missing key via `/healthz` instead of crash-looping.
 
 Logs: `gcloud run services logs read vlm-embedding-atlas --region us-west1 --project experimental-apps-v2 --limit 50`
 
+### One service per fleet
+
+Each fleet has its own map, from its own artifact:
+
+| service | config | corpus | artifact |
+|---|---|---|---|
+| `vlm-embedding-atlas` | `project.toml` | neuron | `s3://neuron-prod-data-intelligence-exploratory/michelle/nls_search/black-dwarf/atlas/` |
+| `vlm-embedding-atlas-trucking` | `project-trucking.toml` | frontier | `s3://frontier-perception-datasets/vlm/atlas/` |
+
+Not one service holding both: coordinates from two independent UMAP fits are not
+comparable, so no single map can hold both corpora. A point's position only means
+something relative to the other points on the same map.
+
+Corpus tables name their embedding column per model (`vector_black_dwarf`), while
+the older standalone atlas table calls it `vector` — `--vector-column` selects it,
+and the artifact schema says `vector` either way.
+
 ## Endpoints
 
 | route | returns |

@@ -106,6 +106,7 @@ def sample_rows(
     oversample: float,
     batch_size: int,
     seed: int,
+    vector_column: str = "vector",
 ) -> pa.Table:
     """Uniform row sample, then capped per run_uuid.
 
@@ -127,7 +128,12 @@ def sample_rows(
     for start in range(0, len(indices), batch_size):
         chunk = indices[start : start + batch_size]
         batches.append(
-            dataset.take(chunk.tolist(), columns=METADATA_COLUMNS + ["vector"])
+            dataset.take(
+                chunk.tolist(),
+                # Aliased so the rest of this script, and the artifact schema,
+                # do not depend on what the source table calls its embedding.
+                columns={**{c: c for c in METADATA_COLUMNS}, "vector": vector_column},
+            )
         )
         fetched = min(start + batch_size, len(indices))
         LOGGER.info(
@@ -277,6 +283,9 @@ def main() -> None:
     )
     parser.add_argument("--oversample", type=float, default=2.0)
     parser.add_argument("--take-batch-size", type=int, default=50_000)
+    # Corpus tables name the embedding per model (`vector_black_dwarf`); the
+    # older standalone atlas table calls it `vector`.
+    parser.add_argument("--vector-column", default="vector")
     parser.add_argument("--pca-dim", type=int, default=50)
     parser.add_argument("--umap-neighbors", type=int, default=25)
     parser.add_argument("--umap-min-dist", type=float, default=0.1)
@@ -300,6 +309,7 @@ def main() -> None:
         oversample=args.oversample,
         batch_size=args.take_batch_size,
         seed=args.seed,
+        vector_column=args.vector_column,
     )
 
     vectors = np.stack(table["vector"].to_numpy(zero_copy_only=False)).astype(np.float32)

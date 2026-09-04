@@ -1,0 +1,47 @@
+# Deploy config for the frontier atlas `vlm-embedding-atlas-trucking`.
+#
+# Same image and same code as `vlm-embedding-atlas` (project.toml). The only
+# difference is ATLAS_URI, which points at the artifact precomputed from the
+# frontier corpus rather than the neuron one:
+#
+#   python3 precompute_atlas.py \
+#     --embeddings-uri s3://frontier-perception-datasets/vlm/corpus/video_embeddings.lance \
+#     --output-uri s3://frontier-perception-datasets/vlm/atlas \
+#     --vector-column vector_black_dwarf
+#
+#   apps-platform app deploy -c project-trucking.toml
+#
+# Two services rather than one serving both fleets: coordinates from two
+# independent UMAP fits are not comparable, so there is no single map that can
+# hold both corpora. Each fleet gets its own projection, and a point's position
+# only means something relative to the other points on the same map.
+name = "vlm-embedding-atlas-trucking"
+enable_filestore = false
+enable_gcs_fuse = false
+enable_postgres = false
+enable_mysql = false
+enable_secrets = true
+enable_api_gateway = false
+enable_slack = false
+
+[cloudrun]
+  # The artifact is the same shape as neuron's -- the sample size, not the
+  # corpus size, sets it -- so the resident footprint is the same 2Gi.
+  memory = "2Gi"
+  cpu = "2"
+  timeout = "300s"
+  min_instances = 1
+  max_instances = 2
+  # NOTE: CPU-always-allocated and startup boost are NOT expressible in this
+  # schema but are REQUIRED, and `apps-platform app deploy` resets them. The
+  # atlas loads on a background thread, so with request-time throttling (the
+  # Cloud Run default) the instance is starved the moment startup returns and
+  # the parse never finishes -- the service stays 503 forever with no error.
+  # Re-apply after every apps-platform deploy:
+  #   gcloud run services update vlm-embedding-atlas-trucking --region us-west1 \
+  #     --project experimental-apps-v2 --no-cpu-throttling --cpu-boost
+
+[metadata]
+  owner = "michelle.chen@applied.co"
+  description = "Interactive UMAP atlas of VLM (Cosmos-Embed) video embeddings, frontier fleet"
+  maintainers = ["michelle.chen@applied.co"]
