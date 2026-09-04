@@ -1,4 +1,4 @@
-# Deploy config for the frontier atlas `vlm-embedding-atlas-trucking`.
+# Deploy config for the frontier atlas `vlm-embed-atlas-trucking`.
 #
 # Same image and same code as `vlm-embedding-atlas` (project.toml). The only
 # difference is ATLAS_URI, which points at the artifact precomputed from the
@@ -15,7 +15,7 @@
 # independent UMAP fits are not comparable, so there is no single map that can
 # hold both corpora. Each fleet gets its own projection, and a point's position
 # only means something relative to the other points on the same map.
-name = "vlm-embedding-atlas-trucking"
+name = "vlm-embed-atlas-trucking"
 enable_filestore = false
 enable_gcs_fuse = false
 enable_postgres = false
@@ -38,7 +38,7 @@ enable_slack = false
   # Cloud Run default) the instance is starved the moment startup returns and
   # the parse never finishes -- the service stays 503 forever with no error.
   # Re-apply after every apps-platform deploy:
-  #   gcloud run services update vlm-embedding-atlas-trucking --region us-west1 \
+  #   gcloud run services update vlm-embed-atlas-trucking --region us-west1 \
   #     --project experimental-apps-v2 --no-cpu-throttling --cpu-boost
 
 [metadata]

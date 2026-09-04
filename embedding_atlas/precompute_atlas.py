@@ -36,6 +36,7 @@ import botocore.config
 import lance
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 import umap
@@ -143,6 +144,15 @@ def sample_rows(
             time.perf_counter() - started,
         )
     table = pa.concat_tables(batches)
+
+    # A corpus row exists before it is embedded, so `vector` is nullable and a
+    # null cannot be projected. Dropped before the cap so the trim still lands
+    # on sample_size rather than slightly under it.
+    valid = pc.is_valid(table["vector"])
+    dropped = table.num_rows - pc.sum(valid).as_py()
+    if dropped:
+        LOGGER.info("dropped %d rows with no embedding", dropped)
+        table = table.filter(valid)
 
     keep = _cap_per_run(table["run_uuid"].to_numpy(zero_copy_only=False), per_run_cap)
     # Logged before the trim: afterwards the count is sample_size regardless, so
