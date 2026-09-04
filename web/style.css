@@ -247,6 +247,25 @@ input:checked + .slider-toggle:before{transform:translateX(16px); background:var
 .job-status.show{display:flex;}
 .job-status b{color:var(--warn); font-family:var(--mono);}
 
+/* Preview sits above Export and is deliberately quieter than it: looking at
+   what a tag matches is the cheap, repeatable step, and writing the artifact
+   is the one worth a filled button. */
+.btn-preview{width:100%; padding:10px 0; margin-bottom:9px; border-radius:8px; font-size:13.5px; cursor:pointer; font-weight:600; font-family:var(--sans); background:transparent; color:var(--muted); border:1px solid var(--border);}
+.btn-preview:hover:not(:disabled){color:var(--fg); border-color:var(--muted-2);}
+.btn-preview:disabled{opacity:.4; cursor:not-allowed;}
+.preview-panel{margin-top:14px;}
+.preview-head{font-size:11.5px; color:var(--muted-2); margin-bottom:10px; line-height:1.5;}
+.preview-block{margin-bottom:14px;}
+.preview-tag{font-size:12px; color:var(--fg); margin-bottom:6px;}
+.preview-sub{color:var(--muted-2); font-family:var(--mono); font-size:11px; margin-left:6px;}
+.preview-err{color:var(--warn); font-size:11px; margin-left:6px;}
+/* One scrolling row per tag: several tags previewed at once should stay
+   comparable at a glance rather than pushing each other off the screen. */
+.preview-row{display:flex; gap:8px; overflow-x:auto; padding-bottom:4px;}
+.preview-card{position:relative; flex:0 0 132px;}
+.preview-card video{width:132px; height:78px; object-fit:cover; border-radius:6px; background:#000; display:block;}
+.preview-id{font-family:var(--mono); font-size:9.5px; color:var(--muted-2); margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+
 .overlay{position:fixed; inset:0; background:rgba(0,0,0,.5); display:none; z-index:90;}
 .overlay.open{display:block;}
 .drawer{position:fixed; top:0; right:0; height:100%; width:440px; max-width:92vw; background:var(--surface-2); border-left:1px solid var(--border); z-index:100; transform:translateX(100%); transition:.25s ease; display:flex; flex-direction:column;}
