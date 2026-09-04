@@ -1269,7 +1269,9 @@ class RetrieveRequest(BaseModel):
     # than endpoints of their own.
     project: str | None = None
     query: str = ""
-    vector: list[float] | None = None
+    # A saved or resent direction. Nested when the ranking it came from used
+    # pooling=individual, so a rescore addresses the same set of directions.
+    vector: list[float] | list[list[float]] | None = None
     window: "WindowRef | None" = None
     image_b64: str = ""
     frames_b64: list[str] = []
@@ -1295,6 +1297,9 @@ class RetrieveRequest(BaseModel):
     rows: list[int] = []          # output="scores" only
     page: int = 0
     limit: int = 50
+    # Window search only: `individual` keeps the window's chunks apart and a row
+    # scores as its best match against any of them.
+    pooling: str = "mean"
     max_rows: int = 0             # threshold-mode ceiling; 0 = the global one
 
     # A saved tag to resume: its stored vector is the query direction.
@@ -1375,8 +1380,11 @@ def retrieve(req: RetrieveRequest, request: Request):
     return out
 
 
-def _window_vector(win: "WindowRef", corpus) -> np.ndarray:
-    """Mean-pool the embeddings of the clips inside a window.
+def _window_vector(win: "WindowRef", corpus, pooling: str = "mean") -> np.ndarray:
+    """The query direction(s) for the clips inside a window.
+
+    `mean` averages them into one vector; `individual` returns one row per clip
+    and leaves the best-of-N to the scorer.
 
     The window's clips are resolved against the resident metadata, then their
     ORIGINAL 768-d embeddings are read: the screen is quantized and PCA-reduced
@@ -1400,6 +1408,16 @@ def _window_vector(win: "WindowRef", corpus) -> np.ndarray:
         mat = corpus.vectors_for(rows[:_WINDOW_MAX_POOL])
     except RuntimeError as exc:
         raise HTTPException(409, str(exc))
+    if pooling == "individual":
+        import full_corpus
+
+        # Every chunk kept as its own direction: a corpus row then scores as its
+        # best match against any of them, so a 30s source matches a clip that
+        # resembles ANY 8s of it rather than its average.
+        try:
+            return full_corpus.as_directions(mat)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
     pooled = mat.mean(axis=0)
     norm = float(np.linalg.norm(pooled))
     if norm == 0.0:
@@ -1472,14 +1490,21 @@ def _retrieve_vector(req: "RetrieveRequest", corpus) -> np.ndarray:
             raise HTTPException(404, f"unknown tag {req.tag!r}")
         return np.asarray(stored["vector"], dtype=np.float32)
     if req.vector:
-        vec = np.asarray(req.vector, dtype=np.float32)
-        if vec.ndim != 1 or vec.shape[0] != corpus.dim:
+        import full_corpus
+
+        try:
+            vec = full_corpus.as_directions(np.asarray(req.vector, dtype=np.float32))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if vec.shape[1] != corpus.dim:
             raise HTTPException(
-                400, f"vector dim {vec.shape[0]} != corpus dim {corpus.dim}"
+                400, f"vector dim {vec.shape[1]} != corpus dim {corpus.dim}"
             )
-        return vec
+        return vec[0] if vec.shape[0] == 1 else vec
     if req.window is not None:
-        return _window_vector(req.window, corpus)
+        if req.pooling not in ("mean", "individual"):
+            raise HTTPException(400, "pooling must be mean or individual")
+        return _window_vector(req.window, corpus, req.pooling)
     if req.image_b64 or req.frames_b64:
         if not _state.get("model_ready"):
             raise HTTPException(503, "model still loading")
@@ -1564,7 +1589,11 @@ def _retrieve_hits(req: "RetrieveRequest", corpus, vec, exclude) -> dict:
     # address the SAME vector: for a refine, a window or an upload there is no
     # text that reproduces it, and re-encoding the UI's label would rescore
     # against the cosine of a caption.
-    out["vector"] = [round(float(x), 6) for x in np.asarray(vec).reshape(-1)]
+    # Shape-preserving: reshape(-1) on a multi-direction query would hand the
+    # client one 768*N-long "vector" that rescores against nothing real.
+    _v = np.asarray(vec, dtype=np.float32)
+    out["vector"] = ([round(float(x), 6) for x in _v] if _v.ndim == 1
+                     else [[round(float(x), 6) for x in row] for row in _v])
     return out
 
 
