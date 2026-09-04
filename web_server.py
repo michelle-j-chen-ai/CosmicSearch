@@ -1107,6 +1107,11 @@ class CalibrateRequest(BaseModel):
     val_fraction: float = 0.0
     sample_size: int = 12
     band: float = 0.02
+    # Where to draw the sample from. None centres it on the fitted cutoff, or on
+    # the suggested one before there are labels. The sweep sets it to wherever
+    # the line has been dragged, so the clips on screen are the clips at the
+    # cutoff being considered rather than the one the fit happened to choose.
+    at_tau: float | None = None
     from_date: str | None = None
     to_date: str | None = None
     vehicle: str | None = None
@@ -1811,7 +1816,12 @@ def calibrate(req: CalibrateRequest, request: Request) -> dict:
     tau = float(fit["threshold"]) if fit else None
     stats = search_engine.score_stats(scores)
     suggested = search_engine.heuristic_threshold(stats)
-    tau_for_sampling = tau if tau is not None else suggested
+    if req.at_tau is not None:
+        if not 0.0 <= float(req.at_tau) <= 1.0:
+            raise HTTPException(400, "at_tau must be in [0, 1]")
+        tau_for_sampling = float(req.at_tau)
+    else:
+        tau_for_sampling = tau if tau is not None else suggested
     sample_idx = search_engine.stratified_boundary_sample(
         scores, allowed, labeled, req.sample_size, tau=tau_for_sampling, band=req.band
     )
