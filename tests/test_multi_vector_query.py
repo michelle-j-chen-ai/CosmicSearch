@@ -180,3 +180,36 @@ def test_corpus_score_is_unchanged_for_a_single_direction():
 
     assert np.array_equal(flat, nested)
     assert err_flat == err_nested
+
+
+# --------------------------------------------- sampling at a chosen cutoff
+
+
+def test_the_sweep_can_ask_for_a_sample_at_an_arbitrary_cutoff():
+    """Dragging the sweep line asks for clips THERE. Without a cutoff to aim at,
+    the sample stays centred on whatever the fit chose and the clips on screen
+    are not the clips at the cutoff being judged."""
+    import web_server
+
+    req = web_server.CalibrateRequest(query="x", at_tau=0.42)
+    assert req.at_tau == 0.42
+    # Absent by default, so an unspecified request still centres on the fit.
+    assert web_server.CalibrateRequest(query="x").at_tau is None
+
+
+def test_a_sample_is_drawn_around_the_cutoff_it_was_asked_for():
+    """The sampler biases toward `tau`, so asking at two different cutoffs has
+    to return clips from two different parts of the distribution."""
+    import search_engine
+
+    scores = np.linspace(0.0, 1.0, 2000).astype(np.float32)
+    low = search_engine.stratified_boundary_sample(
+        scores, None, None, 40, tau=0.2, band=0.02, seed=0)
+    high = search_engine.stratified_boundary_sample(
+        scores, None, None, 40, tau=0.8, band=0.02, seed=0)
+
+    near_low = np.abs(scores[low] - 0.2) <= 0.02
+    near_high = np.abs(scores[high] - 0.8) <= 0.02
+    assert near_low.sum() > 0 and near_high.sum() > 0
+    # Each sample's boundary half sits at its own cutoff, not the other's.
+    assert scores[low][near_low].mean() < scores[high][near_high].mean()

@@ -707,7 +707,7 @@ function renderGrid() {
     const vsrc = "/ui/video?uri=" + encodeURIComponent(h.source_media_uri || "");
     return `<div class="card ${vc}" data-chunk="${escapeHtml(h.chunk_id)}">
       <div class="thumb">
-        <span class="rank-badge">#${fmtInt(h.rank)}</span>
+        <span class="rank-badge">${_rankBadge(h)}</span>
         <span class="score-badge" style="background:${col}">${h.score.toFixed(3)}</span>
         <video controls preload="metadata" playsinline src="${vsrc}#t=0.1"></video>
       </div>
@@ -731,6 +731,18 @@ function renderGrid() {
   if (!compact) grid.classList.remove("compact");
   if (state.sweepActive) $("gridStatus").textContent = "Labeling clips near the cutoff (stratified sample) — vote to refine τ";
 }
+// A sweep card is a stratified sample around the cutoff, not a ranked list: it
+// carries no `rank`, and rendering one printed "#0" on every clip. Where the
+// clip sits in the score distribution is the thing that means something here,
+// and the histogram already on the client answers it without another scan.
+function _rankBadge(h) {
+  if (h.rank != null) return "#" + fmtInt(h.rank);
+  const sw = state.sweep;
+  if (!sw || !sw.total) return "";
+  const pct = (_clipsAtOrAbove(h.score) / sw.total) * 100;
+  return "top " + (pct < 0.1 ? "<0.1" : pct.toFixed(pct < 10 ? 1 : 0)) + "%";
+}
+
 function renderQueryStrip(data) {
   const strip = $("queryStrip");
   const clips = data.query_clips;
@@ -891,7 +903,13 @@ function drawSweep() {
     svg._sweepBound = true;
     svg.addEventListener("pointerdown", (e) => { _sweepDragging = true; try { svg.setPointerCapture(e.pointerId); } catch (_e) { } _sweepDragTo(e.clientX); e.preventDefault(); });
     svg.addEventListener("pointermove", (e) => { if (_sweepDragging) _sweepDragTo(e.clientX); });
-    window.addEventListener("pointerup", () => { _sweepDragging = false; });
+    window.addEventListener("pointerup", () => {
+      if (!_sweepDragging) return;
+      _sweepDragging = false;
+      // On release, not during: every resample is a corpus sweep, and a drag
+      // fires pointermove continuously.
+      resampleAtTau();
+    });
   }
   updateSweepStats();
 }
@@ -907,6 +925,39 @@ function _sweepDragTo(clientX) {
   updateSweepStats();
   drawSweep();
 }
+// Draw a fresh boundary sample where the line now sits. Dragging used to move
+// only the cutoff and its readout, leaving the grid showing clips sampled around
+// wherever the fit had landed -- so the clips you were judging were not the clips
+// at the cutoff you were judging.
+let _resampleSeq = 0;
+async function resampleAtTau() {
+  if (!state.sweepActive || state.tempTau == null) return;
+  const at = state.tempTau;
+  const seq = ++_resampleSeq;
+  const status = $("gridStatus");
+  status.textContent = `Sampling clips at \u03c4 = ${at.toFixed(3)}\u2026`;
+  const marks = Object.entries(state.marks).map(([chunk_id, m]) =>
+    ({ chunk_id, mark: m.mark, index: m.index, row: m.row, segment_id: m.segment_id || "" }));
+  try {
+    const r = await apiFetch(_thresholdEndpoint(), {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: state.query, marks, objective: "f1", min_precision: 0.9,
+                             val_fraction: 0.0, sample_size: 12, at_tau: +at.toFixed(4),
+                             ..._searchFilters() }),
+    });
+    // A slower earlier drag must not overwrite a faster later one.
+    if (seq !== _resampleSeq) return;
+    if (!r.ok) throw new Error(await _detail(r));
+    const thr = await r.json();
+    if (thr && thr.sample && thr.sample.length) {
+      state.sweepSample = thr.sample;
+      renderGrid();
+    }
+  } catch (e) {
+    if (seq === _resampleSeq) status.textContent = "Could not sample at that cutoff: " + e.message;
+  }
+}
+
 function _clipsAtOrAbove(v) {
   const sw = state.sweep; let c = 0;
   for (let i = 0; i < sw.counts.length; i++) {
