@@ -898,6 +898,51 @@ def _full_load_worker(project: str) -> None:
             slot["corpus"] = None
             slot["status"] = "error"
             slot["error"] = f"{type(exc).__name__}: {exc}"
+        _alert_corpus_failed(project, exc)
+
+
+# A corpus that will not load takes every search down, and nothing here notices:
+# the OCI credentials were revoked on 2026-09-03 and the service returned 503 for
+# ten hours before a person happened to look. Cloud Run keeps restarting the
+# instance, each one failing the same way, so redundancy cannot help -- the only
+# thing that shortens the outage is telling someone.
+#
+# Posted from the app rather than a Cloud Monitoring policy because the app knows
+# WHY it failed; a log-based alert would only know that a line matched. No-op
+# when NLS_ALERT_WEBHOOK is unset, so nothing depends on it being configured.
+_ALERT_WEBHOOK = os.getenv("NLS_ALERT_WEBHOOK", "").strip()
+_ALERTED: set[str] = set()
+
+
+def _alert_corpus_failed(project: str, exc: BaseException) -> None:
+    """Say out loud that this project cannot serve, once per process per project."""
+    import oci_s3
+
+    credentials = isinstance(exc, oci_s3.CredentialsMissing) or "credential" in str(exc).lower()
+    detail = (
+        "OCI credentials are missing or rejected -- every instance will fail the "
+        "same way until they are replaced (see README 'Configuration')."
+        if credentials else f"{type(exc).__name__}: {exc}"
+    )
+    # Log first and unconditionally: the webhook may be unset or itself failing,
+    # and this line is the one a human or a log alert can still find.
+    LOGGER.error("ALERT %s corpus unavailable on %s: %s",
+                 project, os.getenv("K_SERVICE", "local"), detail)
+    if not _ALERT_WEBHOOK or project in _ALERTED:
+        return
+    _ALERTED.add(project)
+    try:
+        import json as _json
+        import urllib.request
+
+        body = _json.dumps({"text": (
+            f":rotating_light: *{os.getenv('K_SERVICE', 'nls')}* cannot serve "
+            f"*{project}*: {detail}")}).encode()
+        req = urllib.request.Request(
+            _ALERT_WEBHOOK, data=body, headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).close()
+    except Exception:  # noqa: BLE001 -- an alert that fails must not mask the failure
+        LOGGER.exception("could not send the corpus-failure alert")
 
 
 def _full_corpus_begin_load(project: str | None = None) -> str:
@@ -967,14 +1012,20 @@ def _full_refresh_worker(project: str | None = None) -> None:
 # intermittently, depending on routing. Every instance waking on its own timer
 # has no addressing problem to get wrong.
 #
-# NLS_CORPUS_REFRESH_UTC is "HH:MM" in UTC; empty disables the schedule. The
-# default is 10:00 UTC (~3am US Pacific), when a few minutes without
-# full-corpus search costs least.
+# NLS_CORPUS_REFRESH_UTC is "HH:MM" in UTC; "off" (or empty) disables it.
+#
+# Off by default. Refreshing in place means dropping the resident corpus and
+# rebuilding it -- 32Gi cannot hold two copies -- so the instance serves no
+# full-corpus search for the length of the reload. Instances are replaced often
+# enough on their own (deploys, and Cloud Run recycling roughly daily) that a
+# fresh process picks up the current table anyway, which bounds staleness at
+# about the same day without a self-inflicted outage. Set a time to turn it
+# back on where instances are long-lived.
 # "off" (or empty) disables it. Empty is unusable in practice: the NLS_* vars
 # are Secret Manager values so they survive a deploy, and Secret Manager will
 # not store an empty payload -- so there has to be a word that means off.
 _REFRESH_OFF = {"", "off", "none", "never", "disabled"}
-_REFRESH_AT = os.getenv("NLS_CORPUS_REFRESH_UTC", "10:00").strip()
+_REFRESH_AT = os.getenv("NLS_CORPUS_REFRESH_UTC", "off").strip()
 if _REFRESH_AT.lower() in _REFRESH_OFF:
     _REFRESH_AT = ""
 

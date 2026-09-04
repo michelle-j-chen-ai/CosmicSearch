@@ -191,6 +191,8 @@ Cold start downloads the model (base model from HF, or the merged snapshot from
 | `NLS_<PROJECT>_MP4_PREFIX` | per project | Override where a project's clips are stored |
 | `NLS_<PROJECT>_DORA_HOSTNAME` | per project | Override a project's Data Explorer gRPC host |
 | `NLS_MP4_PREFIX` | neuron clip prefix | Shared default clip prefix; `neuron` inherits it |
+| `NLS_CORPUS_REFRESH_UTC` | `off` | Daily in-place corpus reload, `HH:MM` UTC. Off by default: a refresh drops the resident corpus and rebuilds it (32Gi cannot hold two copies), so the instance serves no full-corpus search meanwhile. Instances are replaced often enough on their own that a fresh process picks up the current table anyway |
+| `NLS_ALERT_WEBHOOK` | `""` | Slack-style incoming webhook posted to when a corpus cannot load. Unset = log only. A corpus that will not load takes every search down and every instance fails identically, so nothing recovers on its own |
 
 ## OCI presigned-URL gotchas
 

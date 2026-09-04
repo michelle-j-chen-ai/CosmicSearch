@@ -171,3 +171,49 @@ def test_the_daily_refresh_can_be_switched_off_by_name():
     finally:
         os.environ.pop("NLS_CORPUS_REFRESH_UTC", None)
         importlib.reload(web_server)
+
+
+def test_the_daily_refresh_is_off_unless_a_time_is_set():
+    """Refreshing drops the resident corpus and rebuilds it, so it is a
+    self-inflicted outage. Instances are replaced often enough on their own that
+    a fresh process picks up the current table anyway."""
+    import importlib
+    import os
+
+    import web_server
+
+    os.environ.pop("NLS_CORPUS_REFRESH_UTC", None)
+    importlib.reload(web_server)
+    assert web_server._REFRESH_AT == ""
+
+
+def test_a_corpus_that_cannot_load_says_so_out_loud(caplog, monkeypatch):
+    """The credentials were revoked and the service 503'd for ten hours before a
+    person noticed. Every instance fails identically, so nothing recovers on its
+    own -- the only thing that shortens the outage is saying so."""
+    import logging
+
+    import oci_s3
+    import web_server
+
+    monkeypatch.setattr(web_server, "_ALERT_WEBHOOK", "")
+    web_server._ALERTED.clear()
+    with caplog.at_level(logging.ERROR, logger="nls"):
+        web_server._alert_corpus_failed("neuron", oci_s3.CredentialsMissing("no AWS_* keys"))
+    text = caplog.text
+    assert "ALERT" in text and "neuron" in text
+    # Names the cause, so whoever is paged knows it is not a transient blip.
+    assert "credential" in text.lower()
+
+
+def test_a_failing_alert_never_hides_the_failure(monkeypatch, caplog):
+    """An unreachable webhook must not turn a corpus outage into a crash."""
+    import logging
+
+    import web_server
+
+    monkeypatch.setattr(web_server, "_ALERT_WEBHOOK", "http://127.0.0.1:1/nope")
+    web_server._ALERTED.clear()
+    with caplog.at_level(logging.ERROR):
+        web_server._alert_corpus_failed("frontier", RuntimeError("disk on fire"))
+    assert "ALERT" in caplog.text and "disk on fire" in caplog.text
