@@ -217,3 +217,37 @@ def test_a_failing_alert_never_hides_the_failure(monkeypatch, caplog):
     with caplog.at_level(logging.ERROR):
         web_server._alert_corpus_failed("frontier", RuntimeError("disk on fire"))
     assert "ALERT" in caplog.text and "disk on fire" in caplog.text
+
+
+def test_the_corpus_load_starts_before_the_model_rather_than_after(monkeypatch):
+    """A cold start used to be the SUM of two independent waits: the corpus load
+    reads a Lance table and never touches the model, but it ran only once the
+    model had finished. ~7 minutes each became ~14, and every minute of that is
+    a window where a replaced instance cannot answer."""
+    import web_server
+
+    order: list[str] = []
+
+    monkeypatch.setattr(web_server.deployment, "enabled", lambda: ["neuron"])
+    monkeypatch.setattr(web_server, "_full_corpus_begin_load",
+                        lambda name: order.append(f"corpus:{name}"))
+    monkeypatch.setattr(web_server, "_start_corpus_refresh_schedule", lambda: None)
+
+    def _fake_load_model(uri, device):
+        order.append("model")
+        return object(), object()
+
+    monkeypatch.setattr(web_server.search_engine, "load_model", _fake_load_model)
+    monkeypatch.setattr(web_server.db, "init_schema", lambda: order.append("db"))
+    monkeypatch.setattr(web_server.db, "backfill_catalog",
+                        lambda **kw: order.append("backfill"))
+    class _Cfg:
+        model_artifact_uri = "s3://fake/model/"
+        device = "cpu"
+
+    monkeypatch.setitem(web_server._state, "cfg", _Cfg())
+
+    web_server._warm_engine()
+
+    assert order.index("corpus:neuron") < order.index("model"), order
+    assert web_server._state.get("model_ready") is True
