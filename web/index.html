@@ -4,6 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>VideoSearch</title>
+<script>
+/* Theme applied before first paint so a saved light preference never flashes
+   dark on reload. Kept inline in <head> (app.js loads at end of body). The
+   same "nls." localStorage namespace as nls.project. */
+(function () {
+  var pref = localStorage.getItem("nls.theme");        // "light" | "dark" | absent
+  var dark = pref ? pref === "dark"
+                   : window.matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+})();
+</script>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
 <link rel="stylesheet" href="/static/style.css" />
 </head>
@@ -16,7 +27,10 @@
       <h1>VideoSearch</h1>
       <span class="corpus-pill" id="corpusPill">loading corpus…</span>
     </div>
-    <button class="icon-btn" id="settingsGear" title="Corpus &amp; model settings">⚙</button>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="themeToggle" title="Theme: follow system"></button>
+      <button class="icon-btn" id="settingsGear" title="Corpus &amp; model settings">⚙</button>
+    </div>
   </div>
 
   <div class="nav">

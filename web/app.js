@@ -11,6 +11,47 @@ const fmtInt = (n) => Number(n || 0).toLocaleString("en-US");
 const escapeHtml = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+/* ===================== theme ===================== */
+/* A single topbar button cycles system -> light -> dark. The preference lives
+   in localStorage["nls.theme"] ("light" | "dark"; absent = follow system) next
+   to nls.project. index.html applies the resolved theme before first paint;
+   this module only keeps the button's icon/tooltip in sync and re-resolves on
+   OS changes while the preference is "system". */
+const THEME_KEY = "nls.theme";
+const themeCycle = ["system", "light", "dark"];
+const THEME_ICON = { system: "◐", light: "☀", dark: "☾" };
+const THEME_LABEL = { system: "follow system", light: "light", dark: "dark" };
+
+function themePref() {
+  const p = localStorage.getItem(THEME_KEY);
+  return p === "light" || p === "dark" ? p : "system";
+}
+
+function applyTheme(pref) {
+  const dark = pref === "dark" ||
+    (pref === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const btn = $("themeToggle");
+  if (btn) {
+    btn.textContent = THEME_ICON[pref];
+    btn.title = `Theme: ${THEME_LABEL[pref]}`;
+    btn.setAttribute("aria-label", btn.title);
+  }
+}
+
+function initTheme() {
+  applyTheme(themePref());
+  $("themeToggle").onclick = () => {
+    const next = themeCycle[(themeCycle.indexOf(themePref()) + 1) % themeCycle.length];
+    if (next === "system") localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, next);
+    applyTheme(next);
+  };
+  // Follow live OS scheme changes while the preference is "system".
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+    if (themePref() === "system") applyTheme("system");
+  });
+}
 const state = {
   health: null,
   project: localStorage.getItem("nls.project") || null,
@@ -145,6 +186,7 @@ function applyCorpus(c) {
 async function loadDefaultCorpusWhenReady() { await refreshCorpusPill(); }
 /* ===================== event wiring ===================== */
 function wireEvents() {
+  initTheme();
   $("navSearch").onclick = () => setPage("search");
   $("navSaved").onclick = () => setPage("saved");
   $("settingsGear").onclick = () => $("settingsPop").classList.toggle("hidden");
@@ -685,7 +727,7 @@ function _funnelText(data) {
 }
 
 /* ===================== grid ===================== */
-function scoreColor(s) { if (s > 0.32) return "#c9f31d"; if (s > 0.24) return "#a9d92a"; if (s > 0.16) return "#8a8f4a"; return "#6b6b70"; }
+function scoreColor(s) { if (s > 0.32) return "var(--score-hi)"; if (s > 0.24) return "var(--score-mid)"; if (s > 0.16) return "var(--score-low)"; return "var(--score-none)"; }
 function _dedupHits(hits) {
   if (!$("quickDedup").checked) return hits;
   const seen = new Set(); const out = [];
@@ -872,18 +914,18 @@ function drawSweep() {
   let bars = "";
   for (let i = 0; i < sw.counts.length; i++) {
     const h = (sw.counts[i] / maxC) * plotH, x0 = x(sw.edges[i]), x1 = x(sw.edges[i + 1]);
-    bars += `<rect x="${x0.toFixed(1)}" y="${(H - padB - h).toFixed(1)}" width="${Math.max(0.5, x1 - x0 - 1).toFixed(1)}" height="${h.toFixed(1)}" fill="#26262e"/>`;
+    bars += `<rect x="${x0.toFixed(1)}" y="${(H - padB - h).toFixed(1)}" width="${Math.max(0.5, x1 - x0 - 1).toFixed(1)}" height="${h.toFixed(1)}" fill="var(--thumb-a)"/>`;
   }
   let ticks = "";
-  sw.up.forEach((s) => { const cx = x(s); ticks += `<line x1="${cx}" y1="${H - padB}" x2="${cx}" y2="${H - padB - 118}" stroke="#c9f31d" stroke-width="2"/><circle cx="${cx}" cy="${H - padB - 118}" r="4" fill="#c9f31d"/>`; });
-  sw.down.forEach((s) => { const cx = x(s); ticks += `<line x1="${cx}" y1="${H - padB}" x2="${cx}" y2="${H - padB - 96}" stroke="#ff6b5c" stroke-width="2"/><circle cx="${cx}" cy="${H - padB - 96}" r="4" fill="#ff6b5c"/>`; });
+  sw.up.forEach((s) => { const cx = x(s); ticks += `<line x1="${cx}" y1="${H - padB}" x2="${cx}" y2="${H - padB - 118}" stroke="var(--accent)" stroke-width="2"/><circle cx="${cx}" cy="${H - padB - 118}" r="4" fill="var(--accent)"/>`; });
+  sw.down.forEach((s) => { const cx = x(s); ticks += `<line x1="${cx}" y1="${H - padB}" x2="${cx}" y2="${H - padB - 96}" stroke="var(--neg)" stroke-width="2"/><circle cx="${cx}" cy="${H - padB - 96}" r="4" fill="var(--neg)"/>`; });
   const tauX = x(state.tempTau);
-  const line = `<line x1="${tauX}" y1="${H - padB + 6}" x2="${tauX}" y2="6" stroke="#ececf0" stroke-width="2" stroke-dasharray="4 3"/><polygon points="${tauX - 6},2 ${tauX + 6},2 ${tauX},12" fill="#ececf0"/>`;
+  const line = `<line x1="${tauX}" y1="${H - padB + 6}" x2="${tauX}" y2="6" stroke="var(--chart-guide)" stroke-width="2" stroke-dasharray="4 3"/><polygon points="${tauX - 6},2 ${tauX + 6},2 ${tauX},12" fill="var(--chart-guide)"/>`;
   const tk = (v) => x(v).toFixed(1);
-  const axis = `<line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="#3a3a44" stroke-width="1"/>
-    <text x="${tk(lo)}" y="${H - 8}" fill="#55555e" font-size="11" font-family="IBM Plex Mono">${lo.toFixed(2)}</text>
-    <text x="${tk((lo + hi) / 2)}" y="${H - 8}" fill="#55555e" font-size="11" font-family="IBM Plex Mono" text-anchor="middle">${((lo + hi) / 2).toFixed(2)}</text>
-    <text x="${tk(hi)}" y="${H - 8}" fill="#55555e" font-size="11" font-family="IBM Plex Mono" text-anchor="end">${hi.toFixed(2)}</text>`;
+  const axis = `<line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="var(--chart-axis)" stroke-width="1"/>
+    <text x="${tk(lo)}" y="${H - 8}" fill="var(--chart-label)" font-size="11" font-family="IBM Plex Mono">${lo.toFixed(2)}</text>
+    <text x="${tk((lo + hi) / 2)}" y="${H - 8}" fill="var(--chart-label)" font-size="11" font-family="IBM Plex Mono" text-anchor="middle">${((lo + hi) / 2).toFixed(2)}</text>
+    <text x="${tk(hi)}" y="${H - 8}" fill="var(--chart-label)" font-size="11" font-family="IBM Plex Mono" text-anchor="end">${hi.toFixed(2)}</text>`;
   svg.innerHTML = bars + axis + ticks + line;
   // Bind drag handlers ONCE on the <svg> (survives innerHTML redraws). Drag state +
   // value mapping read live from state.sweep, so the τ line tracks the pointer.
