@@ -128,31 +128,22 @@ def _load_engine() -> None:
 
 
 def _warm_engine() -> None:
-    """Load the model, then pre-warm the default corpus (runs once, off the
-    request path).
+    """Pre-warm the corpora and the model together (runs once, off the request
+    path).
+
+    The corpus load reads a Lance table and decodes it; it never touches the
+    model. Running it after the model finished made a cold start the SUM of two
+    independent waits -- about 7 minutes each, so ~14 in total -- and every one
+    of those minutes is a window in which a replaced instance cannot answer.
+    Started first and on their own threads, the two overlap instead.
 
     Readiness is gated on the MODEL only -- that is all that is needed to encode
-    queries and to load any corpus on demand. The default corpus (which can be
-    the large 1M set, slow to pull on a cold start) is pre-warmed afterward as a
-    convenience, but must NOT block switching to a smaller corpus.
+    queries and to load any corpus on demand.
     """
     try:
-        cfg = _state["cfg"]
-        LOGGER.info("loading encoder %s ...", cfg.model_artifact_uri or "base")
-        _state["processor"], _state["model"] = search_engine.load_model(
-            cfg.model_artifact_uri, cfg.device
-        )
-        _state["model_uri"] = cfg.model_artifact_uri  # active encoder (swappable)
-        _state["model_ready"] = True  # endpoints unblock here
-        LOGGER.info("model ready")
-        db.init_schema()  # best-effort; logs + continues if exp-db is unreachable
-        import full_corpus
+        import full_corpus  # noqa: F401 -- imported for CORPUS_MODEL below
 
-        db.backfill_catalog(project=deployment.default(), model=full_corpus.CORPUS_MODEL)
-        # Start every enabled project's corpus load here rather than waiting
-        # for someone to search: the read and decode take minutes, and paying
-        # that on a user's first query reads as a hang. Each runs on its own
-        # thread and never gates readiness.
+        # First, because it is the long pole and needs nothing from the model.
         try:
             for name in deployment.enabled():
                 _full_corpus_begin_load(name)
@@ -160,6 +151,20 @@ def _warm_engine() -> None:
             _start_corpus_refresh_schedule()
         except Exception as exc:  # noqa: BLE001 -- warm-up must not wedge startup
             LOGGER.warning("full corpus pre-warm could not start: %s", exc)
+
+        cfg = _state["cfg"]
+        LOGGER.info("loading encoder %s ...", cfg.model_artifact_uri or "base")
+        t0 = time.perf_counter()
+        _state["processor"], _state["model"] = search_engine.load_model(
+            cfg.model_artifact_uri, cfg.device
+        )
+        _state["model_uri"] = cfg.model_artifact_uri  # active encoder (swappable)
+        _state["model_ready"] = True  # endpoints unblock here
+        LOGGER.info("model ready in %.1fs (corpus loading alongside)",
+                    time.perf_counter() - t0)
+
+        db.init_schema()  # best-effort; logs + continues if exp-db is unreachable
+        db.backfill_catalog(project=deployment.default(), model=full_corpus.CORPUS_MODEL)
         _state["ready"] = True
     except Exception as exc:  # noqa: BLE001 -- warmup must record failure, not vanish
         _state["load_error"] = str(exc)
