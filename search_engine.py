@@ -14,6 +14,7 @@ worthwhile past ~10M rows; see README "Scaling" for the migration path.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import os
 import time
@@ -42,6 +43,45 @@ from config import (
 LOGGER = logging.getLogger(__name__)
 
 
+# A merged snapshot ships its own architecture -- modeling_embed1.py and the
+# rest sit next to model.safetensors -- but its config.json inherits the upstream
+# `auto_map`, whose entries are written "repo--module.Class". That form tells
+# transformers to fetch the class FROM THAT REPO, so every cold start downloaded
+# and exec'd unpinned Python from huggingface.co while the identical files sat
+# unread in the snapshot. It put a third party on the boot path of a service that
+# takes minutes to warm, and made two instances of one revision capable of
+# running different code.
+#
+# Rewritten to bare "module.Class", which resolves against the snapshot itself --
+# the form processor_config.json already used.
+def _localize_auto_map(local: "Path") -> None:
+    """Point a snapshot's auto_map at its own files. Idempotent."""
+    config = local / "config.json"
+    try:
+        spec = json.loads(config.read_text())
+    except (OSError, ValueError) as exc:
+        LOGGER.warning("could not read %s to localize auto_map: %s", config, exc)
+        return
+    auto_map = spec.get("auto_map")
+    if not isinstance(auto_map, dict):
+        return
+    rewritten = {}
+    for key, ref in auto_map.items():
+        module = ref.split("--")[-1] if isinstance(ref, str) else ref
+        # Only local if the file is actually here; a missing module must keep
+        # its remote reference or the model stops loading altogether.
+        head = module.split(".")[0] if isinstance(module, str) else ""
+        rewritten[key] = module if head and (local / f"{head}.py").exists() else ref
+    if rewritten == auto_map:
+        return
+    spec["auto_map"] = rewritten
+    tmp = config.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(spec, indent=2))
+    tmp.replace(config)   # atomic: a half-written config would break every load
+    LOGGER.info("auto_map now resolves locally: %s",
+                ", ".join(f"{k}={v}" for k, v in rewritten.items()))
+
+
 def _resolve_model_source(model_artifact_uri: str) -> tuple[str, str | None]:
     """Return (local-or-hub source, revision) for transformers.from_pretrained.
 
@@ -53,6 +93,7 @@ def _resolve_model_source(model_artifact_uri: str) -> tuple[str, str | None]:
         return BASE_MODEL_URI, BASE_MODEL_REVISION
     if model_artifact_uri.startswith(("s3://", "s3a://")):
         local = local_cache.ensure_model_local(model_artifact_uri, oci_s3.s3_client())
+        _localize_auto_map(local)
         return str(local), None
     return model_artifact_uri, None
 
